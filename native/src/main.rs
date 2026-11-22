@@ -1173,7 +1173,7 @@ impl Sessions<'_> {
         (low, high)
     }
 
-    fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
+    fn person_binned(&mut self, person: u64, events: &[u64], clicks: &mut [Touch], sources: &[ClickSource], scratch: &mut TimeBins) -> io::Result<()> {
         for &value in events {
             let ts = (value >> 32) as u32;
             let index = (ts >> BIN_SHIFT) as usize;
@@ -1190,7 +1190,7 @@ impl Sessions<'_> {
                 bin.category_bits[category / 64] |= 1 << (category % 64);
             }
         }
-        let mut cursor = (0, 0);
+        let mut starts = Vec::new();
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
         let (mut start, mut last, mut revenue) = (0u32, 0u32, 0u64);
@@ -1202,7 +1202,7 @@ impl Sessions<'_> {
                 let bin = std::mem::take(&mut scratch.bins[index]);
                 if current_day == NONE || u64::from(bin.first - last) > SESSION_GAP {
                     if current_day != NONE {
-                        cursor = self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
+                        starts.push((start, current_day, revenue));
                     }
                     start = bin.first;
                     revenue = 0;
@@ -1230,7 +1230,39 @@ impl Sessions<'_> {
                 }
             }
         }
-        self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
+        if starts.is_empty() {
+            // Every event belonged to one session. Exact credit and assists
+            // need one scan of the unsorted history, regardless of its size.
+            let limit = u64::from(start) + WEEK as u64;
+            let mut winner: Option<Touch> = None;
+            let days = self.shared.days;
+            for &click in clicks.iter() {
+                if click.ts < start || u64::from(click.ts) > limit { continue; }
+                let campaign = click.campaign as usize;
+                if self.reach[campaign] == 0 {
+                    self.reach[campaign] = 1;
+                    self.active.push(click.campaign);
+                    self.totals[campaign * days + current_day as usize][3] += 1;
+                }
+                if winner.is_none_or(|best| click.ts > best.ts || (click.ts == best.ts &&
+                    click_order(click.id, best.id, sources, self.shared.defer_long_events).is_lt())) {
+                    winner = Some(click);
+                }
+            }
+            let campaign = winner.map_or(0, |click| click.campaign as usize);
+            let totals = &mut self.totals[campaign * days + current_day as usize];
+            totals[0] += 1;
+            totals[1] += i64::from(revenue != 0);
+            totals[2] += revenue as i64;
+        } else {
+            starts.push((start, current_day, revenue));
+            clicks.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(||
+                click_order(a.id, b.id, sources, self.shared.defer_long_events)));
+            let mut cursor = (0, 0);
+            for (start, day, revenue) in starts {
+                cursor = self.credit(clicks, cursor, u64::from(start), day, revenue, revenue != 0);
+            }
+        }
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
         for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
         Ok(())
@@ -1554,7 +1586,7 @@ fn session_worker(
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
+            if mine.len() < 512 && reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
             if mine.len() < 512 {
@@ -1570,7 +1602,7 @@ fn session_worker(
                 sessions.person(person, mine, reached)?;
             } else {
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
-                sessions.person_binned(person, mine, reached, bins)?;
+                sessions.person_binned(person, mine, reached, clicks, bins)?;
             }
             from = to;
             click_from = click_to;
