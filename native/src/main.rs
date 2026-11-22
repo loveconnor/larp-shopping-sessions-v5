@@ -795,12 +795,60 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
 }
 
+struct CampaignCache {
+    entries: [(u64, u32); 128],
+}
+
+impl CampaignCache {
+    #[inline(always)]
+    unsafe fn lookup(&mut self, campaigns: &Dim, p: *const u8, len: usize) -> u32 {
+        if len > 7 {
+            return unsafe { campaigns.get(p, len) };
+        }
+        let raw = u64::from_le(unsafe { p.cast::<u64>().read_unaligned() });
+        // A delimiter bit above the last byte keeps arbitrary short names
+        // distinct even when a name ends in a NUL byte.
+        let limit = 1u64 << (len * 8);
+        let key = (raw & (limit - 1)) | limit;
+        let index = (key.wrapping_mul(MIX) >> 57) as usize;
+        let entry = &mut self.entries[index];
+        if entry.0 != key {
+            *entry = (key, unsafe { campaigns.get(p, len) });
+        }
+        entry.1
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn campaign_cache_preserves_arbitrary_names_and_collisions() {
+    let mut names = vec![vec![], b"x".to_vec(), b"x\0".to_vec(), "日".as_bytes().to_vec(),
+                         b"abcdefg".to_vec(), b"abcdefgh".to_vec(), b"abcdefghi".to_vec()];
+    names.extend((1..=255).map(|byte| vec![byte, b'q']));
+    let mut dim = Dim::new(b"c_");
+    for (i, name) in names.iter().enumerate() {
+        dim.insert(name, usize::MAX, i as u32 + 1);
+    }
+    names.push(b"absent".to_vec());
+    let mut cache = CampaignCache { entries: [(0, 0); 128] };
+    for name in names.iter().chain(names.iter().rev()).cycle().take(names.len() * 4) {
+        let mut padded = name.clone();
+        padded.resize(name.len() + 32, 0);
+        unsafe {
+            let expected = dim.get(padded.as_ptr(), name.len());
+            assert_eq!(cache.lookup(&dim, padded.as_ptr(), name.len()), expected);
+            assert_eq!(cache.lookup(&dim, padded.as_ptr(), name.len()), expected);
+        }
+    }
+}
+
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
     copy: u64,
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
+    campaign_cache: &mut CampaignCache,
     out: &mut ClickSource,
 ) {
     let earliest = shared.window_start - WEEK;
@@ -831,7 +879,7 @@ fn parse_clicks(
         }
         let (id, user) = (id ^ copy, user ^ copy);
         let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
+        let campaign = campaign_cache.lookup(&shared.campaigns, p, n);
         let (p, n) = field(3);
         let at = ts::parse(p, n, dates);
         if campaign == 0 || at < earliest || at >= window_end {
@@ -902,13 +950,14 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
+    let mut campaign_cache = CampaignCache { entries: [(0, 0); 128] };
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut campaign_cache, &mut clicks);
         }
     }
     Ok((events, clicks))
