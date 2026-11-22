@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["395424,233335,301443", "630951,801413,567422", "739147,225071,323378", "853936,522406,717085", "401401,597184,402457", "943270,215674,283849"]
+        seed_list: ["126381,113658,812477", "954180,513335,290550", "138509,465695,767439", "271133,485894,373600", "413218,228581,576700", "294788,733766,278806"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
-      RANKED: 1426671a3250e5dcb5342c29ea6238942350685f
-      CANDIDATE: 7e8f59da6626659f317f8ae7878a3b201dbd61f0
+      RANKED: 7e8f59da6626659f317f8ae7878a3b201dbd61f0
+      CANDIDATE: bf5e73ec8064377d11ba8fcab23369d983df9efa
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +45,7 @@ jobs:
           for label in ranked candidate sorter; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = sorter ]; then sha=bf5e73ec8064377d11ba8fcab23369d983df9efa; fi
+            if [ "$label" = sorter ]; then sha=bf76822d984acc4fc2853a20017a84b3b59bbefb; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
