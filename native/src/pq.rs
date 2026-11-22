@@ -167,12 +167,28 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
 // Eight values at a fixed bit width always end on a byte boundary.
 #[inline(always)]
 fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) {
-    for group in values.chunks_exact(8) {
-        let mut packed = 0u128;
-        for (index, &delta) in group.iter().enumerate() {
-            packed |= u128::from(delta.wrapping_sub(least) as u64) << (index * BITS);
+    let groups = values.chunks_exact(8);
+    let bytes = groups.len() * BITS;
+    let store = if BITS <= 8 { 8 } else { 16 };
+    let start = out.len();
+    out.reserve(bytes + store - BITS);
+    unsafe {
+        let mut dst = out.as_mut_ptr().add(start);
+        for group in groups {
+            let mut packed = 0u128;
+            for (index, &delta) in group.iter().enumerate() {
+                packed |= u128::from(delta.wrapping_sub(least) as u64) << (index * BITS);
+            }
+            // The next group replaces any extra bytes from this word store.
+            // Tail capacity covers the last store. Only payload bytes are published.
+            if BITS <= 8 {
+                dst.cast::<u64>().write_unaligned((packed as u64).to_le());
+            } else {
+                dst.cast::<u128>().write_unaligned(packed.to_le());
+            }
+            dst = dst.add(BITS);
         }
-        out.extend_from_slice(&packed.to_le_bytes()[..BITS]);
+        out.set_len(start + bytes);
     }
 }
 
@@ -563,6 +579,29 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[test]
+    fn packed_narrow_deltas_match_bit_stream_for_wrapping_minima() {
+        fn check<const B: usize>() {
+            for least in [i64::MIN, -100_000, -257, -1, 0, 254, i64::MAX] {
+                let offsets: Vec<u64> = (0..64)
+                    .map(|i| (i * 756547 + 52991) & ((1 << B) - 1))
+                    .collect();
+                let deltas: Vec<_> = offsets.iter().map(|&v| least.wrapping_add(v as i64)).collect();
+                let mut actual = vec![11, 77, 17];
+                let mut expected = actual.clone();
+                pack_eight::<B>(&mut actual, &deltas, least);
+                pack(&mut expected, offsets.into_iter(), B as u32);
+                actual.extend_from_slice(b"after");
+                expected.extend_from_slice(b"after");
+                assert_eq!(actual, expected);
+            }
+        }
+        check::<1>(); check::<2>(); check::<3>(); check::<4>();
+        check::<5>(); check::<6>(); check::<7>(); check::<8>();
+        check::<9>(); check::<10>(); check::<11>(); check::<12>();
+        check::<13>(); check::<14>(); check::<15>(); check::<16>();
     }
 
     #[test]
