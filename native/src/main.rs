@@ -194,10 +194,8 @@ struct Parsed {
     user: u64,
     /// Offset from the ingest origin, or a tagged index into the worker’s overflow times.
     ingest: u32,
-    /// Milliseconds after `window_start`, or `DEAD`.
+    /// A common timestamp, a tagged index of a full event value, or DEAD.
     ts: u32,
-    /// 0, or for a purchase its category in the top 8 bits and price below.
-    payload: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -656,6 +654,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
+    full_values: Vec<u64>,
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
@@ -664,6 +663,17 @@ struct EventSource {
 // Inline offsets cover nearly 25 days starting one day before the window.
 // Other timestamps retain all 64 bits in the parsing worker's side table.
 const OVERFLOW_TIME: u32 = 1 << 31;
+const FULL_VALUE: u32 = 1 << 31;
+
+/// Keep the ingestion word independent so dedup compares even purchases inline.
+#[inline]
+fn event_value(time: u32, payload: u32, full: &mut Vec<u64>) -> u32 {
+    if payload == 0 && time < FULL_VALUE { return time; }
+    let index = full.len();
+    assert!(index < (FULL_VALUE - 1) as usize);
+    full.push((u64::from(time) << 32) | u64::from(payload));
+    FULL_VALUE | index as u32
+}
 
 #[inline]
 fn encode_ingest(time: i64, origin: i64, overflow: &mut Vec<i64>) -> u32 {
@@ -759,8 +769,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             id,
             user,
             ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
-            ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
+            ts: if valid { event_value((at - window_start) as u32, payload, &mut out.full_values) } else { DEAD },
         };
         let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
         if deferred {
@@ -896,6 +905,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
     }
     let mut events = EventSource {
+        full_values: Vec::new(),
         buckets: Buckets::new(1 << shared.id_bits),
         names: Vec::new(),
         overflow_times: Vec::new(),
@@ -995,7 +1005,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
+            for (chunk, &(base, count)) in chunks.iter().enumerate() {
+                let full = &sources[owners[chunk]].full_values;
                 for offset in 0..count {
                     if offset + ahead < count {
                         links.prefetch((*base.add(offset + ahead)).user);
@@ -1005,7 +1016,11 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         continue;
                     }
                     let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    let value = if record.ts < FULL_VALUE {
+                        u64::from(record.ts) << 32
+                    } else {
+                        full[(record.ts ^ FULL_VALUE) as usize]
+                    };
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
