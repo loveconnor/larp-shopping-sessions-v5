@@ -1365,6 +1365,30 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+fn sort_clicks(reached: &mut [Touch], sources: &[ClickSource], local: bool) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    if (5..=32).contains(&reached.len()) {
+        let n = reached.len();
+        let mut keys = [0; 32];
+        let mut original = [Touch { id: 0, ts: 0, campaign: 0 }; 32];
+        original[..n].copy_from_slice(reached);
+        for (i, click) in reached.iter().enumerate() {
+            keys[i] = (u64::from(click.ts) << 32) | i as u64;
+        }
+        unsafe { sort_short_times(&mut keys[..n]); }
+        for (out, &key) in reached.iter_mut().zip(&keys) {
+            *out = original[key as u32 as usize];
+        }
+        for equal_time in reached.chunk_by_mut(|a, b| a.ts == b.ts) {
+            if equal_time.len() > 1 {
+                equal_time.sort_unstable_by(|a, b| click_order(a.id, b.id, sources, local));
+            }
+        }
+        return;
+    }
+    reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, sources, local)));
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1555,7 +1579,7 @@ fn session_worker(
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+                sort_clicks(reached, clicks, shared.defer_long_events);
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
