@@ -1720,6 +1720,12 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // Decode the first click blocks while the link builder and event readers
+    // are starting. Their owned IDs can wait for the canonical names.
+    let first_click = work.partition_point(|block| block.events);
+    let early_clicks = (work.len() - first_click).min(threads * 2);
+    work[..first_click + early_clicks].rotate_right(early_clicks);
+
     let input_bytes = total.saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
     // At intermediate sizes, fewer active destinations reduce scattered
