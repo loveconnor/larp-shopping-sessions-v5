@@ -535,9 +535,10 @@ impl Block {
             let end = end as u32;
             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
-            // Starts of chunks that break a quote rule; the last is a sentinel.
-            let mut bad: Vec<u32> = Vec::new();
-            let mut bad_at = 0usize;
+            // Rows intersecting this interval get exact quote validation.
+            // It also covers clean chunks between two malformed ones.
+            let mut bad_start = u32::MAX;
+            let mut bad_end = 0u32;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
             let mut at = line;
@@ -589,7 +590,8 @@ impl Block {
                         let wrong = misplaced | ((sum ^ quote_before) & sep);
                         carry = u64::from(over);
                         if wrong != 0 {
-                            bad.push(at);
+                            bad_start = bad_start.min(at);
+                            bad_end = at.saturating_add(64);
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
@@ -604,15 +606,11 @@ impl Block {
                 for extra in 0..N {
                     *out.add(count + extra) = u32::MAX;
                 }
-                bad.push(u32::MAX - 64);
                 let mut sep_at = 0usize;
                 for &stop in std::slice::from_raw_parts(ends, lines) {
                     let start = line;
                     line = stop + 1;
-                    while *bad.get_unchecked(bad_at) + 64 <= start {
-                        bad_at += 1;
-                    }
-                    let clean = *bad.get_unchecked(bad_at) > stop;
+                    let clean = stop < bad_start || start >= bad_end;
                     if *out.add(sep_at + N - 1) == stop && clean {
                         visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
                         sep_at += N;
@@ -628,7 +626,10 @@ impl Block {
                         }
                     }
                 }
-                bad.pop();
+                if bad_end <= line {
+                    bad_start = u32::MAX;
+                    bad_end = 0;
+                }
                 // Separators of the line still open move to the front.
                 kept = count - sep_at;
                 std::ptr::copy(out.add(sep_at), out, kept);
@@ -796,6 +797,23 @@ mod tests {
         let previous_capacity = block.buf.capacity();
         block.reserve(previous_capacity + EXTRA);
         assert_eq!(&block.buf[PAD..PAD + 4], b"row,");
+    }
+
+    #[test]
+    fn quote_fallback_across_windows() {
+        let window_bytes = WINDOW * 64;
+        for shift in 0..64 {
+            let mut rows = b"header,header\n".to_vec();
+            rows.extend(std::iter::repeat_n(b'x', window_bytes - 32 + shift));
+            rows.extend_from_slice(b"q\"r,z\nleft,right\n");
+            rows.extend(std::iter::repeat_n(b'y', 2 * window_bytes));
+            rows.extend_from_slice(b",\"quoted\"\nbad,xx\"y\nok,row\n");
+            rows.extend_from_slice(&b"good,row\n".repeat(window_bytes / 9));
+            rows.extend_from_slice(b"a,\"b\"\nc\"d,e\nlast,row\n");
+            for boundary in [window_bytes, window_bytes * 3, rows.len()] {
+                check::<2>(&rows, boundary);
+            }
+        }
     }
 
     #[test]
