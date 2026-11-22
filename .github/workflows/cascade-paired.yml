@@ -1,7 +1,7 @@
-name: Check scored engines independently on native Linux
+name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/parser-isa]
+    branches: [bench/cascade-paired]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 388697, engine: v3}
-          - {events: 60000000, format: current, seed: 388697, engine: v3}
-          - {events: 20000000, format: current, seed: 388697, engine: v4}
-          - {events: 60000000, format: current, seed: 388697, engine: v4}
+          - {events: 20000000, format: current, seed: 673073, engine: n4}
+          - {events: 60000000, format: current, seed: 673073, engine: n4}
+          - {events: 20000000, format: current, seed: 840269, engine: n4}
+          - {events: 60000000, format: current, seed: 840269, engine: n4}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: c285015aa9fad18b8d530ce925c48df218154305
-      CANDIDATE: bc1e0560744823ccca4082819160ea219419cd57
+      RANKED: 9d406d44d87201463951f690f8ee8ad5dedf096b
+      CANDIDATE: 5a5ebea4fa402facfc55f1770c39f948c325b9ac
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,7 +34,7 @@ jobs:
           for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            if [ "$label"  = n4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -60,7 +60,7 @@ jobs:
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          if os.environ["ENGINE"] == "v4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
+          if os.environ["ENGINE"] == "n4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
               print("Host has no v4 engine. Skipping this comparison.", flush=True)
               raise SystemExit(0)
           cpus = sorted(os.sched_getaffinity(0))[:8]
@@ -115,7 +115,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          if [ "$ENGINE" = v4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
+          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
           for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
