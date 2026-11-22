@@ -41,7 +41,7 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
-const GROUP_ROWS: usize = 1 << 17;
+const GROUP_ROWS: usize = 1 << 13;
 /// How many records ahead to prefetch a links lookup.
 const AHEAD: usize = 16;
 
