@@ -12,13 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 856919}
-          - {events: 60000000, format: current, seed: 856919}
+          - {events: 20000000, format: current, seed: 514793}
+          - {events: 60000000, format: current, seed: 514793}
+          - {events: 20000000, format: current, seed: 803203}
+          - {events: 60000000, format: current, seed: 803203}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+      RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -109,5 +111,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-cpu-samples-${{ matrix.events }}
+          name: native-cpu-samples-${{ matrix.events }}-${{ matrix.seed }}
           path: ${{ runner.temp }}/profile/
