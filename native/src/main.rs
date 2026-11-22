@@ -1069,6 +1069,24 @@ impl TimeBins {
             categories,
         }
     }
+
+    #[inline(always)]
+    fn record(&mut self, value: u64) {
+        let ts = (value >> 32) as u32;
+        let index = (ts >> BIN_SHIFT) as usize;
+        let bin = &mut self.bins[index];
+        bin.first = bin.first.min(ts);
+        bin.last = bin.last.max(ts);
+        bin.events += 1;
+        self.occupied[index / 64] |= 1 << (index % 64);
+        let payload = value as u32;
+        if payload != 0 {
+            let category = (payload >> 24) as usize;
+            let price = u64::from(payload & 0xff_ffff);
+            self.revenue[index * self.categories + category] += price;
+            bin.category_bits[category / 64] |= 1 << (category % 64);
+        }
+    }
 }
 
 struct Sessions<'a> {
@@ -1174,22 +1192,7 @@ impl Sessions<'_> {
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
-        for &value in events {
-            let ts = (value >> 32) as u32;
-            let index = (ts >> BIN_SHIFT) as usize;
-            let bin = &mut scratch.bins[index];
-            bin.first = bin.first.min(ts);
-            bin.last = bin.last.max(ts);
-            bin.events += 1;
-            scratch.occupied[index / 64] |= 1 << (index % 64);
-            let payload = value as u32;
-            if payload != 0 {
-                let category = (payload >> 24) as usize;
-                let price = u64::from(payload & 0xff_ffff);
-                scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
-            }
-        }
+        for &value in events { scratch.record(value); }
         let mut cursor = (0, 0);
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
@@ -1365,6 +1368,22 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// Sample one chunk for a dominant person. The subsequent compaction still
+/// compares the exact key of each row, so the choice only affects runtime.
+fn dominant_person(chunks: &[(*mut Event, usize)], total: usize) -> Option<u64> {
+    if total < 1024 { return None; }
+    let &(base, count) = chunks.iter().find(|(_, len)| *len >= 48)?;
+    let mut key = 0u64;
+    let mut votes = 0usize;
+    for i in 0..48 {
+        let person = unsafe { (*base.add(i * count / 48)).person };
+        if votes == 0 { key = person; }
+        if person == key { votes += 1; } else { votes -= 1; }
+    }
+    // A large residual favors concentrated chunks; an inaccurate nomination is harmless.
+    (votes >= 16).then_some(key)
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1399,6 +1418,7 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
+    let mut dominant_bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1408,6 +1428,30 @@ fn session_worker(
         let total: usize = event_chunks.iter().map(|chunk| chunk.1).sum();
         if total == 0 {
             continue;
+        }
+
+        let dominant = dominant_person(&event_chunks, total);
+        let mut total = total;
+        if let Some(key) = dominant {
+            let bins = dominant_bins.get_or_insert_with(|| TimeBins::new(shared));
+            let mut represented = false;
+            // This worker exclusively owns this partition. Compact each chunk in
+            // place, retaining one actual row to keep its user in click grouping.
+            for (base, count) in &mut event_chunks {
+                let mut write = 0;
+                for read in 0..*count {
+                    let event = unsafe { *base.add(read) };
+                    if event.person == key && represented {
+                        bins.record(event.value);
+                    } else {
+                        represented |= event.person == key;
+                        if write != read { unsafe { base.add(write).write(event); } }
+                        write += 1;
+                    }
+                }
+                total -= *count - write;
+                *count = write;
+            }
         }
 
         // Group the events by person: number the people as they appear.
@@ -1557,7 +1601,9 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            if dominant == Some(person) {
+                sessions.person_binned(person, mine, reached, dominant_bins.as_mut().unwrap())?;
+            } else if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
