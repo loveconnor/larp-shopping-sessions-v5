@@ -1,22 +1,19 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 371b35d..89968a0 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -335,6 +335,10 @@ impl Links {
+@@ -339,6 +339,8 @@
              }
              numbered.push(index);
          }
-+        // The hash index is only needed while numbering. Retain the original
-+        // keys densely for the final alias table, then free the sparse index.
 +        drop(slots);
 +        let original = names.clone();
          // Join. The smaller number is the root, so no cycle can form.
          let mut aliases = 0usize;
          let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-@@ -364,9 +368,7 @@ impl Links {
-         let shift = 64 - count.trailing_zeros();
-         let mut groups = vec![AliasGroup::default(); count];
+@@ -370,9 +372,7 @@
+         let mut values = vec![[0u64; 4]; count];
          huge(groups.as_ptr(), count);
+         huge(values.as_ptr(), count);
 -        for [key, id] in slots {
 -            if key == 0 { continue; }
 -            let person = names[id as usize];

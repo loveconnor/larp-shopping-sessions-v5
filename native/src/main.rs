@@ -277,16 +277,16 @@ impl Dim {
     }
 }
 
-#[repr(C, align(64))]
+#[repr(C, align(32))]
 #[derive(Clone, Default)]
 struct AliasGroup {
     keys: [u64; 4],
-    values: [u64; 4],
 }
 
 /// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
     slots: Vec<AliasGroup>,
+    values: Vec<[u64; 4]>,
     shift: u32,
     empty: bool,
 }
@@ -367,7 +367,9 @@ impl Links {
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
+        let mut values = vec![[0u64; 4]; count];
         huge(groups.as_ptr(), count);
+        huge(values.as_ptr(), count);
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
@@ -377,13 +379,13 @@ impl Links {
                 let group = &mut groups[at];
                 if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
                     group.keys[lane] = key;
-                    group.values[lane] = person;
+                    values[at][lane] = person;
                     break;
                 }
                 at = (at + 1) & (count - 1);
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        Self { slots: groups, values, shift, empty: aliases == 0 }
     }
 
     #[inline(always)]
@@ -408,11 +410,11 @@ impl Links {
                 let keys = _mm256_load_si256(group.keys.as_ptr().cast());
                 let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
                 let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
+                if found != 0 { return self.values[slot][found.trailing_zeros() as usize]; }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
+                return self.values[slot][lane];
             }
             if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
