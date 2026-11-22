@@ -218,6 +218,31 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+// Intel's PDEP identifies the fifth delimiter independently of the first
+// four. The two short bit-removal chains can execute in parallel.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4"))]
+#[inline(always)]
+unsafe fn narrow_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        let fifth = std::arch::x86_64::_pdep_u64(16, bits);
+        let mut high = bits & fifth.wrapping_neg();
+        let mut low = bits;
+        for i in 0..4 {
+            *out.add(i) = base + low.trailing_zeros();
+            *out.add(i + 4) = base + high.trailing_zeros();
+            low &= low.wrapping_sub(1);
+            high &= high.wrapping_sub(1);
+        }
+        let mut written = 8;
+        while high != 0 {
+            *out.add(written) = base + high.trailing_zeros();
+            written += 1;
+            high &= high - 1;
+        }
+        bits.count_ones() as usize
+    }
+}
+
 /// Writes the position of every set bit of `bits`, plus `base`, at `out`,
 /// and returns how many. Up to `UNROLL` are written without a branch; `out`
 /// needs room for 64 + `UNROLL`.
@@ -599,7 +624,12 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else {
+                        #[cfg(all(target_feature = "bmi2", feature = "narrow-v4"))]
+                        { narrow_positions(sep, at, out.add(count)) }
+                        #[cfg(not(all(target_feature = "bmi2", feature = "narrow-v4")))]
+                        { flatten::<10>(sep, at, out.add(count)) }
+                    };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
