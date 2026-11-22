@@ -1,0 +1,56 @@
+name: Collect host-specific Shopping Sessions compiler profiles
+on:
+  push:
+    branches: [bench/parser-training]
+permissions:
+  contents: read
+jobs:
+  profile:
+    strategy:
+      matrix:
+        seed: [643211, 643309, 643373]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 57cef8736eaaca27598d2fe9ea5d4dbbec9730b3
+      - name: Generate v5 training input and collect LLVM counters
+        run: |
+          lscpu | grep -E "^Model name|^CPU\(s\)"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          rows=20000000
+          if [ ${{ matrix.seed }} = 643373 ]; then rows=60000000; fi
+          generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
+          mkdir "$RUNNER_TEMP/profile"
+          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
+            cp -a /src /tmp/native
+            cd /tmp/native
+            apt-get update -qq && apt-get install -yq --no-install-recommends patch
+            rustup component add llvm-tools-preview
+            merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
+            for level in v3 v4 wide; do
+              cpu=x86-64-$level
+              feature=
+              if [ "$level" != v3 ]; then
+                grep -qw avx512bw /proc/cpuinfo || continue
+              fi
+              if [ "$level" = wide ]; then
+                grep -qw avx512_vbmi2 /proc/cpuinfo || continue
+                patch -p2 < platform/wide.patch
+                cpu=x86-64-v4
+                feature="-C target-feature=+avx512vbmi2"
+              fi
+              mkdir /work/profile/$level
+              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --release --locked --target x86_64-unknown-linux-gnu
+              NCPU=8 DATA_DIR=/work/train OUTPUT_DIR=/work/out-$level target/x86_64-unknown-linux-gnu/release/shopping-sessions
+              "$merger" merge --sparse /work/profile/$level/*.profraw -o /work/profile/$level.profdata
+            done
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleet-counters-${{ matrix.seed }}
+          path: ${{ runner.temp }}/profile/*.profdata
