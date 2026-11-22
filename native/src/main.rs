@@ -296,9 +296,12 @@ impl Links {
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
-        let mut slots = vec![[0u64; 2]; capacity];
+        let index_bits = capacity.trailing_zeros();
+        let mut slots = vec![0u64; capacity];
         huge(slots.as_ptr(), capacity);
         let mut names: Vec<u64> = Vec::new();
+        let mut overflow_heads: Vec<u32> = Vec::new();
+        let mut overflow: Vec<(u64, u32, u32)> = Vec::new();
         let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
 
         fn find(parent: &mut [u32], mut at: u32) -> u32 {
@@ -323,22 +326,46 @@ impl Links {
             }
             let mut index = [0u32; 2];
             for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
+                let mixed = key.wrapping_mul(MIX);
+                let cell = &mut slots[(mixed >> shift) as usize];
+                let quotient = mixed << index_bits;
+                // The home position and quotient recover every bit of the
+                // bijective hash. The low bits hold a one-based dense ordinal.
+                if *cell == 0 {
+                    let id = u32::try_from(names.len()).expect("too many link endpoints");
+                    *cell = quotient | (u64::from(id) + 1);
+                    names.push(key);
+                    overflow_heads.push(NONE);
+                    index[side] = id;
+                } else {
+                    let owner = ((*cell & mask as u64) - 1) as u32;
+                    index[side] = if (*cell ^ quotient) >> index_bits == 0 {
+                        owner
+                    } else {
+                        let head = overflow_heads[owner as usize];
+                        let mut node = head;
+                        loop {
+                            if node == NONE {
+                                let id = u32::try_from(names.len()).expect("too many link endpoints");
+                                overflow_heads[owner as usize] = overflow.len() as u32;
+                                overflow.push((key, id, head));
+                                names.push(key);
+                                overflow_heads.push(NONE);
+                                break id;
+                            }
+                            let (other, id, next) = overflow[node as usize];
+                            if other == key { break id; }
+                            node = next;
+                        }
+                    };
+                }
             }
             numbered.push(index);
         }
+        drop(slots);
+        drop(overflow_heads);
+        drop(overflow);
+        let original = names.clone();
         // Join. The smaller number is the root, so no cycle can form.
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
@@ -368,9 +395,7 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
+        for (key, person) in original.into_iter().zip(names) {
             if key == person { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
@@ -416,6 +441,53 @@ impl Links {
             }
             if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_links_match_connected_components_with_random_edge_order() {
+    const N: usize = 1536;
+    let names: Vec<_> = (0..N).map(|i| format!("u{:04}", (i * 463) % N)).collect();
+    let keys: Vec<_> = names.iter().map(|s| {
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.resize(bytes.len() + 64, 0);
+        unsafe { keys::pack(bytes.as_ptr(), s.len()) }
+    }).collect();
+    let mut state = 947_153u64;
+    let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as usize };
+    for _ in 0..8 {
+        let mut graph = vec![Vec::new(); N];
+        let mut edges = Vec::new();
+        let mut join = |a: usize, b: usize| {
+            graph[a].push(b);
+            graph[b].push(a);
+            edges.push((keys[a], keys[b]));
+        };
+        for i in 1..767 { join(i - 1, i); }
+        for i in 0..3000 {
+            let a = 800 + next() % 700;
+            let b = (a / 20) * 20 + next() % 20;
+            join(a, b);
+            if i % 5 == 0 { join(b, a); join(a, a); }
+        }
+        for i in (1..edges.len()).rev() { edges.swap(i, next() % (i + 1)); }
+        let links = Links::build(&edges);
+        let mut seen = vec![false; N];
+        for start in 0..N {
+            if seen[start] { continue; }
+            let mut component = Vec::new();
+            let mut todo = vec![start];
+            seen[start] = true;
+            while let Some(id) = todo.pop() {
+                component.push(id);
+                for &other in &graph[id] {
+                    if !seen[other] { seen[other] = true; todo.push(other); }
+                }
+            }
+            let best = *component.iter().min_by_key(|&&id| &names[id]).unwrap();
+            for id in component { assert_eq!(links.person(keys[id]), keys[best]); }
         }
     }
 }
