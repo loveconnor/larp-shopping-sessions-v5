@@ -535,9 +535,7 @@ impl Block {
             let end = end as u32;
             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
-            // Rows intersecting this interval get exact quote validation.
-            // It also covers clean chunks between two malformed ones.
-            let mut bad_start = u32::MAX;
+            // End of the latest suspect chunk already passed by the row cursor.
             let mut bad_end = 0u32;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
@@ -556,6 +554,9 @@ impl Block {
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
                 let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
+                const { assert!(WINDOW <= u64::BITS as usize); }
+                let window_start = at;
+                let mut bad_chunks = 0u64;
                 while at < stop_at {
                     let p = buf.add(at as usize);
                     fetch(p.wrapping_add(READ_AHEAD));
@@ -590,8 +591,7 @@ impl Block {
                         let wrong = misplaced | ((sum ^ quote_before) & sep);
                         carry = u64::from(over);
                         if wrong != 0 {
-                            bad_start = bad_start.min(at);
-                            bad_end = at.saturating_add(64);
+                            bad_chunks |= 1 << ((at - window_start) / 64);
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
@@ -606,11 +606,20 @@ impl Block {
                 for extra in 0..N {
                     *out.add(count + extra) = u32::MAX;
                 }
+                let next_bad_start = |bits: u64| {
+                    if bits == 0 { u32::MAX } else { window_start + bits.trailing_zeros() * 64 }
+                };
+                let mut bad_start = next_bad_start(bad_chunks);
                 let mut sep_at = 0usize;
                 for &stop in std::slice::from_raw_parts(ends, lines) {
                     let start = line;
                     line = stop + 1;
-                    let clean = stop < bad_start || start >= bad_end;
+                    while bad_start <= stop {
+                        bad_end = bad_start.saturating_add(64);
+                        bad_chunks &= bad_chunks - 1;
+                        bad_start = next_bad_start(bad_chunks);
+                    }
+                    let clean = start >= bad_end;
                     if *out.add(sep_at + N - 1) == stop && clean {
                         visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
                         sep_at += N;
@@ -626,9 +635,10 @@ impl Block {
                         }
                     }
                 }
-                if bad_end <= line {
-                    bad_start = u32::MAX;
-                    bad_end = 0;
+                if bad_chunks != 0 {
+                    // Remaining marks are in the unfinished row. Its next
+                    // newline comes in a later window and must use split_line.
+                    bad_end = at;
                 }
                 // Separators of the line still open move to the front.
                 kept = count - sep_at;
