@@ -176,6 +176,75 @@ fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) 
     }
 }
 
+/// Input lanes begin at byte boundaries. Shift each lane by its intra-byte
+/// offset, then assemble each output byte from the lanes on either side.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+mod wide_stream {
+    use std::arch::x86_64::*;
+
+    struct Layout {
+        shifts: [u64; 8],
+        first: [u8; 64],
+        second: [u8; 64],
+        overlap: u64,
+    }
+
+    const fn layout(width: usize) -> Layout {
+        let mut result = Layout { shifts: [0; 8], first: [0; 64], second: [0; 64], overlap: 0 };
+        let mut lane = 0;
+        while lane < 8 {
+            result.shifts[lane] = ((lane * width) % 8) as u64;
+            lane += 1;
+        }
+        let mut byte = 0;
+        while byte < width {
+            let owner = (byte * 8) / width;
+            result.first[byte] = (8 * owner + byte - (owner * width) / 8) as u8;
+            let boundary = (owner + 1) * width;
+            if owner < 7 && boundary < (byte + 1) * 8 {
+                result.second[byte] = (8 * (owner + 1)) as u8;
+                result.overlap |= 1u64 << byte;
+            }
+            byte += 1;
+        }
+        result
+    }
+
+    const LAYOUTS: [Layout; 16] = {
+        let mut table = [const { layout(17) }; 16];
+        let mut slot = 0;
+        while slot < 16 { table[slot] = layout(17 + slot); slot += 1; }
+        table
+    };
+
+    #[target_feature(enable = "avx512vbmi,avx512bw")]
+    pub unsafe fn append(out: &mut Vec<u8>, deltas: &[i64], least: i64, width: usize) {
+        // Caller passes one full 32-value miniblock, each offset fits in width bits.
+        debug_assert_eq!(deltas.len(), 32);
+        let plan = &LAYOUTS[width - 17];
+        let count = 4 * width;
+        let start = out.len();
+        out.reserve(count);
+        unsafe {
+            let shifts = _mm512_loadu_si512(plan.shifts.as_ptr().cast());
+            let first = _mm512_loadu_si512(plan.first.as_ptr().cast());
+            let second = _mm512_loadu_si512(plan.second.as_ptr().cast());
+            let bias = _mm512_set1_epi64(least);
+            let mask = (1u64 << width) - 1;
+            let mut dst = out.as_mut_ptr().add(start);
+            for group in deltas.chunks_exact(8) {
+                let values = _mm512_sub_epi64(_mm512_loadu_si512(group.as_ptr().cast()), bias);
+                let shifted = _mm512_sllv_epi64(values, shifts);
+                let low = _mm512_permutexvar_epi8(first, shifted);
+                let high = _mm512_maskz_permutexvar_epi8(plan.overlap, second, shifted);
+                _mm512_mask_storeu_epi8(dst.cast(), mask, _mm512_or_si512(low, high));
+                dst = dst.add(width);
+            }
+            out.set_len(start + count);
+        }
+    }
+}
+
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
 /// miniblock packed at the width its largest delta above the block's minimum needs.
 fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
@@ -211,6 +280,11 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
             if widths[mini] == 0 { continue; }
             if from + MINI <= count {
                 let group = &deltas[from..from + MINI];
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+                if (17..=32).contains(&widths[mini]) && std::is_x86_feature_detected!("avx512vbmi") {
+                    unsafe { wide_stream::append(out, group, least, widths[mini] as usize); }
+                    continue;
+                }
                 match widths[mini] {
                     1 => { pack_eight::<1>(out, group, least); continue; }
                     2 => { pack_eight::<2>(out, group, least); continue; }
@@ -563,6 +637,33 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn vector_revenue_stream_matches_every_output_bit() {
+        if !std::is_x86_feature_detected!("avx512vbmi") { return; }
+        let mut state = 930815u64;
+        for width in 17..=32 {
+            let mask = (1u64 << width) - 1;
+            for least in [i64::MIN, -1, 0, 547, i64::MAX] {
+                for bit in 0..width {
+                    let mut offsets = [0; 32];
+                    for (i, value) in offsets.iter_mut().enumerate() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *value = match i % 4 { 0 => mask, 1 => 1 << bit, 2 => 0, _ => state & mask };
+                    }
+                    let deltas = offsets.map(|v| least.wrapping_add(v as i64));
+                    let mut expected = vec![9, 1, 3];
+                    let mut actual = expected.clone();
+                    pack(&mut expected, offsets.into_iter(), width as u32);
+                    unsafe { wide_stream::append(&mut actual, &deltas, least, width); }
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 
     #[test]
