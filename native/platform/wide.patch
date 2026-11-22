@@ -1,19 +1,31 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 371b35d..89968a0 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -335,6 +335,10 @@ impl Links {
-             }
-             numbered.push(index);
-         }
-+        // The hash index is only needed while numbering. Retain the original
-+        // keys densely for the final alias table, then free the sparse index.
-+        drop(slots);
-+        let original = names.clone();
-         // Join. The smaller number is the root, so no cycle can form.
+@@ -315,6 +315,7 @@
+ 
+         // Number the IDs as they appear; each pass below prefetches what the
+         // pass will touch a few steps on, since every touch is a cache miss.
++        let mut original = Vec::new();
+         let mut parent = Vec::with_capacity(pairs.len());
          let mut aliases = 0usize;
-         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-@@ -364,9 +368,7 @@ impl Links {
+         const BATCH: usize = 64;
+@@ -336,6 +337,7 @@
+                         if entry[0] == 0 {
+                             *entry = [key, names.len() as u64];
+                             parent.push(names.len() as u32);
++                            original.push(key);
+                             names.push(key);
+                             break (names.len() - 1) as u32;
+                         }
+@@ -364,6 +366,7 @@
+                 }
+             }
+         }
++        drop(slots);
+         // Parents always have smaller indices. In ascending order their
+         // canonical names have already been resolved, even along long chains.
+         for (id, &up) in parent.iter().enumerate() {
+@@ -373,9 +376,7 @@
          let shift = 64 - count.trailing_zeros();
          let mut groups = vec![AliasGroup::default(); count];
          huge(groups.as_ptr(), count);

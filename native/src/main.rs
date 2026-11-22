@@ -315,47 +315,52 @@ impl Links {
 
         // Number the IDs as they appear; each pass below prefetches what the
         // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
-                prefetch(&slots[home(c)]);
-                prefetch(&slots[home(d)]);
-            }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-            }
-            numbered.push(index);
-        }
-        // Join. The smaller number is the root, so no cycle can form.
+        let mut parent = Vec::with_capacity(pairs.len());
         let mut aliases = 0usize;
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-        for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
-                prefetch(&parent[c as usize]);
-                prefetch(&parent[d as usize]);
+        const BATCH: usize = 64;
+        let mut numbered = [[0u32; 2]; BATCH];
+        for batch in pairs.chunks(BATCH) {
+            for (at, &(a, b)) in batch.iter().enumerate() {
+                if let Some(&(c, d)) = batch.get(at + 8) {
+                    prefetch(&slots[home(c)]);
+                    prefetch(&slots[home(d)]);
+                }
+                let mut index = [0u32; 2];
+                for (side, key) in [a, b].into_iter().enumerate() {
+                    let mut slot = home(key);
+                    index[side] = loop {
+                        let entry = &mut slots[slot];
+                        if entry[0] == key {
+                            break entry[1] as u32;
+                        }
+                        if entry[0] == 0 {
+                            *entry = [key, names.len() as u64];
+                            parent.push(names.len() as u32);
+                            names.push(key);
+                            break (names.len() - 1) as u32;
+                        }
+                        slot = (slot + 1) & mask;
+                    };
+                }
+                numbered[at] = index;
             }
-            let a = find(&mut parent, a);
-            let b = find(&mut parent, b);
-            if a != b {
-                aliases += 1;
-                let root = a.min(b) as usize;
-                let child = a.max(b) as usize;
-                parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
+            // Numbered endpoints are still hot. Linking this block now
+            // also avoids storing every numbered edge until the graph is built.
+            for (at, &[a, b]) in numbered[..batch.len()].iter().enumerate() {
+                if let Some(&[c, d]) = numbered[..batch.len()].get(at + 8) {
+                    prefetch(&parent[c as usize]);
+                    prefetch(&parent[d as usize]);
+                }
+                let a = find(&mut parent, a);
+                let b = find(&mut parent, b);
+                if a != b {
+                    aliases += 1;
+                    let root = a.min(b) as usize;
+                    let child = a.max(b) as usize;
+                    parent[child] = root as u32;
+                    if keys::compare(names[child], names[root]) == Order::Less {
+                        names[root] = names[child];
+                    }
                 }
             }
         }
