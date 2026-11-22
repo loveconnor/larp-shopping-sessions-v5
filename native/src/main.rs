@@ -354,15 +354,20 @@ impl Links {
                 let root = a.min(b) as usize;
                 let child = a.max(b) as usize;
                 parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
-                }
             }
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+        // Parents always have smaller indices. Visit each original name once
+        // after union, while link resolution touches a single component root.
+        for id in 0..parent.len() {
+            let root = parent[parent[id] as usize];
+            parent[id] = root;
+            let root = root as usize;
+            if id != root && keys::compare(names[id], names[root]) == Order::Less {
+                names[root] = names[id];
+            }
+        }
+        for (id, &root) in parent.iter().enumerate() {
+            names[id] = names[root as usize];
         }
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
