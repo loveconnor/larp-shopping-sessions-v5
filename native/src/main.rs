@@ -1076,6 +1076,7 @@ struct Sessions<'a> {
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
+    assists: Vec<i64>,
     /// Clicks of each campaign inside the current 7-day reach.
     reach: Vec<u32>,
     place: Vec<u32>,
@@ -1162,8 +1163,10 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
+            let campaigns = self.reach.len();
+            let today = &mut self.assists[(day as usize) * campaigns..][..campaigns];
             for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+                today[campaign as usize] += 1;
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1379,6 +1382,7 @@ fn session_worker(
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
+        assists: vec![0; campaigns * shared.days],
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
         active: Vec::new(),
@@ -1579,6 +1583,11 @@ fn session_worker(
     let wrote = sessions.writer.is_some();
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
+    }
+    for (day, counters) in sessions.assists.chunks_exact(campaigns).enumerate() {
+        for (campaign, &assists) in counters.iter().enumerate() {
+            sessions.totals[campaign * shared.days + day][3] = assists;
+        }
     }
     Ok((sessions.totals, wrote))
 }
