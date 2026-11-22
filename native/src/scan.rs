@@ -450,6 +450,66 @@ impl Block {
         Ok(())
     }
 
+    /// Index newlines in a cache-sized window before decoding the independent rows.
+    #[cfg(target_arch="x86_64")]
+    #[target_feature(enable="avx512bw,avx512vbmi2")]
+    unsafe fn newline_first<const N:usize>(&self, mut visit:impl FnMut(*const u8,u32,&[u32;N])) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let buf=self.base;
+            let bytes=std::slice::from_raw_parts(buf,self.end);
+            let Some(head)=bytes[..self.own_end.min(self.end)].iter().position(|&b|b==b'\n') else{return;};
+            let mut line=head+1;
+            let mut scan=line;
+            let mut stops=[0u32;4096];
+            while scan<self.end {
+                let mut nr=0;
+                let stop=(scan+4096).min(self.end);
+                while scan<stop {
+                    let data=_mm512_loadu_si512(buf.add(scan).cast());
+                    let mut mask=_mm512_cmpeq_epi8_mask(data,_mm512_set1_epi8(10));
+                    if self.end-scan<64 {mask&=(1u64<<(self.end-scan))-1;}
+                    while mask!=0 {
+                        stops[nr]=scan as u32+mask.trailing_zeros();
+                        nr+=1;
+                        mask&=mask-1;
+                    }
+                    scan+=64;
+                }
+                for &nl in &stops[..nr] {
+                    let len=nl as usize+1-line;
+                    if len>128 {
+                        if let Some(row)=Self::split_line::<N>(buf,line) {visit(buf,line as u32,&row);}
+                        line=nl as usize+1;
+                        continue;
+                    }
+                    let classify=|p:*const u8| {
+                        let data=_mm512_loadu_si512(p.cast());
+                        (_mm512_cmpeq_epi8_mask(data,_mm512_set1_epi8(44)),_mm512_cmpeq_epi8_mask(data,_mm512_set1_epi8(34)))
+                    };
+                    let p=buf.add(line);
+                    let (cl,ql)=classify(p);
+                    let (ch,qh)=if len>64 {classify(p.add(64))} else {(0,0)};
+                    let endbit=1u128<<(len-1);
+                    let valid=endbit-1;
+                    let seps=((u128::from(cl)|(u128::from(ch)<<64))&valid)|endbit;
+                    let q=(u128::from(ql)|(u128::from(qh)<<64))&valid;
+                    let open=q&((seps<<1)|1);
+                    let close=q&(seps>>1);
+                    let wrong=q^open^close|(((!seps).wrapping_add(open)^(q<<1)) & seps);
+                    if wrong==0 && seps.count_ones()==N as u32 {
+                        let mut temp=std::mem::MaybeUninit::<[u32;32]>::uninit();
+                        let dst=temp.as_mut_ptr().cast::<u32>();
+                        let count=wide_positions(seps as u64,line as u32,dst);
+                        if count<N {wide_positions((seps>>64) as u64,line as u32+64,dst.add(count));}
+                        visit(buf,line as u32,&*dst.cast::<[u32;N]>());
+                    }
+                    line=nl as usize+1;
+                }
+            }
+        }
+    }
+
     /// The separators of the line starting at `start`, the old way: its
     /// bytes in 64-byte windows. `None` if the line is malformed.
     #[inline(never)]
@@ -522,6 +582,8 @@ impl Block {
 
     #[inline(always)]
     fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+        #[cfg(target_arch="x86_64")]
+        if WIDE && N==7 {return unsafe {self.newline_first(visit)};}
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
