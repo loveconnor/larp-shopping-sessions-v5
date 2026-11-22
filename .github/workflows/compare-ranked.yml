@@ -12,17 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 608207, engine: n4}
-          - {events: 60000000, format: current, seed: 608207, engine: n4}
-          - {events: 20000000, format: current, seed: 608259, engine: n4}
-          - {events: 60000000, format: current, seed: 608259, engine: n4}
+          - {events: 20000000, format: current, seed: 2026703}
+          - {events: 60000000, format: current, seed: 2026703}
+          - {events: 20000000, format: current, seed: 2026799}
+          - {events: 60000000, format: current, seed: 2026799}
     env:
-      ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
-      CANDIDATE: 0a6687303b62e295038b3b901fddb7ecd26b9ef1
+      RANKED: cc4c49a3794fecc6b9b155513ed427936df66f1b
+      CANDIDATE: a7ee7cb29a5f3872491f2f2abde73e4d6507677a
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,7 +33,7 @@ jobs:
           for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label"  = n4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -60,9 +59,6 @@ jobs:
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          if os.environ["ENGINE"] == "n4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
-              print("Host has no v4 engine. Skipping this comparison.", flush=True)
-              raise SystemExit(0)
           cpus = sorted(os.sched_getaffinity(0))[:8]
           cpuset = ",".join(map(str, cpus))
           labels = ["ranked", "candidate"]
@@ -82,7 +78,7 @@ jobs:
                       "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
                       "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
                       "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
-                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label, "/app/shopping-sessions." + os.environ["ENGINE"]]
+                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label]
                   cid = subprocess.check_output(args, text=True).strip()
                   try:
                       subprocess.run(["docker", "start", "-a", cid], check=True)
@@ -115,16 +111,15 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
           for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
-              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions.$ENGINE"
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
               python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
             done
             rm -rf verify-out
             mkdir -p verify-out
-            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions.$ENGINE"
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
             python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
           done
