@@ -222,6 +222,26 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Decode thirteen ASCII digits into epoch milliseconds. The scanner pads each
+/// input block, so the final three bytes of the vector are readable and ignored.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn epoch13(p: *const u8) -> i64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let bytes = _mm_loadu_si128(p.cast());
+        let digits = _mm_slli_si128::<3>(_mm_sub_epi8(bytes, _mm_set1_epi8(b'0' as i8)));
+        let invalid = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if _mm_testz_si128(invalid, invalid) == 0 {
+            return BAD;
+        }
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        let halves = _mm_madd_epi16(_mm_packs_epi32(quads, quads), _mm_set1_epi32(0x00012710));
+        i64::from(_mm_cvtsi128_si32(halves)) * 100_000_000 + i64::from(_mm_extract_epi32::<1>(halves))
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
@@ -234,12 +254,17 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             return BAD;
         }
         if len == 13 {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            { return epoch13(p); }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
             let high = load64(p) ^ 0x3030_3030_3030_3030;
             let low = load64(p.add(5)) ^ 0x3030_3030_3030_3030;
             if not_digits(high) | not_digits(low) == 0 {
                 return (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64;
             }
             return BAD;
+            }
         }
         if len == 25 {
             let sign = *p.add(19);
