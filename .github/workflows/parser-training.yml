@@ -8,12 +8,12 @@ jobs:
   profile:
     strategy:
       matrix:
-        seed: [573211, 573309, 573373]
+        seed: [284239, 284311, 284377]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9fe069f5c76dd1b1e16c394f7fd8d684f98325c7
+          ref: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
@@ -23,7 +23,7 @@ jobs:
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
           rows=20000000
-          if [ ${{ matrix.seed }} = 573373 ]; then rows=60000000; fi
+          if [ ${{ matrix.seed }} = 284377 ]; then rows=60000000; fi
           generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
           mkdir "$RUNNER_TEMP/profile"
           docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
