@@ -606,27 +606,36 @@ impl Block {
                 }
                 bad.push(u32::MAX - 64);
                 let mut sep_at = 0usize;
-                for &stop in std::slice::from_raw_parts(ends, lines) {
+                let stops = std::slice::from_raw_parts(ends, lines);
+                let mut verified = 0;
+                for (row, &stop) in stops.iter().enumerate() {
                     let start = line;
                     line = stop + 1;
-                    while *bad.get_unchecked(bad_at) + 64 <= start {
-                        bad_at += 1;
-                    }
-                    let clean = *bad.get_unchecked(bad_at) > stop;
-                    if *out.add(sep_at + N - 1) == stop && clean {
-                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
-                        sep_at += N;
-                        continue;
-                    }
-                    while *out.add(sep_at) < stop {
-                        sep_at += 1;
-                    }
-                    sep_at += 1;
-                    if !clean {
-                        if let Some(found) = Self::split_line::<N>(buf, start as usize) {
-                            visit(buf, start, &found);
+                    if row >= verified {
+                        while *bad.get_unchecked(bad_at) + 64 <= start {
+                            bad_at += 1;
+                        }
+                        let trouble = *bad.get_unchecked(bad_at);
+                        if row + 8 <= lines && sep_at + 8 * N <= count && trouble > stops[row + 7] {
+                            let mut difference = 0;
+                            for i in 0..8 {
+                                difference |= *out.add(sep_at + (i + 1) * N - 1) ^ stops[row + i];
+                            }
+                            if difference == 0 { verified = row + 8; }
+                        }
+                        if row >= verified && (*out.add(sep_at + N - 1) != stop || trouble <= stop) {
+                            while *out.add(sep_at) < stop { sep_at += 1; }
+                            sep_at += 1;
+                            if trouble <= stop {
+                                if let Some(found) = Self::split_line::<N>(buf, start as usize) {
+                                    visit(buf, start, &found);
+                                }
+                            }
+                            continue;
                         }
                     }
+                    visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                    sep_at += N;
                 }
                 bad.pop();
                 // Separators of the line still open move to the front.
