@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 674921}
-          - {events: 60000000, format: current, seed: 674921}
-          - {events: 20000000, format: current, seed: 674987}
-          - {events: 60000000, format: current, seed: 674987}
+          - {events: 20000000, format: current, seed: 3024109}
+          - {events: 60000000, format: current, seed: 3024109}
+          - {events: 20000000, format: current, seed: 3024209}
+          - {events: 60000000, format: current, seed: 3024209}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
-      CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
+      CANDIDATE: 5f9b7adf591641c8c4633aea2ac07c6bb760b8a8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,13 +30,18 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          mkdir "$RUNNER_TEMP/src"
-          git archive "$RANKED" | tar -x -C "$RUNNER_TEMP/src"
-          docker build -q -t ranked "$RUNNER_TEMP/src"
-          printf '%s\n' 'FROM ranked' 'RUN apt-get update && apt-get install -y --no-install-recommends libmimalloc2.0 libtcmalloc-minimal4 && rm -rf /var/lib/apt/lists/*' > "$RUNNER_TEMP/Dockerfile.allocators"
-          docker build -q -t allocator-test -f "$RUNNER_TEMP/Dockerfile.allocators" "$RUNNER_TEMP/src"
-          docker run --rm --entrypoint sh allocator-test -c "ldconfig -p | grep -E 'jemalloc|mimalloc|tcmalloc'"
-
+          for label in ranked candidate; do
+            sha=$CANDIDATE
+            if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            mkdir "$RUNNER_TEMP/$label-src"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
+            docker rm "$cid"
+          done
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
@@ -47,45 +52,74 @@ jobs:
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
-      - name: Measure cache partition sizes with exact table equality
+      - name: Alternate fresh restricted runc containers and compare both complete output tables
         shell: python
         run: |
-          import datetime,json,os,pathlib,random,subprocess,statistics
+          import datetime, json, os, pathlib, shutil, statistics, subprocess
           import duckdb
-          root=pathlib.Path(os.environ['RUNNER_TEMP'])
-          total=int(os.environ['EVENTS'])
-          variants={'ranked':{},'glibc':{'LD_PRELOAD':''},'glibc-retained':{'LD_PRELOAD':'','MALLOC_ARENA_MAX':'2','MALLOC_TRIM_THRESHOLD_':'-1'},
-                    'mimalloc':{'LD_PRELOAD':'libmimalloc.so.2'},'mimalloc-commit':{'LD_PRELOAD':'libmimalloc.so.2','MIMALLOC_EAGER_COMMIT':'1'},
-                    'tcmalloc':{'LD_PRELOAD':'libtcmalloc_minimal.so.4'},'tcmalloc-retain':{'LD_PRELOAD':'libtcmalloc_minimal.so.4','TCMALLOC_RELEASE_RATE':'0'}}
-          for arenas,thp in ((1,'always'),(4,'always'),(8,'always'),(2,'never'),(2,'default'),(8,'default')):
-              variants[f'jem-{arenas}-{thp}']={'MALLOC_CONF':f'narenas:{arenas},background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:{thp},metadata_thp:auto'}
-          cpus=','.join(str(x) for x in sorted(os.sched_getaffinity(0))[:8])
-          print('CACHETEST',cpus,total,flush=True)
-          samples={k:[] for k in variants}
-          def stamp(s): return datetime.datetime.fromisoformat(s.removesuffix('Z')[:26]+'+00:00')
-          def take(k):
-              out=root/f'cache-{k}'
-              out.mkdir(exist_ok=True);out.chmod(0o777)
-              env={'NCPU':'8','MEM_GB':'24','DATA_DIR':'/data','OUTPUT_DIR':'/output','SCRATCH_DIR':'/scratch',**variants[k]}
-              args=['docker','create','--cpuset-cpus',cpus,'--memory','12g','--memory-swap','12g','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','1000:1000','--tmpfs','/tmp:rw,size=64m','--tmpfs','/scratch:rw,mode=1777','-v',f'{root}/data:/data:ro','-v',f'{out}:/output']
-              for key,value in env.items():args+=['-e',f'{key}={value}']
-              cid=subprocess.check_output(args+['allocator-test'],text=True).strip()
-              try:
-                  subprocess.run(['docker','start','-a',cid],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                  st=json.loads(subprocess.check_output(['docker','inspect',cid]))[0]['State'];assert st['ExitCode']==0
-                  return (stamp(st['FinishedAt'])-stamp(st['StartedAt'])).total_seconds()
-              finally:subprocess.run(['docker','rm','-f',cid],stdout=subprocess.DEVNULL)
-          def verify(k):
-              for table in ('user_daily','campaign_daily'):
-                  a,b=[f"SELECT * FROM read_parquet('{root}/cache-{v}/{table}/*.parquet')" for v in ('ranked',k)]
-                  for x,y in ((a,b),(b,a)):assert duckdb.sql(f'SELECT count(*) FROM ({x} EXCEPT ALL {y})').fetchone()[0]==0
-          take('ranked')
-          for rnd in range(6):
-              order=list(variants);random.Random(3521+rnd).shuffle(order)
-              for k in order:
-                  t=take(k)
-                  if rnd:samples[k].append(t)
-                  elif k!='ranked':verify(k)
-          ref=statistics.median(samples['ranked'])
-          for k in sorted(samples,key=lambda x:statistics.median(samples[x])):print('ALLOCATOR_RESULT',k,round(statistics.median(samples[k])/ref,4),flush=True)
 
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          cpus = sorted(os.sched_getaffinity(0))[:8]
+          cpuset = ",".join(map(str, cpus))
+          labels = ["ranked", "candidate"]
+          samples = {label: [] for label in labels}
+          print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
+          scratch = root / "scratch"
+          scratch.mkdir(mode=0o777)
+          scratch.chmod(0o777)
+          for round_number in range(6):
+              for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  output = root / f"{label}-out-{round_number}"
+                  output.mkdir()
+                  output.chmod(0o777)
+                  args = ["docker", "create", "--runtime", "runc", "--cpuset-cpus", cpuset,
+                      "--memory", "12g", "--memory-swap", "12g", "--network", "none",
+                      "--read-only", "--user", "1000:1000", "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+                      "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
+                      "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
+                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label]
+                  cid = subprocess.check_output(args, text=True).strip()
+                  try:
+                      subprocess.run(["docker", "start", "-a", cid], check=True)
+                      state = json.loads(subprocess.check_output(["docker", "inspect", cid]))[0]["State"]
+                      assert state["ExitCode"] == 0 and not state["OOMKilled"], state
+                      def stamp(value):
+                          return datetime.datetime.fromisoformat(value.removesuffix("Z")[:26] + "+00:00")
+                      seconds = (stamp(state["FinishedAt"]) - stamp(state["StartedAt"])).total_seconds()
+                      if round_number:
+                          samples[label].append(seconds)
+                      print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
+                  finally:
+                      subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
+          for table in ("user_daily", "campaign_daily"):
+              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-5/{table}/*.parquet')" for label in labels]
+              for lhs, rhs in ((a,b),(b,a)):
+                  assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
+          for label in labels:
+              m = statistics.median(samples[label])
+              print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+
+      - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: matrix.events == 20000000 && matrix.format == 'current'
+        run: |
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/starter-polars.zip"
+          curl --retry 3 -fsSLO "$track/dev-answer.zip"
+          unzip -q starter-polars.zip
+          echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
+          unzip -q dev-answer.zip
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in candidate; do
+            for fixture in starter-polars/fixtures/*/; do
+              rm -rf verify-out
+              mkdir -p verify-out
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
+            done
+            rm -rf verify-out
+            mkdir -p verify-out
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
+          done
