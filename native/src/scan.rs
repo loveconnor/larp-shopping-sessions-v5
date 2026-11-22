@@ -593,9 +593,9 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<7>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
-                    let positions = flatten::<10>(sep, at, out.add(count));
+                    let positions = flatten::<7>(sep, at, out.add(count));
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
