@@ -1076,6 +1076,8 @@ struct Sessions<'a> {
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
+    assist_counts: Vec<u16>,
+    assist_sessions: Vec<u16>,
     /// Clicks of each campaign inside the current 7-day reach.
     reach: Vec<u32>,
     place: Vec<u32>,
@@ -1085,6 +1087,15 @@ struct Sessions<'a> {
 }
 
 impl Sessions<'_> {
+    fn flush_assists(&mut self, day: usize) {
+        let campaigns = self.reach.len();
+        let start = day * campaigns;
+        for (campaign, count) in self.assist_counts[start..start + campaigns].iter_mut().enumerate() {
+            self.totals[campaign * self.shared.days + day][3] += i64::from(std::mem::take(count));
+        }
+        self.assist_sessions[day] = 0;
+    }
+
     fn row(&mut self, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) -> io::Result<()> {
         let shared = self.shared;
         if self.writer.is_none() {
@@ -1162,8 +1173,19 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+            // A campaign appears at most once in the active set. One bound
+            // per session therefore covers every counter in the daily slice.
+            if high > low {
+                let day = day as usize;
+                if self.assist_sessions[day] == u16::MAX {
+                    self.flush_assists(day);
+                }
+                self.assist_sessions[day] += 1;
+                let campaigns = self.reach.len();
+                let today = &mut self.assist_counts[day * campaigns..][..campaigns];
+                for &campaign in &self.active {
+                    today[campaign as usize] += 1;
+                }
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1379,6 +1401,8 @@ fn session_worker(
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
+        assist_counts: vec![0; campaigns * shared.days],
+        assist_sessions: vec![0; shared.days],
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
         active: Vec::new(),
@@ -1579,6 +1603,11 @@ fn session_worker(
     let wrote = sessions.writer.is_some();
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
+    }
+    for day in 0..shared.days {
+        if sessions.assist_sessions[day] != 0 {
+            sessions.flush_assists(day);
+        }
     }
     Ok((sessions.totals, wrote))
 }
