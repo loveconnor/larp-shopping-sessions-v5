@@ -1445,6 +1445,10 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // Interleave input files at equal block offsets. Event work stays first
+    // while the link builder prepares the map used by click workers.
+    work.sort_unstable_by_key(|w| (!w.events, w.start, w.file, w.copy));
+
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
     let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
