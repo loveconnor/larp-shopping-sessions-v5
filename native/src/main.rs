@@ -1035,6 +1035,7 @@ type Totals = [i64; 4];
 // Every pair in one bin is within a session gap. Between occupied bins,
 // comparing their exact extrema decides whether their sessions connect.
 const BIN_SHIFT: u32 = 20;
+const _: () = assert!((40 * DAY) <= (4096_i64 << BIN_SHIFT));
 const _: () = assert!((1u64 << BIN_SHIFT) <= SESSION_GAP);
 
 #[derive(Clone, Copy)]
@@ -1174,6 +1175,9 @@ impl Sessions<'_> {
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
+        // The supported window spans fewer than 4096 bins. Track occupied
+        // bitmap words so a short history only visits the part it used.
+        let mut words = 0u64;
         for &value in events {
             let ts = (value >> 32) as u32;
             let index = (ts >> BIN_SHIFT) as usize;
@@ -1182,6 +1186,7 @@ impl Sessions<'_> {
             bin.last = bin.last.max(ts);
             bin.events += 1;
             scratch.occupied[index / 64] |= 1 << (index % 64);
+            words |= 1 << (index / 64);
             let payload = value as u32;
             if payload != 0 {
                 let category = (payload >> 24) as usize;
@@ -1194,8 +1199,10 @@ impl Sessions<'_> {
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
         let (mut start, mut last, mut revenue) = (0u32, 0u32, 0u64);
-        for (word, occupied) in scratch.occupied.iter_mut().enumerate() {
-            let mut bits = std::mem::take(occupied);
+        while words != 0 {
+            let word = words.trailing_zeros() as usize;
+            words &= words - 1;
+            let mut bits = std::mem::take(&mut scratch.occupied[word]);
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
