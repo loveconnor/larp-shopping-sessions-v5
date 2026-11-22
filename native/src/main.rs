@@ -317,7 +317,7 @@ impl Links {
         // pass will touch a few steps on, since every touch is a cache miss.
         let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
         for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
+            if let Some(&(c, d)) = pairs.get(at + 16) {
                 prefetch(&slots[home(c)]);
                 prefetch(&slots[home(d)]);
             }
@@ -343,7 +343,7 @@ impl Links {
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
         for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
+            if let Some(&[c, d]) = numbered.get(at + 16) {
                 prefetch(&parent[c as usize]);
                 prefetch(&parent[d as usize]);
             }
@@ -618,7 +618,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
                 let a = user(left,nl,false);
                 let b = user(right,nr,true);
                 pairs.push((a,b));
-                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
+                if queued.len() >= 16 { drain(&mut queued, &mut pairs); }
             });
             drain(&mut queued, &mut pairs);
             start = end;
