@@ -104,6 +104,13 @@ impl<T: Copy> Buckets<T> {
 
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) -> *mut T {
+        let at = self.reserve_slot(part);
+        unsafe { at.write(value); }
+        at
+    }
+
+    #[inline(always)]
+    fn reserve_slot(&mut self, part: usize) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -114,7 +121,6 @@ impl<T: Copy> Buckets<T> {
             // into its cache while other partitions are receiving records.
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
-            at.write(value);
             *slot = at.add(1);
             at
         }
@@ -198,6 +204,25 @@ struct Parsed {
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
     payload: u32,
+}
+
+impl Parsed {
+    #[inline(always)]
+    unsafe fn write_to(self, dest: *mut Self) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl", target_feature = "avx512f"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            const _: () = assert!(std::mem::size_of::<Parsed>() == 28);
+            let row = _mm256_setr_epi32(
+                self.id as i32, (self.id >> 32) as i32,
+                self.user as i32, (self.user >> 32) as i32,
+                self.ingest as i32, self.ts as i32, self.payload as i32, 0,
+            );
+            _mm256_mask_storeu_epi32(dest.cast(), 0x7f, row);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vl", target_feature = "avx512f")))]
+        unsafe { dest.write(self); }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -762,7 +787,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let dest = out.buckets.reserve_slot((partition_hash >> id_shift) as usize);
+        record.write_to(dest);
         if deferred {
             lookups[queued] = (name,dest,mixed);
             queued += 1;
