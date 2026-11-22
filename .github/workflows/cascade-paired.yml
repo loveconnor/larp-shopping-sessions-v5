@@ -1,7 +1,7 @@
 name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/vector-campaign-assists]
+    branches: [bench/dense-mask-counters]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 658509, engine: n4}
-          - {events: 60000000, format: current, seed: 658509, engine: n4}
-          - {events: 20000000, format: current, seed: 371971, engine: n4}
-          - {events: 60000000, format: current, seed: 371971, engine: n4}
+          - {events: 20000000, format: current, seed: 740743, engine: n4}
+          - {events: 60000000, format: current, seed: 740743, engine: n4}
+          - {events: 20000000, format: current, seed: 541381, engine: n4}
+          - {events: 60000000, format: current, seed: 541381, engine: n4}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 8ae1b3962baf652b8a3eaa065d0dcc38142e14c2
+      CANDIDATE: b9d4b2904e4f21cb40867b26b83bf90e30a67d4e
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +46,7 @@ jobs:
         run: |
           if grep -qw avx512bw /proc/cpuinfo; then
             cd "$RUNNER_TEMP/candidate-src"
-            RUSTFLAGS='-Ctarget-cpu=x86-64-v4' cargo test --release --manifest-path native/Cargo.toml gathered_assists_preserve_other_days_and_counters | tee "$RUNNER_TEMP/assist-test.log"
+            RUSTFLAGS='-Ctarget-cpu=x86-64-v4' cargo test --release --manifest-path native/Cargo.toml daily_dense_masks_flush_exactly_across_byte_rollovers | tee "$RUNNER_TEMP/assist-test.log"
             grep -q '1 passed' "$RUNNER_TEMP/assist-test.log"
           fi
       - name: Generate fresh data
