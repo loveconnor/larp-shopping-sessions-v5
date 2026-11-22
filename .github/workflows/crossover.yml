@@ -1,0 +1,39 @@
+name: Measure streaming-sort versus session-bin time by actual shopper history length
+on:
+  push:
+    branches: [bench/stream-bin-crossover]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [184823, 956321, 507389, 895855, 240231, 793453]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check hardware for the wide engine
+        run: |
+          lscpu | grep -E '^Model name:|^CPU family:'
+          if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then echo 'CAPABLE=yes' >> "$GITHUB_ENV"; fi
+      - name: Build the profiled streaming engine with length counters
+        if: env.CAPABLE == 'yes'
+        run: |
+          mkdir "$RUNNER_TEMP/engine"
+          cp -r native "$RUNNER_TEMP/engine/native"
+          python .github/workflows/crossover.py build
+          docker run --rm -v "$RUNNER_TEMP/engine/native:/src" -w /src -e 'RUSTFLAGS=-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+avx512vbmi2 -Cprofile-use=/src/profile/wide.profdata' rust:1.90-slim-bookworm cargo build --release --locked
+      - name: Sort or bin the same histories on alternating runs and check both complete tables
+        if: env.CAPABLE == 'yes'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --retry 3 -fsSLo generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed ${{ matrix.seed }} --events 60000000 --clicks 15000000 --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+          python -m pip install --quiet duckdb==1.4.5
+          python "$GITHUB_WORKSPACE/.github/workflows/crossover.py" measure
