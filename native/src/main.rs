@@ -33,8 +33,6 @@ const SESSION_GAP: u64 = 1_800_000;
 const BLOCK: u64 = 1 << 19;
 /// Bytes of a links file read at a time.
 const LINK_BLOCK: u64 = 1 << 19;
-/// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
-const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
 const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -521,6 +519,7 @@ struct Shared {
     campaign_names: Vec<Vec<u8>>,
     campaign_channels: Vec<Vec<u8>>,
     files: Vec<Source>,
+    outstanding: Vec<AtomicUsize>,
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
@@ -909,6 +908,12 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+        }
+        if let Some(remaining) = shared.outstanding.get(work.file) {
+            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let source = &shared.files[work.file];
+                source.release(0, source.size);
+            }
         }
     }
     Ok((events, clicks))
@@ -1713,6 +1718,11 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let outstanding = if give_back && map {
+        files.iter().map(|f| AtomicUsize::new((f.size.div_ceil(block) * copies) as usize)).collect()
+    } else {
+        Vec::new()
+    };
     let input_bytes = total.saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
     // At intermediate sizes, fewer active destinations reduce scattered
@@ -1734,6 +1744,7 @@ fn main() -> io::Result<()> {
         campaign_names,
         campaign_channels,
         files,
+        outstanding,
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
@@ -1865,30 +1876,15 @@ fn main() -> io::Result<()> {
 
     // Nothing reads any of this any more. Give it back from every thread at
     // once: left to the kernel, it is freed on one thread at exit, on the clock.
-    let mut segments = Vec::new();
-    for (file, source) in shared.files.iter().enumerate() {
-        let mut start = 0;
-        while start < source.size {
-            segments.push((file, start, (start + SEGMENT).min(source.size)));
-            start += SEGMENT;
-        }
-    }
-    if !give_back {
-        segments.clear();
-    }
-    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
-            let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (events, clicks) = (&events, &clicks);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
                 clicks[thread].buckets.release();
-                while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    shared.files[file].release(start, end);
-                }
             });
         }
         if let Some(links) = shared.links.get().filter(|_| give_back) {
