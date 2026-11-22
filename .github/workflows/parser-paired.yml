@@ -17,10 +17,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the three exact candidate images
+      - name: Build the exact 128-value sorting image
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in profile:846a15a7bd3eda7a2a04581f25b48087093b42ea sorter:1426671a3250e5dcb5342c29ea6238942350685f combined:225f705d906a98cafac0117242ab8c80d7838659; do
+          for item in sorter:7e8f59da6626659f317f8ae7878a3b201dbd61f0; do
             label=${item%%:*}
             sha=${item#*:}
             mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
@@ -45,7 +45,7 @@ jobs:
           python -m pip install --quiet duckdb==1.4.5
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
           executables=()
-          for label in profile sorter combined; do
+          for label in sorter; do
             executables+=("$RUNNER_TEMP/$label/shopping-sessions")
             if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
               executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19")
