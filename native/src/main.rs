@@ -1301,6 +1301,48 @@ unsafe fn sort_short_times(values: &mut [u64]) {
         let other = _mm512_permutexvar_epi64(order,v);
         _mm512_mask_max_epu64(_mm512_min_epu64(v,other),SELECT,v,other)
     }
+    // A purchase-free row has a zero low word. Sixteen timestamps
+    // then fit in one ZMM register, with no payload permutations.
+    if (9..=16).contains(&values.len()) {
+        let n=values.len();
+        let mask=(0xffu16>>(16-n)) as u8;
+        let bottom=_mm512_loadu_si512(values.as_ptr().cast());
+        let top=_mm512_maskz_loadu_epi64(mask,values.as_ptr().add(8).cast());
+        if _mm512_test_epi64_mask(_mm512_or_si512(bottom,top),_mm512_set1_epi64(0xffff_ffff))==0 {
+            let pick=_mm512_setr_epi32(1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31);
+            let times=_mm512_permutex2var_epi32(bottom,pick,top);
+            let mut v=_mm512_mask_mov_epi32(_mm512_set1_epi32(-1),(u16::MAX>>(16-n)),times);
+            let p1=_mm512_setr_epi32(1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14);
+            let p2=_mm512_setr_epi32(2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13);
+            let p4=_mm512_setr_epi32(4,5,6,7,0,1,2,3,12,13,14,15,8,9,10,11);
+            let p8=_mm512_setr_epi32(8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7);
+            let other=_mm512_permutexvar_epi32(p1,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x6666,v,other);
+            let other=_mm512_permutexvar_epi32(p2,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x3c3c,v,other);
+            let other=_mm512_permutexvar_epi32(p1,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x5a5a,v,other);
+            let other=_mm512_permutexvar_epi32(p4,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x0ff0,v,other);
+            let other=_mm512_permutexvar_epi32(p2,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x33cc,v,other);
+            let other=_mm512_permutexvar_epi32(p1,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0x55aa,v,other);
+            let other=_mm512_permutexvar_epi32(p8,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0xff00,v,other);
+            let other=_mm512_permutexvar_epi32(p4,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0xf0f0,v,other);
+            let other=_mm512_permutexvar_epi32(p2,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0xcccc,v,other);
+            let other=_mm512_permutexvar_epi32(p1,v);
+            v=_mm512_mask_max_epu32(_mm512_min_epu32(v,other),0xaaaa,v,other);
+            let lo=_mm512_slli_epi64::<32>(_mm512_cvtepu32_epi64(_mm512_castsi512_si256(v)));
+            let hi=_mm512_slli_epi64::<32>(_mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(v)));
+            _mm512_storeu_si512(values.as_mut_ptr().cast(),lo);
+            _mm512_mask_storeu_epi64(values.as_mut_ptr().add(8).cast(),mask,hi);
+            return;
+        }
+    }
     let swap1 = _mm512_setr_epi64(1,0,3,2,5,4,7,6);
     let swap2 = _mm512_setr_epi64(2,3,0,1,6,7,4,5);
     let swap4 = _mm512_setr_epi64(4,5,6,7,0,1,2,3);
