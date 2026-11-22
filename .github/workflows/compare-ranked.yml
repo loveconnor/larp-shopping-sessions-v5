@@ -12,7 +12,7 @@ jobs:
         replica: [1, 2]
     timeout-minutes: 25
     env:
-      CANDIDATE: 5f2932c10611efc59c2f44d53efd8218344173ae
+      CANDIDATE: c1a1c95cec8a4528e62d41de89a7f52dc78a7691
       RANKED: 2495dfc9e31fe401f60bade9b07508a5933a2766
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +21,10 @@ jobs:
           persist-credentials: false
       - name: Build and inspect the submitted CPU-dispatched image
         run: |
-          for name in candidate; do
+          for name in ranked measured candidate; do
             sha=$RANKED
             if [ "$name" = candidate ]; then sha=$CANDIDATE; fi
+            if [ "$name" = measured ]; then sha=5f2932c10611efc59c2f44d53efd8218344173ae; fi
             src="$RUNNER_TEMP/$name"
             mkdir "$src"
             git archive "$sha" | tar -x -C "$src"
@@ -32,6 +33,10 @@ jobs:
             docker cp "$id:/app" "$src/app"
             docker rm "$id"
           done
+          for level in v3 v4; do
+            cmp "$RUNNER_TEMP/ranked/app/shopping-sessions.$level" "$RUNNER_TEMP/candidate/app/shopping-sessions.$level"
+          done
+          cmp "$RUNNER_TEMP/measured/app/shopping-sessions.wide" "$RUNNER_TEMP/candidate/app/shopping-sessions.wide"
           for level in base v3 v4 wide; do
             test -x "$RUNNER_TEMP/candidate/app/shopping-sessions.$level"
           done
