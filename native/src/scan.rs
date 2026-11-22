@@ -555,14 +555,25 @@ impl Block {
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
                 let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
-                while at < stop_at {
-                    let p = buf.add(at as usize);
+                // Classification is independent across cache lines. Decode
+                // masks after the whole window is resident alongside its fields.
+                let mut classified=[(0u64,0u64,0u64); WINDOW+1];
+                let chunks=((stop_at-at) as usize).div_ceil(64);
+                for (i,mask) in classified[..chunks].iter_mut().enumerate() {
+                    let p=buf.add(at as usize+i*64);
                     fetch(p.wrapping_add(READ_AHEAD));
-                    #[cfg(target_arch = "x86_64")]
-                    let classified = if WIDE { wide_classes(p) } else { classes(p) };
-                    #[cfg(not(target_arch = "x86_64"))]
-                    let classified = classes(p);
-                    let (mut sep, mut newline, mut quote) = classified;
+                    #[cfg(target_arch="x86_64")]
+                    { *mask=if WIDE {wide_classes(p)} else {classes(p)}; }
+                    #[cfg(not(target_arch="x86_64"))]
+                    { *mask=classes(p); }
+                }
+                let last=buf.add(at as usize+chunks*64);
+                classified[chunks].0=u64::from(*last==b',' || *last==b'\n');
+                let prior=*buf.add(at as usize-1);
+                let mut preceding_sep=u64::from(prior==b',' || prior==b'\n');
+                let mut preceding_quote=u64::from(prior==b'"');
+                for chunk in 0..chunks {
+                    let (mut sep,mut newline,mut quote)=classified[chunk];
                     let left = end - at;
                     if left < 64 {
                         let valid = (1u64 << left) - 1;
@@ -570,13 +581,13 @@ impl Block {
                         newline &= valid;
                         quote &= valid;
                     }
-                    let before = *p.sub(1);
-                    // A quote just before the chunk can close a field at its first byte.
-                    if (quote | carry) != 0 || before == b'"' {
-                        let after = *p.add(64);
-                        let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
-                        let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
-                        let quote_before = (quote << 1) | u64::from(before == b'"');
+                    let sep_before=(sep<<1)|preceding_sep;
+                    let quote_before=(quote<<1)|preceding_quote;
+                    let check=quote|carry|preceding_quote;
+                    preceding_sep=sep>>63;
+                    preceding_quote=quote>>63;
+                    if check!=0 {
+                        let sep_after=(sep>>1)|(classified[chunk+1].0<<63);
                         let opening = quote & sep_before;
                         let closing = quote & sep_after;
                         // Both masks are subsets of quote. A quote with
