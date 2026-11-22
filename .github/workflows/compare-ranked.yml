@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: f560d5e697a9ba4aeefddd279deae62a8433bff9
+      CANDIDATE: 3030aac263c92b560dfc4fae8e1a61f4a516e379
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +30,7 @@ jobs:
           for label in ranked candidate v4; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=b27c1e8bab61430a4c43c30169e4a14f0e8cc238; fi
+            if [ "$label" = v4 ]; then sha=4660d6bba6b7c627eefa5e71657394b46149d23d; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -47,7 +47,7 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 766733 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 695177 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
