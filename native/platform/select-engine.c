@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
             else engine = ".wide";
         }
     } else if (__builtin_cpu_supports("x86-64-v3")) {
-        engine = ".v3";
+        engine = use_family19_profile() ? ".z3" : ".v3";
     }
     strcpy(path + n, engine);
     execv(path, argv);
