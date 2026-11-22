@@ -1387,8 +1387,11 @@ fn session_worker(
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
-    let mut table_keys: Vec<u64> = Vec::new();
-    let mut table_ids: Vec<u32> = Vec::new();
+    // An exact key and its dense person ordinal share the same probe.
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy, Default)]
+    struct PersonSlot { key: u64, id: u32 }
+    let mut table: Vec<PersonSlot> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
     let mut local: Vec<u32> = Vec::new();
@@ -1413,10 +1416,8 @@ fn session_worker(
         // Group the events by person: number the people as they appear.
         let mut capacity = (total / 4 + 16).next_power_of_two();
         let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        table.clear();
+        table.resize(capacity, PersonSlot::default());
         persons.clear();
         ends.clear();
         local.clear();
@@ -1426,14 +1427,13 @@ fn session_worker(
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
+                        let entry = *table.get_unchecked(slot);
+                        if entry.key == person {
+                            break entry.id;
                         }
-                        if key == 0 {
+                        if entry.key == 0 {
                             let id = persons.len() as u32;
-                            *table_keys.get_unchecked_mut(slot) = person;
-                            *table_ids.get_unchecked_mut(slot) = id;
+                            *table.get_unchecked_mut(slot) = PersonSlot { key: person, id };
                             persons.push(person);
                             ends.push(0);
                             break id;
@@ -1445,17 +1445,14 @@ fn session_worker(
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
                         mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
+                        table.clear();
+                        table.resize(capacity, PersonSlot::default());
                         for (id, &person) in persons.iter().enumerate() {
                             let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
+                            while table[slot].key != 0 {
                                 slot = (slot + 1) & mask;
                             }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
+                            table[slot] = PersonSlot { key: person, id: id as u32 };
                         }
                     }
                 }
@@ -1497,11 +1494,11 @@ fn session_worker(
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
+                        let entry = *table.get_unchecked(slot);
+                        if entry.key == person {
+                            break entry.id;
                         }
-                        if key == 0 {
+                        if entry.key == 0 {
                             break NONE;
                         }
                         slot = (slot + 1) & mask;
