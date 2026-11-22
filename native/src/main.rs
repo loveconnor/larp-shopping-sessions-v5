@@ -636,29 +636,50 @@ fn person_part(person: u64, bits: u32) -> usize {
 const LONG_EVENT: u64 = 3 << 62;
 const EVENT_FINGERPRINT: u64 = (1 << 30) - 1;
 
-/// A hash selects the dedup bucket. Collisions are resolved by all 33 bytes.
+/// XOR the prefix after hashing the suffix. For any fixed suffix, all 256
+/// possible prefixes then have distinct fingerprints, even after masking.
 #[inline(always)]
 fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     unsafe {
         use std::arch::x86_64::_mm_crc32_u64;
-        let mut crc = u64::from(bytes[0]);
+        let mut crc = 0;
         for word in bytes[1..].chunks_exact(8) {
             crc = _mm_crc32_u64(crc, u64::from_le_bytes(word.try_into().unwrap()));
         }
-        crc & EVENT_FINGERPRINT
+        (crc ^ u64::from(bytes[0])) & EVENT_FINGERPRINT
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
     {
-        let mixed = keys::long_name_mix(bytes) ^ u64::from(bytes[0]);
-        (mixed ^ (mixed >> 32)) & EVENT_FINGERPRINT
+        let mixed = keys::long_name_mix(bytes);
+        (mixed ^ (mixed >> 32) ^ u64::from(bytes[0])) & EVENT_FINGERPRINT
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn event_fingerprint_distinguishes_every_prefix_of_the_same_suffix() {
+    let mut seed = 356731u64;
+    for _ in 0..1024 {
+        let mut name = [0u8; 33];
+        for byte in &mut name[1..] {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = seed as u8;
+        }
+        let start = event_fingerprint(&name);
+        for prefix in 0..=u8::MAX {
+            name[0] = prefix;
+            assert_eq!(event_fingerprint(&name), start ^ u64::from(prefix));
+        }
     }
 }
 
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: Vec<[u8; 32]>,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -708,7 +729,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
             let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            out.names.push(bytes[1..].try_into().unwrap());
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -965,8 +986,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
                         let other_id = (*other).id;
                         let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
+                            // Matching stored suffixes and fingerprints together prove
+                            // equality of the complete original event names.
                             id >> 32 == other_id >> 32
                                 && sources[owners[index]].names[id as u32 as usize]
                                     == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
