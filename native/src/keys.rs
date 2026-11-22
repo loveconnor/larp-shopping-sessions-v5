@@ -98,11 +98,28 @@ pub fn prepare_users(bytes: u64) {
     });
 }
 
+/// Mix all 33 bytes. The table always verifies the original bytes on a hit.
+#[cfg(all(target_arch="x86_64", target_feature="aes"))]
+#[inline(always)]
+pub unsafe fn long_hash(p:*const u8)->u64 {
+    use std::arch::x86_64::*;
+    let first=_mm_loadu_si128(p.add(1).cast());
+    let last=_mm_loadu_si128(p.add(17).cast());
+    let mixed=_mm_aesenc_si128(first,last);
+    let seed=_mm_cvtsi32_si128(i32::from(*p));
+    _mm_cvtsi128_si64(_mm_aesenc_si128(mixed,seed)) as u64
+}
+
 #[inline(always)]
 unsafe fn user_mix(p: *const u8) -> u64 {
+    #[cfg(all(target_arch="x86_64",target_feature="aes"))]
+    {unsafe {long_hash(p)}}
+    #[cfg(not(all(target_arch="x86_64",target_feature="aes")))]
+    {
     let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
     (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
         .wrapping_mul(0x9e3779b97f4a7c15)
+    }
 }
 
 #[inline(always)]

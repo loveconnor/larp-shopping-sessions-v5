@@ -619,6 +619,10 @@ const EVENT_FINGERPRINT: u64 = (1 << 30) - 1;
 /// A hash selects the dedup bucket. Collisions are resolved by all 33 bytes.
 #[inline(always)]
 fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
+    #[cfg(all(target_arch="x86_64",target_feature="aes"))]
+    {unsafe {keys::long_hash(bytes.as_ptr()) & EVENT_FINGERPRINT}}
+    #[cfg(not(all(target_arch="x86_64",target_feature="aes")))]
+    {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     unsafe {
         use std::arch::x86_64::_mm_crc32_u64;
@@ -630,6 +634,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
+    }
 }
 
 struct EventSource {
