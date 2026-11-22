@@ -411,13 +411,13 @@ impl Writer {
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
-                Kind::Date if !column.ints.is_empty() => {
+                Kind::Date | Kind::Int32 if !column.ints.is_empty() => {
                     let lo = *column.ints.iter().min().unwrap();
                     let hi = *column.ints.iter().max().unwrap();
                     if hi.abs_diff(lo) < 256 {
                         let entries = (hi - lo + 1) as usize;
-                        for date in lo..=hi {
-                            body.extend_from_slice(&(date as i32).to_le_bytes());
+                        for value in lo..=hi {
+                            body.extend_from_slice(&(value as i32).to_le_bytes());
                         }
                         Self::page(&mut self.out, &body, entries, true, 0);
                         data_offset = self.out.len() as u64;
@@ -426,20 +426,20 @@ impl Writer {
                         body.push(bits as u8);
                         varint(&mut body, ((rows.div_ceil(8) as u64) << 1) | 1);
                         let full = rows / 8 * 8;
-                        let dates = &column.ints[..full];
+                        let values = &column.ints[..full];
                         match bits {
-                            1 => pack_eight::<1>(&mut body, dates, lo),
-                            2 => pack_eight::<2>(&mut body, dates, lo),
-                            3 => pack_eight::<3>(&mut body, dates, lo),
-                            4 => pack_eight::<4>(&mut body, dates, lo),
-                            5 => pack_eight::<5>(&mut body, dates, lo),
-                            6 => pack_eight::<6>(&mut body, dates, lo),
-                            7 => pack_eight::<7>(&mut body, dates, lo),
-                            8 => pack_eight::<8>(&mut body, dates, lo),
+                            1 => pack_eight::<1>(&mut body, values, lo),
+                            2 => pack_eight::<2>(&mut body, values, lo),
+                            3 => pack_eight::<3>(&mut body, values, lo),
+                            4 => pack_eight::<4>(&mut body, values, lo),
+                            5 => pack_eight::<5>(&mut body, values, lo),
+                            6 => pack_eight::<6>(&mut body, values, lo),
+                            7 => pack_eight::<7>(&mut body, values, lo),
+                            8 => pack_eight::<8>(&mut body, values, lo),
                             _ => unreachable!(),
                         }
                         if full < rows {
-                            let last = column.ints[full..].iter().map(|&day| (day - lo) as u64);
+                            let last = column.ints[full..].iter().map(|&value| (value - lo) as u64);
                             pack(&mut body, last.chain(std::iter::repeat(0)).take(8), bits);
                         }
                         Self::page(&mut self.out, &body, rows, false, 8);
@@ -512,7 +512,7 @@ impl Writer {
                     Kind::Text => (6, &[0]),
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
-                    Kind::Date if chunk.data_offset != chunk.offset => (1, &[0, 8]),
+                    Kind::Date | Kind::Int32 if chunk.data_offset != chunk.offset => (1, &[0, 8]),
                     Kind::Date | Kind::Int32 => (1, &[5]),
                     Kind::Int64 => (2, &[5]),
                 };
