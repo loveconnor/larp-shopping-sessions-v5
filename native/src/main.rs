@@ -81,7 +81,11 @@ unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
     /// Bytes of a chunk that hold records.
-    const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    const FILL: usize = if std::mem::size_of::<T>() == 32 {
+        CHUNK_BYTES - 64
+    } else {
+        (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>()
+    };
     /// Records per chunk.
     const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
     const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
@@ -602,8 +606,55 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
+    pending: Vec<std::mem::MaybeUninit<Parsed>>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
+}
+
+impl EventSource {
+    // Buffer the first record of a cache line. On the second, write the entire
+    // line without pulling the destination back into the parser's cache.
+    #[inline(always)]
+    fn append(&mut self, part: usize, row: Parsed) {
+        let dest = self.buckets.next[part];
+        if dest.addr() & 1 == 0 {
+            self.pending[part].write(row);
+            self.buckets.next[part] = dest.map_addr(|a| a | 1);
+            return;
+        }
+        let mut dest = dest.map_addr(|a| a & !1);
+        if dest.addr() & (CHUNK_BYTES - 1) == Buckets::<Parsed>::FILL {
+            dest = self.buckets.grow(part);
+        }
+        unsafe {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                use std::arch::x86_64::*;
+                let a = _mm256_loadu_si256(self.pending[part].as_ptr().cast());
+                let b = _mm256_loadu_si256((&raw const row).cast());
+                _mm256_stream_si256(dest.cast(), a);
+                _mm256_stream_si256(dest.add(1).cast(), b);
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                dest.write(self.pending[part].assume_init());
+                dest.add(1).write(row);
+            }
+            self.buckets.next[part] = dest.add(2);
+        }
+    }
+
+    fn finish(&mut self) {
+        for part in 0..self.pending.len() {
+            let dest = self.buckets.next[part];
+            if dest.addr() & 1 != 0 {
+                self.buckets.next[part] = dest.map_addr(|a| a & !1);
+                self.buckets.push(part, unsafe { self.pending[part].assume_init() });
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe { std::arch::x86_64::_mm_sfence(); }
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -672,7 +723,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        out.append((partition_hash >> id_shift) as usize, record);
     });
 }
 
@@ -773,7 +824,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { pending: vec![std::mem::MaybeUninit::uninit(); 1 << shared.id_bits], buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -785,6 +836,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
+    events.finish();
     Ok((events, clicks))
 }
 
