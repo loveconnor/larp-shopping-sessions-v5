@@ -1365,6 +1365,69 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// Adding one exponent unit maps every supported event key to a positive
+/// normal binary64 bit pattern. Floating-point min/max then orders all 64
+/// original bits, including the low purchase payload, without conversion.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+unsafe fn sort_normal_keys<const R: usize>(values: &mut [u64]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let bias = _mm256_set1_epi64x(1 << 52);
+        let inf = _mm256_set1_pd(f64::INFINITY);
+        let mut regs = [inf; R];
+        let lane_mask = |count: usize| _mm256_cmpgt_epi64(
+            _mm256_set1_epi64x(count as i64), _mm256_setr_epi64x(0, 1, 2, 3));
+        let finish = |mut v| {
+            let other = _mm256_permute4x64_pd::<0x4e>(v);
+            v = _mm256_blend_pd::<0xc>(_mm256_min_pd(v, other), _mm256_max_pd(v, other));
+            let other = _mm256_permute4x64_pd::<0xb1>(v);
+            _mm256_blend_pd::<0xa>(_mm256_min_pd(v, other), _mm256_max_pd(v, other))
+        };
+        for (i, chunk) in values.chunks(4).enumerate() {
+            let mask = lane_mask(chunk.len());
+            let raw = _mm256_maskload_epi64(chunk.as_ptr().cast(), mask);
+            let data = _mm256_castsi256_pd(_mm256_add_epi64(raw, bias));
+            let mut v = _mm256_blendv_pd(inf, data, _mm256_castsi256_pd(mask));
+            let other = _mm256_permute4x64_pd::<0xb1>(v);
+            v = _mm256_blend_pd::<0xa>(_mm256_min_pd(v, other), _mm256_max_pd(v, other));
+            let other = _mm256_permute4x64_pd::<0x4e>(v);
+            v = _mm256_blend_pd::<0xc>(_mm256_min_pd(v, other), _mm256_max_pd(v, other));
+            let other = _mm256_permute4x64_pd::<0xd8>(v);
+            regs[i] = _mm256_blend_pd::<0x4>(_mm256_min_pd(v, other), _mm256_max_pd(v, other));
+        }
+        let mut half = 1;
+        while half < R {
+            for block in regs.chunks_exact_mut(2 * half) {
+                let (left, right) = block.split_at_mut(half);
+                right.reverse();
+                for (a, b) in left.iter_mut().zip(right.iter_mut()) {
+                    let rev = _mm256_permute4x64_pd::<0x1b>(*b);
+                    *b = _mm256_max_pd(*a, rev);
+                    *a = _mm256_min_pd(*a, rev);
+                }
+                let mut stride = half / 2;
+                while stride > 0 {
+                    for group in block.chunks_exact_mut(2 * stride) {
+                        let (lo, hi) = group.split_at_mut(stride);
+                        for (a, b) in lo.iter_mut().zip(hi) {
+                            let high = _mm256_max_pd(*a, *b);
+                            *a = _mm256_min_pd(*a, *b);
+                            *b = high;
+                        }
+                    }
+                    stride /= 2;
+                }
+                for v in block { *v = finish(*v); }
+            }
+            half *= 2;
+        }
+        for (chunk, v) in values.chunks_mut(4).zip(regs) {
+            let raw = _mm256_sub_epi64(_mm256_castpd_si256(v), bias);
+            _mm256_maskstore_epi64(chunk.as_mut_ptr().cast(), lane_mask(chunk.len()), raw);
+        }
+    }
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1398,6 +1461,8 @@ fn session_worker(
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+    let normal_keys = shared.window_end - shared.window_start <= (2046i64 << 20);
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
@@ -1565,7 +1630,17 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                if normal_keys && (5..=32).contains(&mine.len()) {
+                    unsafe {
+                        match mine.len() {
+                            5..=8 => sort_normal_keys::<2>(mine),
+                            9..=16 => sort_normal_keys::<4>(mine),
+                            _ => sort_normal_keys::<8>(mine),
+                        }
+                    }
+                } else { mine.sort_unstable(); }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
