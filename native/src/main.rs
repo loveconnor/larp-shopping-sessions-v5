@@ -777,22 +777,69 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
 
 struct ClickSource {
     buckets: Buckets<Click>,
-    names: Vec<[u8; 33]>,
+    names: Vec<[u8; 32]>,
     worker: usize,
+}
+
+const CLICK_PREFIX_SHIFT: u32 = 37;
+
+impl ClickSource {
+    fn save_name(&mut self, bytes: &[u8; 33]) -> u64 {
+        const _: () = assert!(MAX_THREADS <= 32);
+        let index = u32::try_from(self.names.len()).expect("too many long click IDs in one worker");
+        let prefix = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]);
+        self.names.push(bytes[1..].try_into().unwrap());
+        LONG_EVENT | (u64::from(prefix) << CLICK_PREFIX_SHIFT) | (self.worker as u64) << 32 | u64::from(index)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn stored_click_prefix_matches_bytewise_order_for_every_worker() {
+    let mut sources: Vec<_> = (0..MAX_THREADS)
+        .map(|worker| ClickSource { buckets: Buckets::new(1), names: Vec::new(), worker })
+        .collect();
+    let mut keys = Vec::new();
+    for (worker, source) in sources.iter_mut().enumerate() {
+        for at in [0, 1, 2, 3, 32] {
+            let mut bytes = [b'a'; 33];
+            bytes[at] = worker as u8 + 1;
+            keys.push((source.save_name(&bytes), bytes.to_vec()));
+        }
+    }
+    for text in ["a", "aa", "aaa", "b", "aa long name", "💡"] {
+        let mut padded = text.as_bytes().to_vec();
+        padded.resize(text.len() + 64, 0);
+        keys.push((unsafe { keys::pack(padded.as_ptr(), text.len()) }, text.as_bytes().to_vec()));
+    }
+    for (a, name_a) in &keys {
+        for (b, name_b) in &keys {
+            assert_eq!(click_order(*a, *b, &sources, true), name_a.cmp(name_b));
+        }
+    }
 }
 
 fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp::Ordering {
     if !local || (a & LONG_EVENT != LONG_EVENT && b & LONG_EVENT != LONG_EVENT) {
         return keys::compare(a, b);
     }
-    fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
+    const PREFIX_MASK: u64 = 0xff_ffff;
+    let prefix = |key: u64| (key >> CLICK_PREFIX_SHIFT) & PREFIX_MASK;
+    if a & LONG_EVENT == LONG_EVENT && b & LONG_EVENT == LONG_EVENT {
+        let order = prefix(a).cmp(&prefix(b));
+        if order != Order::Equal { return order; }
+    }
+    fn parts<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> (u8, &'a [u8]) {
         if key & LONG_EVENT == LONG_EVENT {
-            &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
+            let worker = ((key >> 32) & 31) as usize;
+            let first = (key >> (CLICK_PREFIX_SHIFT + 16)) as u8;
+            (first, &sources[worker].names[key as u32 as usize])
         } else {
-            keys::bytes(key, scratch)
+            let text = keys::bytes(key, scratch);
+            (text[0], &text[1..])
         }
     }
-    name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
+    parts(a, sources, &mut [0; 9]).cmp(&parts(b, sources, &mut [0; 9]))
 }
 
 fn parse_clicks(
@@ -816,9 +863,7 @@ fn parse_clicks(
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
-            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-            out.names.push(*p.cast::<[u8; 33]>());
-            LONG_EVENT | (out.worker as u64) << 32 | index as u64
+            out.save_name(&*p.cast::<[u8; 33]>())
         } else {
             keys::pack(p, n)
         };
