@@ -577,23 +577,17 @@ impl Block {
                         let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
                         let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
                         let quote_before = (quote << 1) | u64::from(before == b'"');
-                        let quote_after = (quote >> 1) | (u64::from(after == b'"') << 63);
                         let opening = quote & sep_before;
                         let closing = quote & sep_after;
-                        let mut wrong = (quote & !(opening | closing)) | (opening & closing);
-                        // The separator ending each field that opened with a quote,
-                        // found by a carry through the run of non-separators after
-                        // it; it must be a separator right after a closing quote.
-                        // A field opening at the chunk's first byte counts here,
-                        // not in the chunk before: that one may have skipped
-                        // these checks for having no quotes.
-                        let opens = sep & quote_after & !(1u64 << 63);
-                        let first_opens = opening & 1;
-                        let (sum, over) = (!sep).overflowing_add(opens << 1);
-                        let (sum, over2) = sum.overflowing_add(carry | first_opens);
-                        let closes = sum & sep;
-                        wrong |= closes ^ (sep & quote_before);
-                        carry = u64::from(over | over2);
+                        // Both masks are subsets of quote. A quote with
+                        // neither boundary or both boundaries is invalid.
+                        let misplaced = quote ^ opening ^ closing;
+                        // Each opening seeds a carry into the following
+                        // delimiter. Bit zero is also seeded if the field
+                        // was opened in the preceding 64-byte chunk.
+                        let (sum, over) = (!sep).overflowing_add(opening | carry);
+                        let wrong = misplaced | ((sum ^ quote_before) & sep);
+                        carry = u64::from(over);
                         if wrong != 0 {
                             bad.push(at);
                         }
