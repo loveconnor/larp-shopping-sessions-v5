@@ -1411,12 +1411,14 @@ fn session_worker(
         }
 
         // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
+        // A few prolific people can put millions of events in a partition.
+        // Bound its initial directory and grow it from observed distinct people.
+        let mut capacity = (total / 4 + 16).min(8192).next_power_of_two();
         let mut mask = capacity - 1;
         table_keys.clear();
         table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        // An ID is read only after its key was installed in this partition.
+        if table_ids.len() < capacity { table_ids.resize(capacity, 0); }
         persons.clear();
         ends.clear();
         local.clear();
@@ -1436,28 +1438,28 @@ fn session_worker(
                             *table_ids.get_unchecked_mut(slot) = id;
                             persons.push(person);
                             ends.push(0);
+                            if persons.len() * 2 > capacity {
+                                capacity *= 2;
+                                mask = capacity - 1;
+                                table_keys.clear();
+                                table_keys.resize(capacity, 0);
+                                table_ids.resize(capacity, 0);
+                                for (id, &person) in persons.iter().enumerate() {
+                                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
+                                    while table_keys[slot] != 0 {
+                                        slot = (slot + 1) & mask;
+                                    }
+                                    table_keys[slot] = person;
+                                    table_ids[slot] = id as u32;
+                                }
+                            }
                             break id;
                         }
                         slot = (slot + 1) & mask;
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
                     local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
-                    }
+
                 }
             }
             // `ends` holds counts; make it each person's first slot, then fill,
