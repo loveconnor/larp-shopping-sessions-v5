@@ -916,11 +916,55 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
 
 // ---------------------------------------------------------------- phase 2
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
+/// Each person partition may nominate one frequently seen key. The sample
+/// chooses the storage layout only. All rows still undergo exact deduplication.
+struct FrequentPeople {
+    by_part: Vec<(u64, usize)>,
+    keys: Vec<(usize, u64)>,
+}
+
+impl FrequentPeople {
+    fn sample(shared: &Shared, sources: &[EventSource]) -> Self {
+        let links = shared.links.get().unwrap();
+        let partitions = 1usize << shared.id_bits;
+        let mut frequencies = HashMap::<u64, usize>::new();
+        let mut sampled = 0usize;
+        let mut chunks = Vec::new();
+        for part in [partitions / 4, 3 * partitions / 4] {
+            for source in sources { source.buckets.chunks(part, &mut chunks); }
+        }
+        for (base, count) in chunks {
+            for offset in (0..count).step_by(4) {
+                let event = unsafe { *base.add(offset) };
+                if event.ts != DEAD {
+                    *frequencies.entry(links.person(event.user)).or_default() += 1;
+                    sampled += 1;
+                }
+            }
+        }
+        let mut heavy: Vec<_> = frequencies.into_iter()
+            .filter(|&(_, n)| n >= 12 && n >= sampled / 300)
+            .collect();
+        heavy.sort_unstable_by_key(|&(key, n)| (std::cmp::Reverse(n), key));
+        let mut by_part = vec![(0, 0); 1 << shared.person_bits];
+        let mut keys = Vec::new();
+        for (key, _) in heavy.into_iter().take(16) {
+            let part = person_part(key, shared.person_bits);
+            if by_part[part].0 == 0 {
+                by_part[part] = (key, keys.len());
+                keys.push((part, key));
+            }
+        }
+        Self { by_part, keys }
+    }
+}
+
+fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, frequent: &FrequentPeople) -> (Buckets<Event>, Vec<Vec<u64>>) {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
+    let mut dense = vec![Vec::<u64>::new(); frequent.keys.len()];
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -1006,7 +1050,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    let part = person_part(person, person_bits);
+                    let (key, index) = frequent.by_part[part];
+                    if key == person {
+                        dense[index].push(value);
+                    } else {
+                        out.push(part, Event { person, value });
+                    }
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -1015,7 +1065,12 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
         }
     }
-    out
+    // Keep one genuine event in its partition so the ordinary click grouping
+    // discovers this person even when every one of their rows took this path.
+    for (&(part, person), extra) in frequent.keys.iter().zip(&mut dense) {
+        if let Some(value) = extra.pop() { out.push(part, Event { person, value }); }
+    }
+    (out, dense)
 }
 
 // ---------------------------------------------------------------- phase 3
@@ -1370,6 +1425,8 @@ fn session_worker(
     events: &[Buckets<Event>],
     clicks: &[ClickSource],
     order: &[u32],
+    frequent: &FrequentPeople,
+    dense: &[Vec<Vec<u64>>],
     next: &AtomicUsize,
     thread: usize,
 ) -> io::Result<(Vec<Totals>, bool)> {
@@ -1399,6 +1456,7 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
+    let mut dense_values = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1557,7 +1615,16 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            let (frequent_key, index) = frequent.by_part[part];
+            if person == frequent_key {
+                dense_values.clear();
+                dense_values.extend_from_slice(mine);
+                for source in dense {
+                    dense_values.extend_from_slice(&source[index]);
+                }
+                let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
+                sessions.person_binned(person, &dense_values, reached, bins)?;
+            } else if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
@@ -1768,12 +1835,14 @@ fn main() -> io::Result<()> {
     let parse = began.elapsed();
 
     let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
+    let frequent = FrequentPeople::sample(shared, &parsed_events);
+    let routed: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next, &frequent)))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
+    let (events, dense): (Vec<_>, Vec<_>) = routed.into_iter().unzip();
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
@@ -1791,8 +1860,8 @@ fn main() -> io::Result<()> {
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
+                let (events, clicks, next, frequent, dense) = (&events, &clicks, &next, &frequent, &dense);
+                scope.spawn(move || session_worker(shared, events, clicks, order, frequent, dense, next, thread))
             })
             .collect();
         handles
