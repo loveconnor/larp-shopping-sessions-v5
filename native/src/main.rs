@@ -645,6 +645,9 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
+    const DEPTH: usize = 16;
+    let mut pending = [(std::ptr::null_mut::<Parsed>(), Parsed { id: 0, user: 0, ingest: 0, ts: DEAD, payload: 0 }); DEPTH];
+    let mut cursor = 0usize;
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -707,8 +710,14 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        dest.write(record);
+        let (previous, ready) = pending[cursor];
+        if !previous.is_null() { previous.write(ready); }
+        pending[cursor] = (dest, record);
+        cursor = (cursor + 1) % DEPTH;
     });
+    for (dest, record) in pending {
+        if !dest.is_null() { unsafe { dest.write(record); } }
+    }
 }
 
 struct ClickSource {
