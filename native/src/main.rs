@@ -655,10 +655,41 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+#[derive(Default)]
+struct EventNames {
+    pointers: Vec<*const [u8; 33]>,
+    copied: Vec<Vec<[u8; 33]>>,
+}
+
+// Parsing owns each table exclusively. Its pointers refer either to mapped
+// input retained through dedup, or to fixed-capacity pages owned by the table.
+unsafe impl Send for EventNames {}
+unsafe impl Sync for EventNames {}
+
+impl EventNames {
+    fn insert(&mut self, bytes: &[u8; 33], mapped: bool) -> u32 {
+        let index = u32::try_from(self.pointers.len()).expect("too many long event IDs in one worker");
+        let pointer = if mapped { bytes as *const _ } else {
+            if self.copied.last().is_none_or(|page| page.len() == page.capacity()) {
+                self.copied.push(Vec::with_capacity(512));
+            }
+            let page = self.copied.last_mut().unwrap();
+            page.push(*bytes);
+            page.last().unwrap() as *const _
+        };
+        self.pointers.push(pointer);
+        index
+    }
+
+    fn get(&self, index: u32) -> &[u8; 33] {
+        unsafe { &*self.pointers[index as usize] }
+    }
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: EventNames,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -693,6 +724,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
+    let mapped = block.is_mapped();
     const LOOKUPS: usize = 16;
     let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
     let mut queued = 0;
@@ -707,8 +739,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let index = out.names.insert(bytes, mapped);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -897,7 +928,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
-        names: Vec::new(),
+        names: EventNames::default(),
         overflow_times: Vec::new(),
     };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
@@ -968,8 +999,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             // Equal fingerprints select candidates. Only the full bytes
                             // decide whether these two records are duplicates.
                             id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                                && sources[owners[index]].names.get(id as u32)
+                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names.get(other_id as u32)
                         } else {
                             id == other_id
                         };

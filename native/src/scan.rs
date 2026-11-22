@@ -379,6 +379,10 @@ impl Block {
         }
     }
 
+    pub fn is_mapped(&self) -> bool {
+        self.base != self.buf.as_ptr().wrapping_add(PAD)
+    }
+
     fn reserve(&mut self, data: usize) {
         let need = PAD + data + 1 + 4 * PAD;
         if self.buf.len() < need {
