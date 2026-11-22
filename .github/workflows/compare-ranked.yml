@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: af5fb050f273f23452a8a1023c52d8a38f4ce407
+      CANDIDATE: 375f9d24cf9903fff2eafa93014189b00d493db3
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,9 +27,10 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked candidate; do
+          for label in ranked candidate sizing; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = sizing ]; then sha=af5fb050f273f23452a8a1023c52d8a38f4ce407; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -45,7 +46,7 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 778193 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 635049 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -59,7 +60,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "sizing"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
