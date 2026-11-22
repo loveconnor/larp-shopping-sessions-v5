@@ -82,6 +82,7 @@ const FIXED_USER: u64 = 1 << 61;
 #[repr(C, align(64))]
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
+    canonical: std::sync::atomic::AtomicU32,
     name: std::cell::UnsafeCell<[u8; 33]>,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
@@ -93,7 +94,7 @@ pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
         let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
         let mut slots = Vec::with_capacity(size);
-        slots.resize_with(size, || UserSlot { tag: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
+        slots.resize_with(size, || UserSlot { tag: 0.into(), canonical: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
         slots.into_boxed_slice()
     });
 }
@@ -165,16 +166,20 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
 
 // One-based slots identify people during grouping. The input key is stored
 // whole, so collisions are resolved before any two people's data can meet.
+struct PersonSlot {
+    key:std::sync::atomic::AtomicU64,
+    canonical:std::sync::atomic::AtomicU32,
+}
 struct Ordinals {
-    words: Vec<std::sync::atomic::AtomicU64>,
+    words: Vec<PersonSlot>,
     shift: u32,
     spill_start: usize,
     spill: Mutex<(std::collections::HashMap<u64,u32>, Vec<u64>)>,
 }
 static PEOPLE: std::sync::OnceLock<Ordinals> = std::sync::OnceLock::new();
 pub fn prepare_people(bytes:u64) {
-    let n=bytes.div_ceil(1024).clamp(256,1<<24).next_power_of_two() as usize;
-    let words=(0..n).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let n=bytes.div_ceil(2048).clamp(256,1<<24).next_power_of_two() as usize;
+    let words=(0..n).map(|_| PersonSlot{key:0.into(),canonical:0.into()}).collect();
     let long=USER_SLOTS.get().map_or(0,|s|s.len());
     let _=PEOPLE.set(Ordinals {words,shift:64-n.trailing_zeros(),spill_start:n+long+1,spill:Mutex::default()});
 }
@@ -189,7 +194,7 @@ pub fn ordinal(key:u64)->u64 {
     }
     let mut i=(key.wrapping_mul(0x9e3779b97f4a7c15)>>dict.shift) as usize;
     for _ in 0..16 {
-        let slot=&dict.words[i];
+        let slot=&dict.words[i].key;
         let mut seen=slot.load(Relaxed);
         if seen==0 {seen=match slot.compare_exchange(0,key,Relaxed,Relaxed){Ok(_)=>key,Err(k)=>k};}
         if seen==key{return (i+1) as u64;}
@@ -204,9 +209,29 @@ pub fn ordinal(key:u64)->u64 {
 pub fn original(id:u64)->u64 {
     let dict=PEOPLE.get().unwrap();
     let i=id as usize-1;
-    if let Some(slot)=dict.words.get(i){return slot.load(std::sync::atomic::Ordering::Relaxed);}
+    if let Some(slot)=dict.words.get(i){return slot.key.load(std::sync::atomic::Ordering::Relaxed);}
     if (id as usize)<dict.spill_start {return INTERNED|FIXED_USER|(i-dict.words.len()) as u64;}
     dict.spill.lock().unwrap().1[id as usize-dict.spill_start]
+}
+
+pub fn spill_start()->usize { PEOPLE.get().unwrap().spill_start }
+#[inline(always)]
+pub fn canonical_slot(id:usize)->Option<&'static std::sync::atomic::AtomicU32>{
+    let dict=PEOPLE.get().unwrap();
+    let i=id.checked_sub(1)?;
+    if let Some(slot)=dict.words.get(i){return Some(&slot.canonical);}
+    let slot=USER_SLOTS.get()?.get(i-dict.words.len())?;
+    Some(&slot.canonical)
+}
+#[inline(always)]
+pub fn prefetch_person(key:u64){
+    if key & (INTERNED|FIXED_USER)==INTERNED|FIXED_USER {
+        if let Some(slots)=USER_SLOTS.get(){
+            crate::prefetch(&slots[(key&!(INTERNED|FIXED_USER)) as usize]);return;
+        }
+    }
+    let dict=PEOPLE.get().unwrap();
+    crate::prefetch(&dict.words[(key.wrapping_mul(0x9e3779b97f4a7c15)>>dict.shift) as usize]);
 }
 
 fn name(key: u64) -> &'static [u8] {

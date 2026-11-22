@@ -308,16 +308,27 @@ impl Links {
             let p=parents[id] as usize;
             if p!=0{best[id]=best[p];}
         }
-        Self{slots:best}
+        let split=keys::spill_start().min(best.len());
+        let spills=best.split_off(split);
+        for (id,to) in best.into_iter().enumerate(){
+            if to!=0 && to as usize!=id {
+                keys::canonical_slot(id).unwrap().store(to,Ordering::Relaxed);
+            }
+        }
+        Self{slots:spills}
     }
     #[inline(always)]
-    fn prefetch(&self,key:u64) {
-        if let Some(c)=self.slots.get(key as usize){prefetch(c);}
-    }
+    fn prefetch(&self,key:u64) {keys::prefetch_person(key);}
     #[inline(always)]
-    fn person(&self,key:u64)->u64 {
-        match self.slots.get(key as usize){Some(&c) if c!=0=>c as u64,_=>key}
+    fn person(&self,raw:u64)->u64 {
+        let id=keys::ordinal(raw);
+        let alias=match keys::canonical_slot(id as usize){
+            Some(slot)=>slot.load(Ordering::Relaxed),
+            None=>self.slots.get(id as usize-keys::spill_start()).copied().unwrap_or(0)
+        };
+        if alias==0 {id} else {alias as u64}
     }
+
 }
 
 /// Asks for transparent huge pages under `count` values at `start`: fewer
@@ -548,7 +559,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::ordinal(keys::finish_long_user(name,mixed)); }
+            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -577,7 +588,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let deferred = n == 33 && shared.defer_long_events;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if deferred || user == 0 { user } else { keys::ordinal(user ^ copy) };
+        let user = if deferred || user == 0 { user } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -671,7 +682,7 @@ fn parse_clicks(
         if id == 0 || user == 0 {
             return;
         }
-        let (id, user) = (id ^ copy, keys::ordinal(user ^ copy));
+        let (id, user) = (id ^ copy, user ^ copy);
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
