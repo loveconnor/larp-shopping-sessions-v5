@@ -377,7 +377,7 @@ impl Links {
                 let group = &mut groups[at];
                 if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
                     group.keys[lane] = key;
-                    group.values[lane] = person;
+                    group.values[lane] = key ^ person;
                     break;
                 }
                 at = (at + 1) & (count - 1);
@@ -408,11 +408,17 @@ impl Links {
                 let keys = _mm256_load_si256(group.keys.as_ptr().cast());
                 let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
                 let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
+                if (found != 0) | (group.keys[3] == 0) {
+                    let deltas = _mm256_load_si256(group.values.as_ptr().cast());
+                    let selected = _mm256_and_si256(matches, deltas);
+                    let pair = _mm_or_si128(_mm256_castsi256_si128(selected), _mm256_extracti128_si256::<1>(selected));
+                    let delta = _mm_cvtsi128_si64(_mm_or_si128(pair, _mm_srli_si128::<8>(pair))) as u64;
+                    return key ^ delta;
+                }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
+                return key ^ group.values[lane];
             }
             if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
