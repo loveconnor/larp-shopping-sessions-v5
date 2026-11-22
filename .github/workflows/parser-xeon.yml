@@ -1,7 +1,7 @@
-name: Benchmark parser against ranked entry
+name: Benchmark on Intel Xeon hosts
 on:
   push:
-    branches: [bench/parser-paired]
+    branches: [bench/parser-xeon]
 permissions:
   contents: read
 jobs:
@@ -16,18 +16,30 @@ jobs:
           - {events: 60000000, format: current, seed: 574187}
           - {events: 20000000, format: current, seed: 823693}
           - {events: 60000000, format: current, seed: 823693}
+          - {events: 20000000, format: current, seed: 691301}
+          - {events: 60000000, format: current, seed: 691301}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: bc1e0560744823ccca4082819160ea219419cd57
+      RANKED: c285015aa9fad18b8d530ce925c48df218154305
       CANDIDATE: ce8ab71001dd883c1062104cf9ee589be79dd8c6
     steps:
+      - name: Identify scoring CPU family
+        id: cpu
+        shell: bash
+        run: |
+          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
+          if grep -qw GenuineIntel /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
+            echo 'xeon=yes' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
+        if: steps.cpu.outputs.xeon == 'yes' 
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Check CPU and build the two submission images
+        if: steps.cpu.outputs.xeon == 'yes'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           for label in ranked candidate; do
@@ -43,6 +55,7 @@ jobs:
             docker rm "$cid"
           done
       - name: Generate fresh data
+        if: steps.cpu.outputs.xeon == 'yes'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
@@ -53,6 +66,7 @@ jobs:
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate fresh restricted runc containers and compare both complete output tables
+        if: steps.cpu.outputs.xeon == 'yes'
         shell: python
         run: |
           import datetime, json, os, pathlib, shutil, statistics, subprocess
@@ -101,7 +115,7 @@ jobs:
               print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
-        if: matrix.events == 20000000 && matrix.format == 'current'
+        if: steps.cpu.outputs.xeon == 'yes' && matrix.events == 20000000 && matrix.format == 'current'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
