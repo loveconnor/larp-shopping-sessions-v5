@@ -237,6 +237,19 @@ pub unsafe fn pack_plain(p: *const u8, len: usize) -> u64 {
     }
 }
 
+/// The diagnostic input multiplier gives each replica distinct identities.
+/// An interned ID is an index into a table and must remain a valid index.
+pub fn replica(key: u64, copy: u64) -> u64 {
+    if key == 0 || copy == 0 { return key; }
+    if key & INTERNED == 0 { return key ^ copy; }
+    let original = name(key);
+    let index = (copy >> 56) as u8;
+    let mut spelling = Vec::with_capacity(original.len() + 4);
+    spelling.extend_from_slice(&[b'~', b'0' + index / 10, b'0' + index % 10, b'/']);
+    spelling.extend_from_slice(original);
+    intern(&spelling)
+}
+
 /// Appends the string of `key` to `out`.
 #[inline]
 pub fn unpack(key: u64, out: &mut Vec<u8>) {

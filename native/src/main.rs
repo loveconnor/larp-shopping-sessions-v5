@@ -686,7 +686,7 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
     }
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+fn parse_events<const SINGLE: bool>(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -704,7 +704,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let (id, partition_hash) = if n == 33 && shared.defer_long_events {
+        let (id, partition_hash) = if n == 33 && SINGLE {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
             let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
@@ -715,7 +715,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             if id == 0 {
                 return;
             }
-            let id = id ^ copy;
+            let id = if SINGLE { id } else { keys::replica(id, copy) };
             (id, id.wrapping_mul(MIX))
         };
         let (p, n) = field(3);
@@ -724,10 +724,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let (name,n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
+        let deferred = n == 33 && SINGLE;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
+        let user = if SINGLE { user } else { keys::replica(user, copy) };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -795,7 +795,7 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
 }
 
-fn parse_clicks(
+fn parse_clicks<const SINGLE: bool>(
     shared: &Shared,
     block: &Block,
     copy: u64,
@@ -815,7 +815,7 @@ fn parse_clicks(
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let id = if n == 33 && shared.defer_long_events {
+        let id = if n == 33 && SINGLE {
             let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
             out.names.push(*p.cast::<[u8; 33]>());
             LONG_EVENT | (out.worker as u64) << 32 | index as u64
@@ -823,13 +823,13 @@ fn parse_clicks(
             keys::pack(p, n)
         };
         let (name, n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
+        let deferred = n == 33 && SINGLE;
         let hash = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         if id == 0 || user == 0 {
             return;
         }
-        let (id, user) = (id ^ copy, user ^ copy);
+        let (id, user) = if SINGLE { (id, user) } else { (keys::replica(id, copy), keys::replica(user, copy)) };
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
@@ -905,10 +905,11 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
-        if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
-        } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+        match (work.events, shared.defer_long_events) {
+            (true, true) => parse_events::<true>(shared, &block, 0, &mut dates, &mut events),
+            (false, true) => parse_clicks::<true>(shared, &block, 0, &mut dates, &mut pending, &mut clicks),
+            (true, false) => parse_events::<false>(shared, &block, work.copy, &mut dates, &mut events),
+            (false, false) => parse_clicks::<false>(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks),
         }
     }
     Ok((events, clicks))
