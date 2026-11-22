@@ -42,7 +42,7 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 const DEAD: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
-const GROUP_ROWS: usize = 1 << 17;
+const GROUP_ROWS: usize = 1 << 18;
 /// How many records ahead to prefetch a links lookup.
 const AHEAD: usize = 16;
 
@@ -693,7 +693,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    const LOOKUPS: usize = 16;
+    const LOOKUPS: usize = 24;
     let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
