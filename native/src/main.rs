@@ -525,6 +525,7 @@ struct Shared {
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
     id_bits: u32,
+    filter_words: usize,
     defer_long_events: bool,
     person_bits: u32,
     ahead: usize,
@@ -631,13 +632,28 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+const RAW_ROWS: usize = 1 << 15;
 struct EventSource {
+    rows: Vec<Vec<Parsed>>,
+    seen: Vec<u64>,
+    repeated: Vec<u64>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
 }
 
+#[inline(always)]
+fn event_hash(id: u64, deferred: bool) -> u64 {
+    let key = if deferred && id & LONG_EVENT == LONG_EVENT { (id >> 32) & EVENT_FINGERPRINT } else { id };
+    key.wrapping_mul(MIX)
+}
+
+#[inline(always)]
+fn filter_position(hash: u64, words: usize) -> (usize, u64) {
+    let h = hash ^ hash.rotate_right(29);
+    ((h as usize >> 6) & (words - 1), 1 << (h & 63))
+}
+
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
-    let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -702,7 +718,14 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let (word, bit) = filter_position(partition_hash, shared.filter_words);
+        let old = out.seen[word];
+        if old & bit != 0 { out.repeated[word] |= bit; }
+        out.seen[word] = old | bit;
+        if out.rows.last().is_none_or(|b| b.len() == RAW_ROWS) {
+            out.rows.push(Vec::with_capacity(RAW_ROWS));
+        }
+        out.rows.last_mut().unwrap().push(record);
     });
 }
 
@@ -803,7 +826,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), rows: Vec::new(), seen: vec![0;shared.filter_words], repeated: vec![0;shared.filter_words], names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -819,6 +842,55 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 }
 
 // ---------------------------------------------------------------- phase 2
+
+fn ambiguous_bits(sources: &[EventSource], words: usize, threads: usize) -> Vec<u64> {
+    let mut result = vec![0;words];
+    let span = words.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (part, out) in result.chunks_mut(span).enumerate() {
+            scope.spawn(move || {
+                let mut union = vec![0;out.len()];
+                let start = part * span;
+                for source in sources {
+                    let seen = &source.seen[start..start+out.len()];
+                    let repeat = &source.repeated[start..start+out.len()];
+                    for i in 0..out.len() {
+                        out[i] |= repeat[i] | (union[i] & seen[i]);
+                        union[i] |= seen[i];
+                    }
+                }
+            });
+        }
+    });
+    result
+}
+
+fn route_unique(shared: &Shared, source: &mut EventSource, ambiguous: &[u64]) -> Buckets<Event> {
+    let mut out = Buckets::new(1 << shared.person_bits);
+    let links = shared.links.get().unwrap();
+    drop(std::mem::take(&mut source.seen));
+    drop(std::mem::take(&mut source.repeated));
+    for block in source.rows.drain(..) {
+        for (i, &row) in block.iter().enumerate() {
+            if let Some(future) = block.get(i+shared.ahead) {
+                let h = event_hash(future.id, shared.defer_long_events);
+                prefetch(&ambiguous[filter_position(h, ambiguous.len()).0]);
+                links.prefetch(future.user);
+            }
+            let hash = event_hash(row.id, shared.defer_long_events);
+            let (word, bit) = filter_position(hash, ambiguous.len());
+            if ambiguous[word] & bit != 0 {
+                source.buckets.push((hash >> (64 - shared.id_bits)) as usize, row);
+            } else if row.ts != DEAD {
+                let person = links.person(row.user);
+                out.push(person_part(person, shared.person_bits), Event {
+                    person, value: (u64::from(row.ts) << 32) | u64::from(row.payload),
+                });
+            }
+        }
+    }
+    out
+}
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
@@ -1452,6 +1524,9 @@ fn main() -> io::Result<()> {
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
     let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
+    // About eight bits per typical input row; collisions only cause an
+    // extra exact lookup and never suppress a record.
+    let filter_words = (input_bytes / 512).clamp(256, 1 << 23).next_power_of_two() as usize;
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
@@ -1468,6 +1543,7 @@ fn main() -> io::Result<()> {
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
         defer_long_events: copies == 1,
+        filter_words,
         id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
@@ -1491,16 +1567,23 @@ fn main() -> io::Result<()> {
             .map(|handle| handle.join().unwrap())
             .collect::<io::Result<Vec<_>>>()
     })?;
-    let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
+    let (mut parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
 
+    let ambiguous = ambiguous_bits(&parsed_events, shared.filter_words, threads);
+    let mut unique: Vec<_> = std::thread::scope(|scope| {
+        let ambiguous = &ambiguous;
+        let handles: Vec<_> = parsed_events.iter_mut().map(|source| scope.spawn(move || route_unique(shared, source, ambiguous))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
+    let mut events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
+    events.append(&mut unique);
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
@@ -1593,6 +1676,7 @@ fn main() -> io::Result<()> {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
+                events[thread + threads].release();
                 clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
