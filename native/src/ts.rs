@@ -34,17 +34,19 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// The epoch day of each `YYYY-MM-DD` seen, by its day of month: a dataset
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
-    month: [u64; 100],
-    midnight: [i64; 100],
+    entries: [(u64, i64); 256],
 }
 
 impl Dates {
     pub fn new() -> Self {
-        Self {
-            month: [0; 100],
-            midnight: [0; 100],
-        }
+        Self { entries: [(0, 0); 256] }
     }
+}
+
+#[inline(always)]
+unsafe fn date_slot(p: *const u8) -> usize {
+    let pair = u16::from_le(unsafe { p.add(8).cast::<u16>().read_unaligned() });
+    usize::from(((pair & 15) << 4) | ((pair >> 8) & 15))
 }
 
 /// The epoch day of `YYYY-MM-` (raw in `raw`) and `day`, or `BAD`.
@@ -88,17 +90,16 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
         if hour > 23 || minute > 59 || second > 59 {
             return BAD;
         }
-        let slot = day as usize;
-        let midnight = if *dates.month.get_unchecked(slot) == raw {
-            *dates.midnight.get_unchecked(slot)
+        let entry = dates.entries.get_unchecked_mut(date_slot(p));
+        let midnight = if entry.0 == raw && raw != 0 {
+            entry.1
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
-            dates.month[slot] = raw;
             let midnight = days * 86_400;
-            dates.midnight[slot] = midnight;
+            *entry = (raw, midnight);
             midnight
         };
         midnight + hour * 3_600 + minute * 60 + second
@@ -137,17 +138,16 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
         let sums = _mm_cvtsi128_si64(_mm_madd_epi16(parts, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0))) as u64;
         let second = ((sums & 0xFFFF_FFFF) + (sums >> 32)) as i64;
         let day = (_mm_cvtsi128_si32(parts) & 0xFFFF) as i64;
-        let slot = day as usize;
-        let midnight = if *dates.month.get_unchecked(slot) == raw {
-            *dates.midnight.get_unchecked(slot)
+        let entry = dates.entries.get_unchecked_mut(date_slot(p));
+        let midnight = if entry.0 == raw && raw != 0 {
+            entry.1
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
-            dates.month[slot] = raw;
             let midnight = days * 86_400;
-            dates.midnight[slot] = midnight;
+            *entry = (raw, midnight);
             midnight
         };
         midnight + second
@@ -217,11 +217,11 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             let order=_mm_setr_epi8(0,1,3,4,6,7,9,10,-1,-1,-1,-1,-1,-1,-1,-1);
             let digits=_mm_and_si128(_mm_shuffle_epi8(ascii,order),_mm_set1_epi8(15));
             let pairs=_mm_maddubs_epi16(digits,_mm_set1_epi16(0x010a));
-            let day=_mm_extract_epi16::<0>(pairs) as usize;
-            if day>=dates.month.len() || dates.month[day]!=raw {return parse(p,len,dates);}
+            let entry = *dates.entries.get_unchecked(date_slot(p));
+            if entry.0 != raw || raw == 0 { return parse(p,len,dates); }
             let sum=_mm_madd_epi16(pairs,_mm_setr_epi16(0,3600,60,1,0,0,0,0));
             let second=_mm_cvtsi128_si32(_mm_add_epi32(sum,_mm_srli_si128::<4>(sum)));
-            (dates.midnight[day]+i64::from(second))*1000
+            (entry.1+i64::from(second))*1000
         }
         #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
         {
@@ -229,12 +229,12 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             let v = u16::from_le((p.add(i) as *const u16).read_unaligned());
             i64::from((v & 15) * 10 + ((v >> 8) & 15))
         };
-        let day = pair(8) as usize;
+        let entry = *dates.entries.get_unchecked(date_slot(p));
         let raw = load64(p);
-        if day >= dates.month.len() || dates.month[day] != raw {
+        if entry.0 != raw || raw == 0 {
             return parse(p, len, dates);
         }
-        (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
+        (entry.1 + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
         }
     }
 }
