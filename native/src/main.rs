@@ -277,18 +277,10 @@ impl Dim {
     }
 }
 
-#[repr(C, align(64))]
-#[derive(Clone, Default)]
-struct AliasGroup {
-    keys: [u64; 4],
-    values: [u64; 4],
-}
-
-/// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
-    slots: Vec<AliasGroup>,
+    slots: Vec<[u64;2]>,
     shift: u32,
-    empty: bool,
+    names: Vec<u64>,
 }
 
 impl Links {
@@ -340,7 +332,6 @@ impl Links {
             numbered.push(index);
         }
         // Join. The smaller number is the root, so no cycle can form.
-        let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
         for (at, &[a, b]) in numbered.iter().enumerate() {
             if let Some(&[c, d]) = numbered.get(at + 8) {
@@ -350,7 +341,6 @@ impl Links {
             let a = find(&mut parent, a);
             let b = find(&mut parent, b);
             if a != b {
-                aliases += 1;
                 let root = a.min(b) as usize;
                 let child = a.max(b) as usize;
                 parent[child] = root as u32;
@@ -359,63 +349,29 @@ impl Links {
                 }
             }
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+        // Parent indices decrease strictly on every link. Reuse the original
+        // dictionary as a dense component lookup instead of rebuilding it.
+        for i in 0..parent.len() { parent[i] = parent[parent[i] as usize]; }
+        for slot in &mut slots {
+            if slot[0] != 0 { slot[1] = u64::from(parent[slot[1] as usize]); }
         }
-        let count = aliases.div_ceil(2).next_power_of_two().max(2);
-        let shift = 64 - count.trailing_zeros();
-        let mut groups = vec![AliasGroup::default(); count];
-        huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
-            if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
-            }
-        }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        Self { slots, shift, names }
     }
-
     #[inline(always)]
-    fn prefetch(&self, key: u64) {
-        if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
-        }
+    fn prefetch(&self, key:u64) {
+        prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
     }
-
     #[inline(always)]
-    fn person(&self, key: u64) -> u64 {
-        if self.empty {
-            return key;
-        }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+    fn route(&self,key:u64,bits:u32) -> (usize,u64) {
+        let mut index = (key.wrapping_mul(MIX) >> self.shift) as usize;
         loop {
-            let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use std::arch::x86_64::*;
-                let keys = _mm256_load_si256(group.keys.as_ptr().cast());
-                let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
+            let [stored,root] = unsafe { *self.slots.get_unchecked(index) };
+            if stored == key {
+                let parts = 1usize << bits;
+                return (parts + ((root as usize) & (parts-1)), root);
             }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
-            }
-            if group.keys[3] == 0 { return key; }
-            slot = (slot + 1) & mask;
+            if stored == 0 { return (person_part(key,bits),key); }
+            index = (index+1) & (self.slots.len()-1);
         }
     }
 }
@@ -778,9 +734,9 @@ fn parse_clicks(
             links.prefetch(ahead.user);
         }
         let click = pending[at];
-        let person = links.person(click.user);
+        let (part,person) = links.route(click.user,shared.person_bits);
         out.buckets.push(
-            person_part(person, shared.person_bits),
+            part,
             Click {
                 person,
                 id: click.id,
@@ -804,7 +760,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         let _ = shared.links.set(links);
     }
     let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
-    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
+    let mut clicks = ClickSource { buckets: Buckets::new(2 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
@@ -824,7 +780,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
-    let mut out = Buckets::new(1 << shared.person_bits);
+    let mut out = Buckets::new(2 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -899,9 +855,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let (part,person) = links.route(record.user,person_bits);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    out.push(part, Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -1108,6 +1064,18 @@ fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
     to.copy_from_slice(from);
 }
 
+fn finish_person(sessions:&mut Sessions, person:u64, mine:&mut [u64], reached:&mut [Touch], scratch:&mut Vec<u64>, clicks:&[ClickSource]) -> io::Result<()> {
+            if mine.len() > 2048 {
+                sort_by_time(mine, scratch);
+            } else {
+                mine.sort_unstable();
+            }
+            if reached.len() > 1 {
+                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, sessions.shared.defer_long_events)));
+            }
+            sessions.person(person, mine, reached)
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1148,6 +1116,53 @@ fn session_worker(
         }
         let total: usize = event_chunks.iter().map(|chunk| chunk.1).sum();
         if total == 0 {
+            continue;
+        }
+
+        let parts = 1usize << shared.person_bits;
+        if part >= parts {
+            let links = shared.links.get().unwrap();
+            let n = links.names.len().div_ceil(parts);
+            ends.clear(); ends.resize(n,0);
+            click_ends.clear(); click_ends.resize(n,0);
+            click_chunks.clear();
+            for source in clicks { source.buckets.chunks(part,&mut click_chunks); }
+            unsafe {
+                for &(base,len) in &event_chunks {
+                    for row in std::slice::from_raw_parts(base,len) { ends[row.person as usize >> shared.person_bits] += 1; }
+                }
+                for &(base,len) in &click_chunks {
+                    for row in std::slice::from_raw_parts(base,len) { click_ends[row.person as usize >> shared.person_bits] += 1; }
+                }
+                let mut sum = 0usize;
+                for end in &mut ends { let k=*end; *end=sum as u32; sum+=k as usize; }
+                if values.len()<sum { values.resize(sum,0); }
+                sum=0;
+                for end in &mut click_ends { let k=*end; *end=sum as u32; sum+=k as usize; }
+                if touches.len()<sum { touches.resize(sum,Touch {id:0,ts:0,campaign:0}); }
+                for &(base,len) in &event_chunks {
+                    for row in std::slice::from_raw_parts(base,len) {
+                        let pos = &mut ends[row.person as usize >> shared.person_bits];
+                        values[*pos as usize]=row.value; *pos+=1;
+                    }
+                }
+                for &(base,len) in &click_chunks {
+                    for row in std::slice::from_raw_parts(base,len) {
+                        let pos = &mut click_ends[row.person as usize >> shared.person_bits];
+                        touches[*pos as usize]=Touch {id:row.id,ts:row.ts,campaign:row.campaign}; *pos+=1;
+                    }
+                }
+            }
+            let (mut from,mut click_from)=(0usize,0usize);
+            for local_id in 0..n {
+                let to=ends[local_id] as usize;
+                let click_to=click_ends[local_id] as usize;
+                if from<to {
+                    let name=links.names[(local_id<<shared.person_bits)+(part-parts)];
+                    finish_person(&mut sessions,name,&mut values[from..to],&mut touches[click_from..click_to],&mut scratch,clicks)?;
+                }
+                from=to; click_from=click_to;
+            }
             continue;
         }
 
@@ -1293,17 +1308,7 @@ fn session_worker(
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
-            let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
-            } else {
-                mine.sort_unstable();
-            }
-            let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
-            }
-            sessions.person(person, mine, reached)?;
+            finish_person(&mut sessions,person,&mut values[from..to],&mut touches[click_from..click_to],&mut scratch,clicks)?;
             from = to;
             click_from = click_to;
         }
@@ -1505,7 +1510,7 @@ fn main() -> io::Result<()> {
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
-    let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
+    let mut order: Vec<u32> = (0..2u32 << shared.person_bits).collect();
     let weight = |part: u32| {
         events
             .iter()
