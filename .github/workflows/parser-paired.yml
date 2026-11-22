@@ -1,7 +1,7 @@
-name: Check processor-specific release binaries against the published answers
+name: Verify combined binaries against each parent and the published answers
 on:
   push:
-    branches: [bench/family-release-correctness]
+    branches: [bench/independent-engines]
 permissions:
   contents: read
 jobs:
@@ -17,10 +17,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the exact profiled, scheduled and sixteen-lane release images
+      - name: Build both parent releases and the combined release
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in profile:c1f4dc0dc82197f71ea4bec36722688e2c7cf73f tuned:faf7a64332db78809a950daf53ca0326d906e420 combined:5085884a63d3e70c2a7bdd9702d058d1315dc5d2 wider:ae784b93b8e6f9606636c1aec8e9041efd810f74; do
+          for item in intel:2eb64984a86a458c75898012b38ca94ea5f16a43 amd:faf7a64332db78809a950daf53ca0326d906e420 combined:567939bcd88a63e39e62c4c803d57d67c0333d00; do
             label=${item%%:*}
             sha=${item#*:}
             mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
@@ -30,6 +30,12 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
+          for engine in base v3 v4 n4 wide; do
+            cmp "$RUNNER_TEMP/combined/shopping-sessions.$engine" "$RUNNER_TEMP/intel/shopping-sessions.$engine"
+            cmp "$RUNNER_TEMP/combined/shopping-sessions.$engine" "$RUNNER_TEMP/amd/shopping-sessions.$engine"
+          done
+          cmp "$RUNNER_TEMP/combined/shopping-sessions.istr" "$RUNNER_TEMP/intel/shopping-sessions.p19"
+          cmp "$RUNNER_TEMP/combined/shopping-sessions.p19" "$RUNNER_TEMP/amd/shopping-sessions.p19"
       - name: Run each release selector and every supported new engine on 36 fixtures and the official dev answer
         run: |
           cd "$RUNNER_TEMP"
@@ -45,10 +51,10 @@ jobs:
           python -m pip install --quiet duckdb==1.4.5
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
           executables=()
-          for label in profile tuned combined wider; do
+          for label in combined; do
             executables+=("$RUNNER_TEMP/$label/shopping-sessions")
             if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
-              executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19")
+              executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19" "$RUNNER_TEMP/$label/shopping-sessions.istr")
             fi
           done
           printf 'Checking executable %s\n' "${executables[@]}"
