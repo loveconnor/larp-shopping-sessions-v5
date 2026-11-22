@@ -1802,67 +1802,6 @@ fn main() -> io::Result<()> {
     })?;
     let sessions = began.elapsed();
 
-    let empty_result = !results.iter().any(|result| result.1);
-    if empty_result {
-        let path = user_dir.join("part-000.parquet");
-        pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS, &shared.categories)?.finish()?;
-    }
-    let mut writer = pq::Writer::create(
-        &shared.output.join("campaign_daily").join("part-000.parquet"),
-        &[
-            ("campaign_id", pq::Kind::Text),
-            ("channel", pq::Kind::Text),
-            ("day", pq::Kind::Date),
-            ("sessions", pq::Kind::Int64),
-            ("purchasing_sessions", pq::Kind::Int64),
-            ("revenue_cents", pq::Kind::Int64),
-            ("assisted_sessions", pq::Kind::Int64),
-        ],
-        GROUP_ROWS,
-        &[],
-    )?;
-    for campaign in 0..shared.campaign_names.len() {
-        for day in 0..shared.days {
-            let mut sum: Totals = [0; 4];
-            for result in &results {
-                let totals = &result.0[campaign * shared.days + day];
-                for (total, part) in sum.iter_mut().zip(totals) {
-                    *total += part;
-                }
-            }
-            if sum[0] == 0 && sum[3] == 0 {
-                continue;
-            }
-            writer.text(0, &shared.campaign_names[campaign]);
-            writer.text(1, &shared.campaign_channels[campaign]);
-            writer.int(2, shared.first_day + day as i64);
-            writer.int(3, sum[0]);
-            writer.int(4, sum[1]);
-            writer.int(5, sum[2]);
-            writer.int(6, sum[3]);
-            writer.end_row();
-        }
-    }
-    writer.finish()?;
-    // A retry may use fewer workers or assign all rows to different workers.
-    // Remove only this writer's stale parts, after both tables are complete.
-    if reusing_user_dir {
-        for entry in fs::read_dir(&user_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let part = name.to_str().and_then(|s| s.strip_prefix("part-")?.strip_suffix(".parquet"));
-            let Some(digits) = part.filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())) else {
-                continue;
-            };
-            let worker = digits.parse::<usize>().unwrap();
-            let wrote = results.get(worker).is_some_and(|result| result.1) || (worker == 0 && empty_result);
-            if worker < MAX_THREADS && !wrote && entry.file_type()?.is_file() {
-                fs::remove_file(entry.path())?;
-            }
-        }
-    }
-
-
     // Nothing reads any of this any more. Give it back from every thread at
     // once: left to the kernel, it is freed on one thread at exit, on the clock.
     let mut segments = Vec::new();
@@ -1877,7 +1816,7 @@ fn main() -> io::Result<()> {
         segments.clear();
     }
     let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
+    std::thread::scope(|scope| -> io::Result<()> {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
             let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
             let parsed_events = &parsed_events;
@@ -1885,16 +1824,80 @@ fn main() -> io::Result<()> {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
+                if thread == 0 {
+                    if let Some(links) = shared.links.get() {
+                        crate::release(links.slots.as_ptr(), links.slots.len());
+                    }
+                }
                 clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
             });
         }
-        if let Some(links) = shared.links.get().filter(|_| give_back) {
-            crate::release(links.slots.as_ptr(), links.slots.len());
+
+        // The campaign writer reads only worker totals and dimension strings.
+        let empty_result = !results.iter().any(|result| result.1);
+        if empty_result {
+            let path = user_dir.join("part-000.parquet");
+            pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS, &shared.categories)?.finish()?;
         }
-    });
+        let mut writer = pq::Writer::create(
+            &shared.output.join("campaign_daily").join("part-000.parquet"),
+            &[
+                ("campaign_id", pq::Kind::Text),
+                ("channel", pq::Kind::Text),
+                ("day", pq::Kind::Date),
+                ("sessions", pq::Kind::Int64),
+                ("purchasing_sessions", pq::Kind::Int64),
+                ("revenue_cents", pq::Kind::Int64),
+                ("assisted_sessions", pq::Kind::Int64),
+            ],
+            GROUP_ROWS,
+            &[],
+        )?;
+        for campaign in 0..shared.campaign_names.len() {
+            for day in 0..shared.days {
+                let mut sum: Totals = [0; 4];
+                for result in &results {
+                    let totals = &result.0[campaign * shared.days + day];
+                    for (total, part) in sum.iter_mut().zip(totals) {
+                        *total += part;
+                    }
+                }
+                if sum[0] == 0 && sum[3] == 0 {
+                    continue;
+                }
+                writer.text(0, &shared.campaign_names[campaign]);
+                writer.text(1, &shared.campaign_channels[campaign]);
+                writer.int(2, shared.first_day + day as i64);
+                writer.int(3, sum[0]);
+                writer.int(4, sum[1]);
+                writer.int(5, sum[2]);
+                writer.int(6, sum[3]);
+                writer.end_row();
+            }
+        }
+        writer.finish()?;
+        // A retry may use fewer workers or assign all rows to different workers.
+        // Remove only this writer's stale parts, after both tables are complete.
+        if reusing_user_dir {
+            for entry in fs::read_dir(&user_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let part = name.to_str().and_then(|s| s.strip_prefix("part-")?.strip_suffix(".parquet"));
+                let Some(digits) = part.filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())) else {
+                    continue;
+                };
+                let worker = digits.parse::<usize>().unwrap();
+                let wrote = results.get(worker).is_some_and(|result| result.1) || (worker == 0 && empty_result);
+                if worker < MAX_THREADS && !wrote && entry.file_type()?.is_file() {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        Ok(())
+    })?;
     let total = began.elapsed();
     eprintln!(
         "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
