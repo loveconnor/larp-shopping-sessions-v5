@@ -507,7 +507,7 @@ impl Block {
     /// exactly which are wrong.
     #[inline(always)]
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "narrow-v4")))]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
             return unsafe { self.raw_wide(visit) };
         }
