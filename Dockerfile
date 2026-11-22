@@ -19,11 +19,18 @@ COPY native/ ./
 # x86-64-v3 (AVX2, BMI2): every scorer machine is Cascade Lake or newer.
 RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
-    case "$TARGETARCH" in amd64) cpu=x86-64-v3; profile="-Cprofile-use=/src/profile/v5.profdata" ;; arm64) cpu=generic; profile= ;; esac && \
-    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $profile" \
-      cargo build --locked --release --target "$target" && \
-    cp "target/$target/release/shopping-sessions" /shopping-sessions
+    mkdir -p /app && \
+    if [ "$TARGETARCH" = amd64 ]; then \
+        for level in v3 v4; do \
+            RUSTFLAGS="-C linker=$linker -C target-cpu=x86-64-$level -Cprofile-use=/src/profile/v5.profdata" \
+              cargo build --locked --release --target "$target" || exit 1; \
+            cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
+        done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
+    else \
+        RUSTFLAGS="-C linker=$linker -C target-cpu=generic" cargo build --locked --release --target "$target" && \
+        cp "target/$target/release/shopping-sessions" /app/shopping-sessions; \
+    fi
 
 FROM debian:bookworm-slim
-COPY --from=builder /shopping-sessions /app/shopping-sessions
+COPY --from=builder /app /app
 CMD ["/app/shopping-sessions"]

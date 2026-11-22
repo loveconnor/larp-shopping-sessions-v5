@@ -132,6 +132,15 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
 unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     unsafe {
         use std::arch::x86_64::*;
+        #[cfg(target_feature = "avx512bw")]
+        {
+            let data = _mm512_loadu_si512(p.cast());
+            let newline = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'\n' as i8));
+            let comma = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b',' as i8));
+            let quote = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'"' as i8));
+            return (comma | newline, newline, quote);
+        }
+        #[allow(unreachable_code)]
         let low = _mm256_loadu_si256(p as *const __m256i);
         let high = _mm256_loadu_si256(p.add(32) as *const __m256i);
         let find = |byte: u8| {
