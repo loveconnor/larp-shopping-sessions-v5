@@ -176,13 +176,13 @@ fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) 
     }
 }
 
-/// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
+/// DELTA_BINARY_PACKED: blocks of 128 deltas split into equal miniblocks, each
 /// miniblock packed at the width its largest delta above the block's minimum needs.
-fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
+fn delta_binary_packed<const MINIS: usize>(out: &mut Vec<u8>, values: &[i64]) {
     const BLOCK: usize = 128;
-    const MINI: usize = 32;
+    let mini_size = BLOCK / MINIS;
     varint(out, BLOCK as u64);
-    varint(out, (BLOCK / MINI) as u64);
+    varint(out, MINIS as u64);
     varint(out, values.len() as u64);
     zigzag(out, values.first().copied().unwrap_or(0));
     let mut deltas = [0i64; BLOCK];
@@ -195,22 +195,22 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
             least = least.min(deltas[slot]);
         }
         zigzag(out, least);
-        let minis = count.div_ceil(MINI);
-        let mut widths = [0u8; BLOCK / MINI];
+        let minis = count.div_ceil(mini_size);
+        let mut widths = [0u8; MINIS];
         for mini in 0..minis {
-            let end = ((mini + 1) * MINI).min(count);
-            let most = deltas[mini * MINI..end]
+            let end = ((mini + 1) * mini_size).min(count);
+            let most = deltas[mini * mini_size..end]
                 .iter()
                 .fold(0u64, |most, &delta| most.max(delta.wrapping_sub(least) as u64));
             widths[mini] = width(most) as u8;
         }
         out.extend_from_slice(&widths);
         for mini in 0..minis {
-            // A short last miniblock is padded with zeros to its full 32 values.
-            let from = mini * MINI;
+            // A short last miniblock is padded with zeros to its full width.
+            let from = mini * mini_size;
             if widths[mini] == 0 { continue; }
-            if from + MINI <= count {
-                let group = &deltas[from..from + MINI];
+            if from + mini_size <= count {
+                let group = &deltas[from..from + mini_size];
                 match widths[mini] {
                     1 => { pack_eight::<1>(out, group, least); continue; }
                     2 => { pack_eight::<2>(out, group, least); continue; }
@@ -231,7 +231,7 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
                     _ => {}
                 }
             }
-            let packed = (from..from + MINI).map(|slot| {
+            let packed = (from..from + mini_size).map(|slot| {
                 if slot < count {
                     deltas[slot].wrapping_sub(least) as u64
                 } else {
@@ -412,7 +412,11 @@ impl Writer {
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
                 Kind::Date | Kind::Int32 | Kind::Int64 => {
-                    delta_binary_packed(&mut body, &column.ints);
+                    if matches!(column.kind, Kind::Int64) {
+                        delta_binary_packed::<4>(&mut body, &column.ints);
+                    } else {
+                        delta_binary_packed::<1>(&mut body, &column.ints);
+                    }
                     Self::page(&mut self.out, &body, rows, false, 5);
                 }
             }
@@ -580,7 +584,10 @@ mod tests {
                     .map(|_| ((next() % range) as i64).wrapping_sub((range / 2) as i64))
                     .collect();
                 let mut bytes = Vec::new();
-                delta_binary_packed(&mut bytes, &values);
+                delta_binary_packed::<1>(&mut bytes, &values);
+                assert_eq!(decode(&bytes), values, "one miniblock, count {count} range {range}");
+                bytes.clear();
+                delta_binary_packed::<4>(&mut bytes, &values);
                 assert_eq!(decode(&bytes), values, "count {count} range {range}");
             }
         }
