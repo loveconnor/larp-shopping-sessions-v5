@@ -840,6 +840,30 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 // ---------------------------------------------------------------- phase 2
 
+/// Populate empty hash homes eight at a time. Every contested home, including
+/// a duplicate within the same packet, goes through the full equality check.
+#[cfg(all(target_arch="x86_64",target_feature="avx512cd",target_feature="avx512dq",target_feature="avx512vl"))]
+#[inline(always)]
+unsafe fn reserve_homes(base:*const Parsed,entry:u32,table:*mut u32,mask:usize,deferred:bool)->u32 {
+    use std::arch::x86_64::*;
+    let id=_mm512_i64gather_epi64::<8>(_mm512_setr_epi64(0,4,8,12,16,20,24,28),base.cast());
+    let mut keys=id;
+    if deferred {
+        let tag=_mm512_set1_epi64(LONG_EVENT as i64);
+        let is_long=_mm512_cmpeq_epi64_mask(_mm512_and_si512(id,tag),tag);
+        keys=_mm512_mask_mov_epi64(id,is_long,_mm512_and_si512(_mm512_srli_epi64::<32>(id),_mm512_set1_epi64(EVENT_FINGERPRINT as i64)));
+    }
+    let h=_mm512_mullo_epi64(keys,_mm512_set1_epi64(MIX as i64));
+    let slots=_mm256_and_si256(_mm512_cvtepi64_epi32(_mm512_srli_epi64::<24>(h)),_mm256_set1_epi32(mask as i32));
+    let seen=_mm256_i32gather_epi32::<4>(table.cast(),slots);
+    let empty=_mm256_cmpeq_epi32_mask(seen,_mm256_set1_epi32(-1));
+    let first=_mm256_cmpeq_epi32_mask(_mm256_conflict_epi32(slots),_mm256_setzero_si256());
+    let won=empty & first;
+    let entries=_mm256_add_epi32(_mm256_set1_epi32(entry as i32),_mm256_setr_epi32(0,1,2,3,4,5,6,7));
+    _mm256_mask_i32scatter_epi32::<4>(table.cast(),won,slots,entries);
+    u32::from(!won)
+}
+
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
@@ -870,7 +894,17 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         table.resize(capacity, NONE);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
-                for offset in 0..count {
+                let mut first=0;
+                while first<count {
+                    let width=(count-first).min(8);
+                    let mut pending=(1u32<<width)-1;
+                    #[cfg(all(target_arch="x86_64",target_feature="avx512cd",target_feature="avx512dq",target_feature="avx512vl"))]
+                    if width==8 {
+                        pending=reserve_homes(base.add(first),((index<<OFFSET_BITS)|first) as u32,table.as_mut_ptr(),mask,shared.defer_long_events);
+                    }
+                    while pending!=0 {
+                    let offset=first+pending.trailing_zeros() as usize;
+                    pending &= pending-1;
                     let record = base.add(offset);
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
@@ -908,6 +942,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         }
                         slot = (slot + 1) & mask;
                     }
+                }
+                    first+=width;
                 }
             }
             for &(base, count) in &chunks {
