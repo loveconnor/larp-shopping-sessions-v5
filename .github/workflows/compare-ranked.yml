@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 903527}
-          - {events: 60000000, format: current, seed: 903527}
-          - {events: 20000000, format: current, seed: 903553}
-          - {events: 60000000, format: current, seed: 903553}
+          - {events: 20000000, format: current, seed: 913307}
+          - {events: 60000000, format: current, seed: 913307}
+          - {events: 20000000, format: current, seed: 913373}
+          - {events: 60000000, format: current, seed: 913373}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 3b74f4fbfa088ae4eceaf976e9b63f8e6d2a9db2
-      CANDIDATE: df7d40b5d315c3f0421afa8f74a054895e12dbda
+      RANKED: c285015aa9fad18b8d530ce925c48df218154305
+      CANDIDATE: f94ec74ec7e01a72364945b914f8d0dd1394bc15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +85,7 @@ jobs:
                       state = json.loads(subprocess.check_output(["docker", "inspect", cid]))[0]["State"]
                       assert state["ExitCode"] == 0 and not state["OOMKilled"], state
                       def stamp(value):
-                          return datetime.datetime.fromisoformat(value[:26] + "+00:00")
+                          return datetime.datetime.fromisoformat(value.removesuffix("Z")[:26] + "+00:00")
                       seconds = (stamp(state["FinishedAt"]) - stamp(state["StartedAt"])).total_seconds()
                       if round_number:
                           samples[label].append(seconds)
