@@ -1020,6 +1020,59 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
 
 // ---------------------------------------------------------------- phase 3
 
+/// Most partitions have fewer than 65,534 distinct shoppers. Large partitions
+/// keep the full ordinal of every overflow occurrence in encounter order.
+#[derive(Default)]
+struct GroupOrdinals {
+    codes: Vec<u16>,
+    overflow: Vec<u32>,
+}
+
+impl GroupOrdinals {
+    fn clear(&mut self) {
+        self.codes.clear();
+        self.overflow.clear();
+    }
+
+    #[inline(always)]
+    fn push(&mut self, id: u32) {
+        let code = id.wrapping_add(1);
+        if code >= u32::from(u16::MAX) {
+            self.overflow.push(id);
+            self.codes.push(u16::MAX);
+        } else {
+            self.codes.push(code as u16);
+        }
+    }
+
+    #[inline(always)]
+    fn at(&self, index: usize, escaped: &mut usize) -> u32 {
+        let code = self.codes[index];
+        if code == u16::MAX {
+            let full = self.overflow[*escaped];
+            *escaped += 1;
+            full
+        } else {
+            u32::from(code).wrapping_sub(1)
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn grouping_ordinals_preserve_missing_and_overflow() {
+    let mut table = GroupOrdinals::default();
+    let input = [NONE, 0, 65533, 65534, 65535, 65536, 0, u32::MAX-1, NONE, 65534];
+    for _ in 0..3 {
+        table.clear();
+        for id in input { table.push(id); }
+        let mut escaped = 0;
+        for (i,id) in input.into_iter().enumerate() { assert_eq!(table.at(i,&mut escaped),id); }
+        assert_eq!(escaped,table.overflow.len());
+    }
+}
+
+
 const USER_COLUMNS: [(&str, pq::Kind); 6] = [
     ("user_id", pq::Kind::Keyed),
     ("day", pq::Kind::Date),
@@ -1391,10 +1444,10 @@ fn session_worker(
     let mut table_ids: Vec<u32> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
-    let mut local: Vec<u32> = Vec::new();
+    let mut local = GroupOrdinals::default();
     let mut values: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
-    let mut click_local: Vec<u32> = Vec::new();
+    let mut click_local = GroupOrdinals::default();
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
@@ -1472,9 +1525,10 @@ fn session_worker(
                 values.resize(total, 0);
             }
             let mut index = 0;
+            let mut escaped = 0;
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
+                    let end = ends.get_unchecked_mut(local.at(index, &mut escaped) as usize);
                     *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
                     *end += 1;
                     index += 1;
@@ -1530,9 +1584,10 @@ fn session_worker(
                 );
             }
             let mut index = 0;
+            let mut escaped = 0;
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
-                    let id = *click_local.get_unchecked(index);
+                    let id = click_local.at(index, &mut escaped);
                     index += 1;
                     if id != NONE {
                         let click = *base.add(offset);
