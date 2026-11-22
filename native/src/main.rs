@@ -1071,7 +1071,115 @@ impl TimeBins {
     }
 }
 
+/// One bit per campaign. Adding a word increments independent binary
+/// counters for exactly the campaigns that assisted this session.
+struct AssistPlanes {
+    words: Vec<u64>,
+    nonempty: Vec<usize>,
+    positions: Vec<usize>,
+    days: usize,
+    planes: Vec<[u64; 8]>,
+}
+
+impl AssistPlanes {
+    fn new(campaigns: usize, days: usize) -> Self {
+        let groups = campaigns.div_ceil(64);
+        Self {
+            words: vec![0; groups],
+            nonempty: Vec::new(),
+            positions: vec![0; groups],
+            days,
+            planes: vec![[0; 8]; groups * days],
+        }
+    }
+
+    fn toggle(&mut self, campaign: usize) {
+        let group = campaign / 64;
+        let word = &mut self.words[group];
+        if *word == 0 {
+            self.positions[group] = self.nonempty.len();
+            self.nonempty.push(group);
+        }
+        *word ^= 1 << (campaign % 64);
+        if *word == 0 {
+            let slot = self.positions[group];
+            self.nonempty.swap_remove(slot);
+            if let Some(&moved) = self.nonempty.get(slot) {
+                self.positions[moved] = slot;
+            }
+        }
+    }
+
+    fn count(&mut self, day: usize, totals: &mut [Totals]) {
+        for &group in &self.nonempty {
+            let mut carry = self.words[group];
+            let planes = &mut self.planes[group * self.days + day];
+            for plane in planes {
+                let overlap = carry & *plane;
+                *plane ^= carry;
+                carry = overlap;
+                if carry == 0 { break; }
+            }
+            while carry != 0 {
+                let campaign = group * 64 + carry.trailing_zeros() as usize;
+                totals[campaign * self.days + day][3] += 256;
+                carry &= carry - 1;
+            }
+        }
+    }
+
+    fn clear_person(&mut self) {
+        for group in self.nonempty.drain(..) {
+            self.words[group] = 0;
+        }
+    }
+
+    fn finish(self, totals: &mut [Totals]) {
+        for (index, planes) in self.planes.into_iter().enumerate() {
+            let (group, day) = (index / self.days, index % self.days);
+            for (level, mut bits) in planes.into_iter().enumerate() {
+                while bits != 0 {
+                    let campaign = group * 64 + bits.trailing_zeros() as usize;
+                    totals[campaign * self.days + day][3] += 1 << level;
+                    bits &= bits - 1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bitplanes_agree_with_scalar_across_people_days_and_byte_carries() {
+    for campaigns in [1usize, 63, 64, 65, 129, 2049] {
+        let days = 5;
+        let mut planes = AssistPlanes::new(campaigns, days);
+        let mut totals = vec![[7, 8, 9, 11]; campaigns * days];
+        let mut expected = totals.clone();
+        let mut active = vec![false; campaigns];
+        for person in 0..4 {
+            for step in 0..1660 {
+                let day = (step / 602 + person) % days;
+                if step < campaigns || step % 17 == 0 {
+                    let id = (step * 193 + person) % campaigns;
+                    planes.toggle(id);
+                    active[id] = !active[id];
+                }
+                planes.count(day, &mut totals);
+                for (id, &present) in active.iter().enumerate() {
+                    expected[id * days + day][3] += i64::from(present);
+                }
+            }
+            planes.clear_person();
+            active.fill(false);
+        }
+        planes.finish(&mut totals);
+        assert_eq!(totals, expected);
+    }
+}
+
 struct Sessions<'a> {
+    planes: AssistPlanes,
     shared: &'a Shared,
     writer: Option<pq::Writer>,
     thread: usize,
@@ -1129,6 +1237,7 @@ impl Sessions<'_> {
         let days = self.shared.days;
         let mut credited = 0usize;
         if !clicks.is_empty() {
+            let use_planes = clicks.len() >= 128;
             // A click's `ts` counts from 7 days before the events' zero, so
             // the clicks in reach are those with start <= ts <= start + 7 days.
             let limit = start + WEEK as u64;
@@ -1137,6 +1246,7 @@ impl Sessions<'_> {
                 if self.reach[campaign] == 0 {
                     self.place[campaign] = self.active.len() as u32;
                     self.active.push(campaign as u32);
+                    if use_planes { self.planes.toggle(campaign); }
                 }
                 self.reach[campaign] += 1;
                 high += 1;
@@ -1145,6 +1255,7 @@ impl Sessions<'_> {
                 let campaign = clicks[low].campaign as usize;
                 self.reach[campaign] -= 1;
                 if self.reach[campaign] == 0 {
+                    if use_planes { self.planes.toggle(campaign); }
                     let hole = self.place[campaign] as usize;
                     let moved = self.active.pop().unwrap();
                     if hole < self.active.len() {
@@ -1162,8 +1273,12 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+            if use_planes {
+                self.planes.count(day as usize, &mut self.totals);
+            } else {
+                for &campaign in &self.active {
+                    self.totals[campaign as usize * days + day as usize][3] += 1;
+                }
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1232,6 +1347,7 @@ impl Sessions<'_> {
         }
         self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
+        if clicks.len() >= 128 { self.planes.clear_person(); }
         for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
         Ok(())
     }
@@ -1285,6 +1401,7 @@ impl Sessions<'_> {
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
         }
+        if clicks.len() >= 128 { self.planes.clear_person(); }
         for campaign in self.active.drain(..) {
             self.reach[campaign as usize] = 0;
         }
@@ -1375,6 +1492,7 @@ fn session_worker(
 ) -> io::Result<(Vec<Totals>, bool)> {
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
+        planes: AssistPlanes::new(campaigns, shared.days),
         shared,
         writer: None,
         thread,
@@ -1580,6 +1698,7 @@ fn session_worker(
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
     }
+    sessions.planes.finish(&mut sessions.totals);
     Ok((sessions.totals, wrote))
 }
 
