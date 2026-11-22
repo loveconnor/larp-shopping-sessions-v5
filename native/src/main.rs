@@ -876,7 +876,7 @@ fn parse_clicks(
 
 type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
 
-fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards) -> io::Result<(EventSource, ClickSource)> {
+fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards, events_end: usize) -> io::Result<EventSource> {
     let mut block = Block::new();
     let began = Instant::now();
     let own = read_links(shared, &mut block, worker, threads).unwrap_or_else(|error| {
@@ -900,18 +900,24 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         names: Vec::new(),
         overflow_times: Vec::new(),
     };
+    let mut dates = ts::Dates::new();
+    while let Some(work) = shared.work[..events_end].get(shared.next.fetch_add(1, Ordering::Relaxed)) {
+        block.load(&shared.files[work.file], work.start, work.end)?;
+        parse_events(shared, &block, work.copy, &mut dates, &mut events);
+    }
+    Ok(events)
+}
+
+fn read_click_work(shared: &Shared, worker: usize) -> io::Result<ClickSource> {
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
+    let mut block = Block::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
-        if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
-        } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
-        }
+        parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
     }
-    Ok((events, clicks))
+    Ok(clicks)
 }
 
 // ---------------------------------------------------------------- phase 2
@@ -1755,25 +1761,38 @@ fn main() -> io::Result<()> {
     let setup = began.elapsed();
 
     let shards = &LinkShards::default();
-    let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
+    let events_end = shared.work.partition_point(|work| work.events);
+    let parsed_events: Vec<EventSource> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
+            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards, events_end)))
             .collect();
         handles
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect::<io::Result<Vec<_>>>()
     })?;
-    let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
-
+    shared.next.store(events_end, Ordering::Relaxed);
     let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
+    let combined = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for worker in 0..threads {
+            let (sources, next) = (&parsed_events, &next);
+            handles.push(scope.spawn(move || {
+                // Both queues are independent now. A worker helps the other
+                // queue as soon as it has exhausted its initial queue.
+                if worker % 4 == 0 {
+                    let clicks = read_click_work(shared, worker)?;
+                    Ok((dedup_worker(shared, sources, next), clicks))
+                } else {
+                    let events = dedup_worker(shared, sources, next);
+                    Ok((events, read_click_work(shared, worker)?))
+                }
+            }));
+        }
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect::<io::Result<Vec<_>>>()
+    })?;
+    let (events, clicks): (Vec<_>, Vec<_>) = combined.into_iter().unzip();
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
