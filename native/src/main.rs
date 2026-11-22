@@ -1071,7 +1071,87 @@ impl TimeBins {
     }
 }
 
+struct DenseAssists {
+    active: Vec<u64>,
+    counts: Vec<u8>,
+    sessions: Vec<u8>,
+}
+
+impl DenseAssists {
+    fn new(campaigns: usize, days: usize) -> Self {
+        let words = campaigns.div_ceil(64);
+        Self { active: vec![0; words], counts: vec![0; words*64*days], sessions: vec![0; days] }
+    }
+
+    fn flush(&mut self, day: usize, totals: &mut [Totals]) {
+        let days = self.sessions.len();
+        let stride = self.active.len()*64;
+        let counts = &mut self.counts[day*stride..][..stride];
+        for (campaign, count) in counts[..totals.len()/days].iter_mut().enumerate() {
+            totals[campaign*days+day][3] += i64::from(std::mem::take(count));
+        }
+        self.sessions[day] = 0;
+    }
+
+    fn credit(&mut self, day: usize, totals: &mut [Totals]) {
+        if self.sessions[day] == u8::MAX { self.flush(day, totals); }
+        // Each active campaign increments once per credited session. Starting
+        // a fresh daily batch at 255 guarantees that every byte stays exact.
+        self.sessions[day] += 1;
+        let stride = self.active.len()*64;
+        let today = &mut self.counts[day*stride..][..stride];
+        for (&mask, counters) in self.active.iter().zip(today.chunks_exact_mut(64)) {
+            if mask == 0 { continue; }
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+            unsafe {
+                use std::arch::x86_64::*;
+                let p = counters.as_mut_ptr().cast();
+                let old = _mm512_loadu_si512(p);
+                let next = _mm512_mask_add_epi8(old, mask, old, _mm512_set1_epi8(1));
+                _mm512_storeu_si512(p, next);
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+            {
+                let mut pending = mask;
+                while pending != 0 {
+                    counters[pending.trailing_zeros() as usize] += 1;
+                    pending &= pending-1;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn daily_dense_masks_flush_exactly_across_byte_rollovers() {
+    for campaigns in [63, 64, 65, 127, 128, 129, 2001] {
+        let days = 3;
+        let mut trial = DenseAssists::new(campaigns, days);
+        let mut actual = vec![[4, 5, 6, 7]; days*campaigns];
+        let mut expected = actual.clone();
+        let mut random = 987565u64;
+        for session in 0..3075 {
+            let day = session%days;
+            trial.active.fill(0);
+            for campaign in 0..campaigns {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                if campaign%64 == 0 || random%5 < 2 {
+                    trial.active[campaign/64] |= 1u64 << (campaign%64);
+                    expected[campaign*days+day][3] += 1;
+                }
+            }
+            trial.credit(day, &mut actual);
+        }
+        for day in 0..days { trial.flush(day, &mut actual); }
+        assert_eq!(actual, expected);
+    }
+}
+
 struct Sessions<'a> {
+    dense_assists: DenseAssists,
     shared: &'a Shared,
     writer: Option<pq::Writer>,
     thread: usize,
@@ -1127,6 +1207,7 @@ impl Sessions<'_> {
     fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
         let (mut low, mut high) = cursor;
         let days = self.shared.days;
+        let track_dense = clicks.len() >= 64;
         let mut credited = 0usize;
         if !clicks.is_empty() {
             // A click's `ts` counts from 7 days before the events' zero, so
@@ -1137,6 +1218,7 @@ impl Sessions<'_> {
                 if self.reach[campaign] == 0 {
                     self.place[campaign] = self.active.len() as u32;
                     self.active.push(campaign as u32);
+                    if track_dense { self.dense_assists.active[campaign/64] |= 1u64 << (campaign%64); }
                 }
                 self.reach[campaign] += 1;
                 high += 1;
@@ -1145,6 +1227,7 @@ impl Sessions<'_> {
                 let campaign = clicks[low].campaign as usize;
                 self.reach[campaign] -= 1;
                 if self.reach[campaign] == 0 {
+                    if track_dense { self.dense_assists.active[campaign/64] &= !(1u64 << (campaign%64)); }
                     let hole = self.place[campaign] as usize;
                     let moved = self.active.pop().unwrap();
                     if hole < self.active.len() {
@@ -1162,8 +1245,12 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+            if track_dense && self.active.len() >= self.dense_assists.active.len().max(32) {
+                self.dense_assists.credit(day as usize, &mut self.totals);
+            } else {
+                for &campaign in &self.active {
+                    self.totals[campaign as usize * days + day as usize][3] += 1;
+                }
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1375,6 +1462,7 @@ fn session_worker(
 ) -> io::Result<(Vec<Totals>, bool)> {
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
+        dense_assists: DenseAssists::new(campaigns, shared.days),
         shared,
         writer: None,
         thread,
@@ -1572,6 +1660,7 @@ fn session_worker(
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
             }
+            if reached.len() >= 64 { sessions.dense_assists.active.fill(0); }
             from = to;
             click_from = click_to;
         }
@@ -1579,6 +1668,9 @@ fn session_worker(
     let wrote = sessions.writer.is_some();
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
+    }
+    for day in 0..shared.days {
+        if sessions.dense_assists.sessions[day] != 0 { sessions.dense_assists.flush(day, &mut sessions.totals); }
     }
     Ok((sessions.totals, wrote))
 }
