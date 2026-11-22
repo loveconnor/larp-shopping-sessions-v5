@@ -288,7 +288,7 @@ impl Writer {
     }
 
     /// A `Keyed` value. `key` identifies it; when the row before had the same
-    /// key the value is not written again. Otherwise `write` appends its bytes.
+    /// key the value is not written again. Otherwise `write` appends a length-prefixed PLAIN byte array.
     #[inline(always)]
     pub fn keyed(&mut self, column: usize, key: u64, write: impl FnOnce(&mut Vec<u8>)) {
         let column = &mut self.columns[column];
@@ -300,11 +300,7 @@ impl Writer {
         }
         column.last_key = key;
         column.runs.push(1);
-        let at = column.bytes.len();
-        column.bytes.extend_from_slice(&[0; 4]);
         write(&mut column.bytes);
-        let length = (column.bytes.len() - at - 4) as u32;
-        column.bytes[at..at + 4].copy_from_slice(&length.to_le_bytes());
     }
 
     #[inline(always)]

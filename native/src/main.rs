@@ -1100,7 +1100,7 @@ impl Sessions<'_> {
             )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        writer.keyed(0, person, |name| keys::unpack(person, name));
+        writer.keyed(0, person, |name| keys::write_plain_name(person, name));
         writer.int(1, shared.first_day + day as i64);
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);

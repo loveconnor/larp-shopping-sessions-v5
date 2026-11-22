@@ -237,22 +237,24 @@ pub unsafe fn pack_plain(p: *const u8, len: usize) -> u64 {
     }
 }
 
-/// Appends the string of `key` to `out`.
+/// Append one Parquet PLAIN byte array, including its little-endian length.
 #[inline]
-pub fn unpack(key: u64, out: &mut Vec<u8>) {
+pub fn write_plain_name(key: u64, out: &mut Vec<u8>) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if key & INTERNED == 0 {
-        let mut shift = 56i32;
-        while shift >= 0 {
-            let byte = ((key >> shift) & 0x7F) as u8;
-            if byte == 0 {
-                break;
-            }
-            out.push(byte);
-            shift -= 7;
-        }
-    } else {
-        out.extend_from_slice(name(key));
+        let length = 9 - (key.trailing_zeros() / 7) as usize;
+        let first = std::arch::x86_64::_pdep_u64(key >> 7, 0x7f7f_7f7f_7f7f_7f7f);
+        let mut entry = [0u8; 13];
+        entry[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        entry[4..12].copy_from_slice(&first.to_be_bytes());
+        entry[12] = (key & 127) as u8;
+        out.extend_from_slice(&entry[..4 + length]);
+        return;
     }
+    let mut scratch = [0; 9];
+    let name = bytes(key, &mut scratch);
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
 }
 
 pub fn bytes(key: u64, packed: &mut [u8; 9]) -> &[u8] {
