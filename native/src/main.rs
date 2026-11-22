@@ -1236,6 +1236,82 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn person_marked(&mut self, person: u64, events: &[u64], clicks: &[Touch], ends: &mut [u16; 512], buys: &mut [u16; 512]) -> io::Result<()> {
+        use std::arch::x86_64::*;
+        debug_assert!((8..512).contains(&events.len()));
+        let (mut end_count,mut buy_count) = (0,0);
+        if events[0] as u32 != 0 { buys[0] = 0; buy_count = 1; }
+        let mut at = 1;
+        // Each vector compares adjacent clocks. Record only session starts
+        // and purchases, including both marks when they coincide.
+        unsafe {
+            let bound = _mm256_set1_epi64x(SESSION_GAP as i64);
+            let low = _mm256_set1_epi64x(0xffff_ffff);
+            while at + 4 <= events.len() {
+                let p = events.as_ptr().add(at);
+                let v = _mm256_loadu_si256(p.cast());
+                let last = _mm256_loadu_si256(p.sub(1).cast());
+                let delta = _mm256_sub_epi64(_mm256_srli_epi64::<32>(v),_mm256_srli_epi64::<32>(last));
+                let mut gaps = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(delta,bound))) as u32;
+                let mut purchases = _mm256_movemask_pd(_mm256_castsi256_pd(
+                    _mm256_cmpgt_epi64(_mm256_and_si256(v,low),_mm256_setzero_si256()))) as u32;
+                while gaps != 0 {
+                    ends[end_count] = (at + gaps.trailing_zeros() as usize) as u16;
+                    end_count += 1;
+                    gaps &= gaps - 1;
+                }
+                while purchases != 0 {
+                    buys[buy_count] = (at + purchases.trailing_zeros() as usize) as u16;
+                    buy_count += 1;
+                    purchases &= purchases - 1;
+                }
+                at += 4;
+            }
+        }
+        for i in at..events.len() {
+            if (events[i] >> 32) - (events[i-1] >> 32) > SESSION_GAP {
+                ends[end_count] = i as u16; end_count += 1;
+            }
+            if events[i] as u32 != 0 {
+                buys[buy_count] = i as u16; buy_count += 1;
+            }
+        }
+        ends[end_count] = events.len() as u16;
+        let mut from = 0;
+        let mut purchase = 0;
+        let mut current_day = NONE;
+        let (mut n_sessions,mut n_events,mut total_revenue) = (0,0,0);
+        let mut cursor = (0,0);
+        for &end in &ends[..=end_count] {
+            let start = events[from] >> 32;
+            let day = ((start+self.shared.day_offset)/DAY as u64) as u32;
+            if current_day != day {
+                if current_day != NONE {self.row(person,current_day,n_sessions,n_events,total_revenue)?;}
+                current_day = day;
+                (n_sessions,n_events,total_revenue) = (0,0,0);
+            }
+            let mut revenue = 0;
+            while purchase < buy_count && buys[purchase] < end {
+                let value = events[buys[purchase] as usize] as u32;
+                let category = (value >> 24) as usize;
+                let price = u64::from(value & 0xff_ffff);
+                if self.sums[category] == 0 {self.touched.push(category as u8);}
+                self.sums[category] += price;
+                revenue += price;
+                purchase += 1;
+            }
+            n_sessions += 1;
+            n_events += (end as usize - from) as u32;
+            total_revenue += revenue;
+            cursor = self.credit(clicks,cursor,start,day,revenue,revenue != 0);
+            from = end as usize;
+        }
+        self.row(person,current_day,n_sessions,n_events,total_revenue)?;
+        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        Ok(())
+    }
+
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
@@ -1398,6 +1474,8 @@ fn session_worker(
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    let (mut session_ends, mut purchased_rows) = ([0u16;512], [0u16;512]);
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
@@ -1567,6 +1645,10 @@ fn session_worker(
                 }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
+                #[cfg(all(target_arch="x86_64", target_feature="avx2"))]
+                if mine.len() >= 8 { sessions.person_marked(person, mine, reached, &mut session_ends, &mut purchased_rows)?; }
+                else { sessions.person(person, mine, reached)?; }
+                #[cfg(not(all(target_arch="x86_64", target_feature="avx2")))]
                 sessions.person(person, mine, reached)?;
             } else {
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
