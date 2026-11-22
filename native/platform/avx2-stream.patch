@@ -1,0 +1,121 @@
+diff --git a/native/src/main.rs b/native/src/main.rs
+index 4b7bb4e..4f8aabc 100644
+--- a/native/src/main.rs
++++ b/native/src/main.rs
+@@ -1365,6 +1365,93 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+     sort_medium_times(right,r,depth-1);
+ }
+ 
++#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
++fn sort_history_blocks(values: &mut [u64], scratch: &mut [u64]) {
++    use std::arch::x86_64::*;
++    let n = values.len();
++    if n <= 32 {
++        values.sort_unstable();
++        return;
++    }
++    let middle = n.next_power_of_two() / 2;
++    let (left, right) = values.split_at_mut(middle);
++    let (a, b) = scratch.split_at_mut(middle);
++    sort_history_blocks(left, a);
++    sort_history_blocks(right, b);
++    unsafe {
++        let sign = _mm256_set1_epi64x(i64::MIN);
++        let lanes = _mm256_setr_epi64x(0, 1, 2, 3);
++        let upper = _mm256_setr_epi64x(0, 0, -1, -1);
++        let odd = _mm256_setr_epi64x(0, -1, 0, -1);
++        let split = |a, b| {
++            let exchange = _mm256_cmpgt_epi64(a,b);
++            (_mm256_blendv_epi8(a,b,exchange), _mm256_blendv_epi8(b,a,exchange))
++        };
++        let stage = |v, other, upper| {
++            let choose = _mm256_xor_si256(_mm256_cmpgt_epi64(v,other),upper);
++            _mm256_blendv_epi8(v,other,choose)
++        };
++        let finish = |v| {
++            let v = stage(v, _mm256_permute4x64_epi64::<0x4e>(v), upper);
++            stage(v, _mm256_permute4x64_epi64::<0xb1>(v), odd)
++        };
++        let load = |p: *const u64| _mm256_xor_si256(_mm256_loadu_si256(p.cast()), sign);
++        let mut carry = load(left.as_ptr());
++        let (mut x, mut y, mut written) = (4, 0, 0);
++        while x < left.len() || y < right.len() {
++            let block = if y == right.len() || (x < left.len() && left[x] <= right[y]) {
++                let v = load(left.as_ptr().add(x));
++                x += 4;
++                v
++            } else if right.len() - y >= 4 {
++                let v = load(right.as_ptr().add(y));
++                y += 4;
++                v
++            } else {
++                let valid = _mm256_cmpgt_epi64(_mm256_set1_epi64x((right.len()-y) as i64), lanes);
++                let raw = _mm256_maskload_epi64(right.as_ptr().add(y).cast(),valid);
++                y = right.len();
++                _mm256_blendv_epi8(_mm256_set1_epi64x(i64::MAX),_mm256_xor_si256(raw,sign),valid)
++            };
++            let (low, high) = split(carry, _mm256_permute4x64_epi64::<0x1b>(block));
++            carry = finish(high);
++            _mm256_storeu_si256(scratch.as_mut_ptr().add(written).cast(),_mm256_xor_si256(finish(low), sign));
++            written += 4;
++        }
++        let valid = _mm256_cmpgt_epi64(_mm256_set1_epi64x((n-written) as i64),lanes);
++        _mm256_maskstore_epi64(scratch.as_mut_ptr().add(written).cast(),valid,_mm256_xor_si256(carry,sign));
++    }
++    values.copy_from_slice(&scratch[..n]);
++}
++
++#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
++#[test]
++fn avx2_histories_match_unsigned_sort() {
++    let mut seed = 0x71b13d05a289ef43u64;
++    for n in 0..=520 {
++        for mode in 0..8 {
++            let mut guarded = vec![u64::MAX - 3; n + 2];
++            let values = &mut guarded[1..=n];
++            for (i, value) in values.iter_mut().enumerate() {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                *value = match mode {
++                    0 => seed, 1 => seed & 3, 2 => u64::MAX,
++                    3 => i as u64, 4 => (n - i) as u64,
++                    5 => (i % 2) as u64 * u64::MAX,
++                    6 => (i.abs_diff(n / 2)) as u64, _ => seed.rotate_left(i as u32),
++                };
++            }
++            let mut reference = values.to_vec();
++            reference.sort_unstable();
++            sort_history_blocks(values, &mut vec![0; n]);
++            assert_eq!(values, reference, "length={n} mode={mode}");
++            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
++        }
++    }
++}
++
+ fn session_worker(
+     shared: &Shared,
+     events: &[Buckets<Event>],
+@@ -1396,7 +1483,7 @@ fn session_worker(
+     let mut click_ends: Vec<u32> = Vec::new();
+     let mut click_local: Vec<u32> = Vec::new();
+     let mut touches: Vec<Touch> = Vec::new();
+-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
++    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+     let mut scratch: Vec<u64> = Vec::new();
+     let mut bins = None;
+     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+@@ -1565,7 +1652,12 @@ fn session_worker(
+                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
+                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
+                 }
+-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
++                #[cfg(all(target_arch="x86_64",target_feature="avx2",not(target_feature="avx512f")))]
++                if mine.len() > 32 {
++                    if scratch.len() < mine.len() { scratch.resize(mine.len(),0); }
++                    sort_history_blocks(mine,&mut scratch[..mine.len()]);
++                } else { mine.sort_unstable(); }
++                #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
+                 mine.sort_unstable();
+                 sessions.person(person, mine, reached)?;
+             } else {
