@@ -1505,6 +1505,15 @@ fn session_worker(
 
 // ---------------------------------------------------------------- main
 
+fn large_private_cache() -> bool {
+    let dir = "/sys/devices/system/cpu/cpu0/cache/index2";
+    if !fs::read_to_string(format!("{dir}/level")).is_ok_and(|v| v.trim()=="2") { return false; }
+    let Ok(size) = fs::read_to_string(format!("{dir}/size")) else {return false};
+    let text=size.trim();
+    text.strip_suffix('K').and_then(|n|n.parse::<usize>().ok()).is_some_and(|n|n>=2048)
+        || text.strip_suffix('M').and_then(|n|n.parse::<usize>().ok()).is_some_and(|n|n>=2)
+}
+
 fn tune(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -1630,8 +1639,9 @@ fn main() -> io::Result<()> {
     // writes. Larger inputs need finer partitions for the dedup table.
     let medium = (1 << 30..4u64 << 30).contains(&input_bytes);
     let partition_bits = |bytes_per_part| input_bytes.div_ceil(bytes_per_part).max(threads as u64 * 8).ilog2();
-    let id_bits = partition_bits(if medium { 2 << 20 } else { 1 << 20 });
-    let person_bits = partition_bits(if medium { 4 << 20 } else { 1 << 20 });
+    let fine = medium && large_private_cache();
+    let id_bits = partition_bits(if medium && !fine { 2 << 20 } else { 1 << 20 });
+    let person_bits = partition_bits(if medium && !fine { 4 << 20 } else { 1 << 20 });
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
