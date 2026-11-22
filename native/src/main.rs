@@ -23,7 +23,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
@@ -524,7 +524,7 @@ struct Shared {
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
-    id_bits: u32,
+    event_map: EventMap,
     defer_long_events: bool,
     person_bits: u32,
     ahead: usize,
@@ -631,13 +631,113 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+// Entries live in fixed-capacity pages until all parsing and routing
+// threads have joined. Publishing a slot never moves a previous row.
+const PAGE_ROWS: usize = 1 << 14;
+struct Pages<T> { pages: Vec<Vec<T>> }
+impl<T> Pages<T> {
+    fn new() -> Self { Self { pages: Vec::new() } }
+    fn append(&mut self, value: T) -> *mut T {
+        if self.pages.last().is_none_or(|page| page.len() == PAGE_ROWS) {
+            self.pages.push(Vec::with_capacity(PAGE_ROWS));
+        }
+        let page = self.pages.last_mut().unwrap();
+        let at = page.len();
+        page.push(value);
+        unsafe { page.as_mut_ptr().add(at) }
+    }
+}
+
+struct StoredRow {
+    id: u64,
+    user: u64,
+    ingest: i64,
+    ts: AtomicU32,
+    payload: u32,
+}
+
 struct EventSource {
-    buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    rows: Pages<StoredRow>,
+    names: Pages<[u8; 33]>,
+    pending: Vec<(usize, usize)>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum FallbackId { Short(u64), Long([u8; 33]) }
+
+struct EventMap {
+    slots: Box<[AtomicPtr<StoredRow>]>,
+    overflow: Vec<std::sync::Mutex<HashMap<FallbackId, usize>>>,
+}
+
+impl EventMap {
+    fn new(input_bytes: u64) -> Self {
+        let n = (input_bytes / 48).clamp(256, 1 << 27).next_power_of_two() as usize;
+        let layout = std::alloc::Layout::array::<AtomicPtr<StoredRow>>(n).unwrap();
+        // All-zero bytes are a null AtomicPtr. Demand-zero pages avoid a
+        // serial initialization of the entire hash table at startup.
+        let slots = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<AtomicPtr<StoredRow>>();
+            if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr,n))
+        };
+        huge(slots.as_ptr(), n);
+        Self { slots, overflow: (0..256).map(|_| std::sync::Mutex::new(HashMap::new())).collect() }
+    }
+
+    fn home(&self, hash: u64) -> usize {
+        ((hash ^ hash.rotate_right(27)) as usize) & (self.slots.len() - 1)
+    }
+
+    // Only this hash's exact ID may replace an occupied slot. Each
+    // successful replacement makes the UTC ingestion timestamp earlier.
+    unsafe fn insert(&self, home: usize, row: *mut StoredRow, deferred: bool) {
+        unsafe {
+            let id = (*row).id;
+            let long = deferred && id & LONG_EVENT == LONG_EVENT;
+            let name = |key: u64| &*((key & !LONG_EVENT) as *const [u8; 33]);
+            for probe in 0..8 {
+                let slot = self.slots.get_unchecked((home + probe) & (self.slots.len() - 1));
+                let mut prev = slot.load(Ordering::Acquire);
+                loop {
+                    if !prev.is_null() {
+                        let other = (*prev).id;
+                        let same = if long {
+                            other & LONG_EVENT == LONG_EVENT && name(id) == name(other)
+                        } else { id == other };
+                        if !same { break; }
+                        if (*prev).ingest <= (*row).ingest {
+                            (*row).ts.store(DEAD, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    match slot.compare_exchange(prev,row,Ordering::AcqRel,Ordering::Acquire) {
+                        Ok(_) => {
+                            if !prev.is_null() { (*prev).ts.store(DEAD,Ordering::Relaxed); }
+                            return;
+                        }
+                        Err(current) => prev = current,
+                    }
+                }
+            }
+            // A full probe window stays full, so every occurrence of this
+            // spilled key follows the same exact, locked lookup.
+            let key = if long { FallbackId::Long(*name(id)) } else { FallbackId::Short(id) };
+            let mut overflow = self.overflow[home & 255].lock().unwrap();
+            match overflow.entry(key) {
+                std::collections::hash_map::Entry::Vacant(e) => { e.insert(row as usize); }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let prev = *e.get() as *mut StoredRow;
+                    if (*prev).ingest <= (*row).ingest { (*row).ts.store(DEAD, Ordering::Relaxed); }
+                    else { (*prev).ts.store(DEAD,Ordering::Relaxed); e.insert(row as usize); }
+                }
+            }
+        }
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
-    let id_shift = 64 - shared.id_bits;
+    out.pending.clear();
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -649,9 +749,9 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
-            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+            let address = out.names.append(*bytes) as u64;
+            assert_eq!(address & LONG_EVENT, 0);
+            (LONG_EVENT | address, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
@@ -695,15 +795,19 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
-        let record = Parsed {
-            id,
-            user,
-            ingest,
-            ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
-        };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let row = out.rows.append(StoredRow {
+            id, user, ingest, payload,
+            ts: AtomicU32::new(if valid { (at - window_start) as u32 } else { DEAD }),
+        });
+        let home = shared.event_map.home(partition_hash);
+        out.pending.push((home, row as usize));
     });
+    for (i, &(home, row)) in out.pending.iter().enumerate() {
+        if let Some(&(future, _)) = out.pending.get(i + 20) {
+            prefetch(&shared.event_map.slots[future]);
+        }
+        unsafe { shared.event_map.insert(home, row as *mut StoredRow, shared.defer_long_events); }
+    }
 }
 
 struct ClickSource {
@@ -803,7 +907,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { rows: Pages::new(), names: Pages::new(), pending: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -820,94 +924,18 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 // ---------------------------------------------------------------- phase 2
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
+fn route_worker(shared: &Shared, source: &EventSource) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
-    // The events go into the memory of the parsed records they came from: a
-    // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
-    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
-    let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
-    let mut owners = Vec::new();
-    let mut table: Vec<u32> = Vec::new();
-    loop {
-        let part = next.fetch_add(1, Ordering::Relaxed);
-        if part >= 1 << shared.id_bits {
-            break;
-        }
-        chunks.clear();
-        owners.clear();
-        for (owner, source) in sources.iter().enumerate() {
-            source.buckets.chunks(part, &mut chunks);
-            owners.resize(chunks.len(), owner);
-        }
-        let total: usize = chunks.iter().map(|chunk| chunk.1).sum();
-        if total == 0 {
-            continue;
-        }
-        let capacity = (total * 2).next_power_of_two();
-        let mask = capacity - 1;
-        table.clear();
-        table.resize(capacity, NONE);
-        unsafe {
-            for (index, &(base, count)) in chunks.iter().enumerate() {
-                for offset in 0..count {
-                    let record = base.add(offset);
-                    let id = (*record).id;
-                    let entry = ((index << OFFSET_BITS) | offset) as u32;
-                    let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
-                    loop {
-                        let seen = *table.get_unchecked(slot);
-                        if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
-                            break;
-                        }
-                        let other = chunks
-                            .get_unchecked((seen >> OFFSET_BITS) as usize)
-                            .0
-                            .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
-                        let other_id = (*other).id;
-                        let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
-                        } else {
-                            id == other_id
-                        };
-                        if equal {
-                            if (*record).ingest < (*other).ingest {
-                                (*other).ts = DEAD;
-                                *table.get_unchecked_mut(slot) = entry;
-                            } else {
-                                (*record).ts = DEAD;
-                            }
-                            break;
-                        }
-                        slot = (slot + 1) & mask;
-                    }
-                }
-            }
-            for &(base, count) in &chunks {
-                for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
-                        continue;
-                    }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
-                }
-            }
-            // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
-            }
+    for page in &source.rows.pages {
+        for (i,row) in page.iter().enumerate() {
+            if let Some(future) = page.get(i+shared.ahead) { links.prefetch(future.user); }
+            let ts = row.ts.load(Ordering::Relaxed);
+            if ts == DEAD { continue; }
+            let person = links.person(row.user);
+            out.push(person_part(person, shared.person_bits), Event {
+                person, value: (u64::from(ts) << 32) | u64::from(row.payload),
+            });
         }
     }
     out
@@ -1468,7 +1496,7 @@ fn main() -> io::Result<()> {
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
         defer_long_events: copies == 1,
-        id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
+        event_map: EventMap::new(input_bytes),
         person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
@@ -1494,12 +1522,9 @@ fn main() -> io::Result<()> {
     let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
 
-    let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    let events: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = parsed_events.iter().map(|source| scope.spawn(move || route_worker(shared, source))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
@@ -1591,7 +1616,11 @@ fn main() -> io::Result<()> {
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
-                parsed_events[thread].buckets.release();
+                for page in &parsed_events[thread].rows.pages { release(page.as_ptr(), page.len()); }
+                let slots = &shared.event_map.slots;
+                let start = slots.len() * thread / threads;
+                let end = slots.len() * (thread + 1) / threads;
+                release(slots[start..end].as_ptr(), end-start);
                 events[thread].release();
                 clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
