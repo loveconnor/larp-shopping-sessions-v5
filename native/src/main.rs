@@ -723,11 +723,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
-        let (name,n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
-        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
-        let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
+        let (name, name_len) = field(1);
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -736,7 +732,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
-        let mut valid = user != 0
+        let mut valid = name_len != 0
             && (purchase || other)
             && field(5).1 > 0
             && at >= window_start
@@ -755,6 +751,12 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
+        // An invalid earliest copy still suppresses later copies of its ID.
+        // Only surviving rows need a user key for session grouping.
+        let deferred = valid && name_len == 33 && shared.defer_long_events;
+        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
+        let user = if !valid { 0 } else if deferred { 1 } else { keys::pack_user(name, name_len) ^ copy };
+        valid &= user != 0;
         let record = Parsed {
             id,
             user,
@@ -814,6 +816,13 @@ fn parse_clicks(
     };
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
+        let (p, n) = field(2);
+        let campaign = shared.campaigns.get(p, n);
+        let (p, n) = field(3);
+        let at = ts::parse(p, n, dates);
+        if campaign == 0 || at < earliest || at >= window_end {
+            return;
+        }
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
             let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
@@ -830,13 +839,6 @@ fn parse_clicks(
             return;
         }
         let (id, user) = (id ^ copy, user ^ copy);
-        let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
-        let (p, n) = field(3);
-        let at = ts::parse(p, n, dates);
-        if campaign == 0 || at < earliest || at >= window_end {
-            return;
-        }
         let index = pending.len();
         pending.push(RawClick {
             user,
