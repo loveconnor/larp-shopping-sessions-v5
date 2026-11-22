@@ -736,9 +736,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
+        // A validly quoted empty field occupies exactly two bytes.
+        // Every other positive width is sufficient for the non-purchase check.
+        let product_start = seps[4] + 1;
+        let product_width = seps[5] - product_start;
+        let has_product = product_width != 0 &&
+            (product_width != 2 || *buf.add(product_start as usize) != b'"');
         let mut valid = user != 0
             && (purchase || other)
-            && field(5).1 > 0
+            && has_product
             && at >= window_start
             && at < window_end
             && ingest - at <= DAY;
