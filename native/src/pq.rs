@@ -168,6 +168,24 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
 #[inline(always)]
 fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) {
     for group in values.chunks_exact(8) {
+        if BITS > 16 {
+            // Four values fit in each u128 at these widths. Join the two
+            // four-value pieces across bit 128 before emitting the bytes.
+            let four = |items: &[i64]| {
+                let mut packed = 0u128;
+                for (i, &item) in items.iter().enumerate() {
+                    packed |= u128::from(item.wrapping_sub(least) as u64) << (i * BITS);
+                }
+                packed
+            };
+            let left = four(&group[..4]);
+            let right = four(&group[4..]);
+            let low = left | (right << (4 * BITS));
+            let high = right >> (128 - 4 * BITS);
+            out.extend_from_slice(&low.to_le_bytes());
+            out.extend_from_slice(&high.to_le_bytes()[..BITS - 16]);
+            continue;
+        }
         let mut packed = 0u128;
         for (index, &delta) in group.iter().enumerate() {
             packed |= u128::from(delta.wrapping_sub(least) as u64) << (index * BITS);
@@ -228,6 +246,9 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
                     14 => { pack_eight::<14>(out, group, least); continue; }
                     15 => { pack_eight::<15>(out, group, least); continue; }
                     16 => { pack_eight::<16>(out, group, least); continue; }
+                    17 => { pack_eight::<17>(out, group, least); continue; }
+                    18 => { pack_eight::<18>(out, group, least); continue; }
+                    19 => { pack_eight::<19>(out, group, least); continue; }
                     _ => {}
                 }
             }
@@ -563,6 +584,21 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[test]
+    fn complete_miniblock_widths() {
+        for bits in 1..=19 {
+            let mask = (1i64 << bits) - 1;
+            let mut values = vec![i64::MAX];
+            for i in 0..128i64 {
+                let relative = match i % 32 { 0 => 0, 1 => mask, _ => (i * 78839) & mask };
+                values.push(values.last().unwrap().wrapping_add(relative - 123456));
+            }
+            let mut encoded = Vec::new();
+            delta_binary_packed(&mut encoded, &values);
+            assert_eq!(decode(&encoded), values, "width {bits}");
+        }
     }
 
     #[test]
