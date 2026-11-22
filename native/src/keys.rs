@@ -152,6 +152,28 @@ fn name(key: u64) -> &'static [u8] {
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
 }
 
+/// A prefix shared by the column need not occupy space in each short key.
+/// Full eight-byte suffixes carry their printable final byte. Shorter
+/// suffixes use that byte for the original length. All other strings use
+/// the exact interner, whose keys have the high bit set.
+#[inline(always)]
+pub unsafe fn prefixed(p: *const u8, len: usize, prefix: u8) -> u64 {
+    unsafe {
+        if len == 0 { return 0; }
+        if len <= 9 && *p == prefix {
+            let suffix = u64::from_le(p.add(1).cast::<u64>().read_unaligned());
+            if len == 9 {
+                let last = (suffix >> 56) as u8;
+                if (32..128).contains(&last) { return suffix; }
+            } else {
+                let mask = (1u64 << ((len - 1) * 8)) - 1;
+                return (suffix & mask) | ((len as u64) << 56);
+            }
+        }
+        intern(std::slice::from_raw_parts(p, len))
+    }
+}
+
 /// The key of the `len` bytes at `p`. At least 9 bytes must be readable at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]
