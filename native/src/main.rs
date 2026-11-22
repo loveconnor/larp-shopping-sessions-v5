@@ -1557,7 +1557,7 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            if mine.len() < 32 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
