@@ -224,6 +224,21 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
 #[inline(always)]
 unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) -> usize {
     unsafe {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512f",feature="narrow-v4"))]
+        if UNROLL==10 {
+            use std::arch::x86_64::*;
+            let indices=_mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+            let mut pos=_mm512_add_epi32(indices,_mm512_set1_epi32(base as i32));
+            let mut written=0usize;
+            for _ in 0..4 {
+                let group=bits as u16;
+                _mm512_mask_compressstoreu_epi32(out.add(written).cast(),group,pos);
+                written+=group.count_ones() as usize;
+                pos=_mm512_add_epi32(pos,_mm512_set1_epi32(16));
+                bits>>=16;
+            }
+            return written;
+        }
         let count = bits.count_ones() as usize;
         for at in 0..UNROLL {
             *out.add(at) = base + bits.trailing_zeros();
