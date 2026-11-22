@@ -1474,6 +1474,13 @@ fn session_worker(
             let mut index = 0;
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    if let Some(&future) = local.get(index + 16) {
+                        let pos = *ends.get_unchecked(future as usize);
+                        let address = values.as_ptr().add(pos as usize);
+                        std::arch::asm!("prefetchw [{p}]", p = in(reg) address,
+                            options(nostack, preserves_flags, readonly));
+                    }
                     let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
                     *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
                     *end += 1;
@@ -1532,6 +1539,15 @@ fn session_worker(
             let mut index = 0;
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    if let Some(&future) = click_local.get(index + 16) {
+                        if future != NONE {
+                            let pos = *click_ends.get_unchecked(future as usize);
+                            let address = touches.as_ptr().add(pos as usize);
+                            std::arch::asm!("prefetchw [{p}]", p = in(reg) address,
+                                options(nostack, preserves_flags, readonly));
+                        }
+                    }
                     let id = *click_local.get_unchecked(index);
                     index += 1;
                     if id != NONE {
