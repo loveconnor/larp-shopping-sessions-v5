@@ -108,7 +108,7 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
 /// `civil_seconds_plain`, with the day and time read as one vector.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+unsafe fn civil_seconds_original(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe {
         use std::arch::x86_64::*;
         let raw = load64(p); // YYYY-MM-
@@ -156,8 +156,62 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+unsafe fn civil_seconds_original(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe { civil_seconds_plain(p, dates) }
+}
+
+// Gather only the varying bits of HH:MM:SS. A 32 KiB table covers
+// every encoded hour/minute and a second small table covers seconds.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+mod clock {
+    pub const MASK: u64 = u64::from_le_bytes([3,15,0,7,15,0,7,15]);
+    const fn minutes() -> [i32;8192] {
+        let mut result = [i32::MIN;8192];
+        let mut min = 0;
+        while min < 1440 {
+            let h = min / 60;
+            let m = min % 60;
+            let key = h/10 | ((h%10)<<2) | ((m/10)<<6) | ((m%10)<<9);
+            result[key] = min as i32 * 60;
+            min += 1;
+        }
+        result
+    }
+    const fn seconds() -> [i32;128] {
+        let mut result = [i32::MIN;128];
+        let mut s = 0;
+        while s < 60 { result[s/10 | ((s%10)<<3)] = s as i32; s+=1; }
+        result
+    }
+    pub static MINUTES: [i32;8192] = minutes();
+    pub static SECONDS: [i32;128] = seconds();
+
+    #[inline(always)]
+    pub unsafe fn parts(text: u64) -> (i32,i32) {
+        let key = unsafe { std::arch::x86_64::_pext_u64(text,MASK) } as usize;
+        (MINUTES[key & 8191], SECONDS[key >> 13])
+    }
+}
+
+#[inline(always)]
+unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        let raw = load64(p);
+        let dd = (load32(p.add(8)) ^ u32::from_le_bytes(*b"00T\0")) & 0xffffff;
+        let tens = dd & 15;
+        let units = (dd >> 8) & 15;
+        let day = (tens*10 + units) as usize;
+        if dd & 0xfff0f0 == 0 && tens <= 3 && units <= 9 && raw != 0 && dates.month[day] == raw {
+            let text = load64(p.add(11));
+            let (minute,second) = clock::parts(text);
+            if (text ^ u64::from_le_bytes(*b"00:00:00")) & !clock::MASK != 0 || (minute | second) < 0 {
+                return BAD;
+            }
+            return dates.midnight[day] + i64::from(minute + second);
+        }
+    }
+    unsafe { civil_seconds_original(p,dates) }
 }
 
 /// Eight ASCII digits already reduced to 0..=9 per byte, first digit lowest.
@@ -218,7 +272,14 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
         if day >= dates.month.len() || dates.month[day] != raw {
             return parse(p, len, dates);
         }
-        (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            let (minute, second) = clock::parts(load64(p.add(11)));
+            if (minute | second) < 0 { return BAD; }
+            (dates.midnight[day] + i64::from(minute + second)) * 1000
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        { (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000 }
     }
 }
 
