@@ -1332,14 +1332,17 @@ unsafe fn sort_short_times(values: &mut [u64]) {
 }
 
 #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
-fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+fn sort_medium_times<const IN_PLACE: bool>(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     use std::arch::x86_64::*;
     let n=values.len();
-    if n<=32 {
-        if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
+    if n <= 32 || depth == 0 {
+        let dest = if IN_PLACE { values } else {
+            tmp.copy_from_slice(values);
+            tmp
+        };
+        if (5..=32).contains(&n) { unsafe { sort_short_times(dest) } } else { dest.sort_unstable(); }
         return;
     }
-    if depth==0 { values.sort_unstable(); return; }
     let (a,b,c)=(values[0],values[n/2],values[n-1]);
     let pivot=a.min(b).max(a.max(b).min(c));
     let (mut lo,mut hi)=(0,n);
@@ -1357,12 +1360,21 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
             lo+=small;
         }
     }
-    if lo==0 || lo==n { values.sort_unstable(); return; }
-    values.copy_from_slice(&tmp[..n]);
-    let (left,right)=values.split_at_mut(lo);
-    let (l,r)=tmp.split_at_mut(lo);
-    sort_medium_times(left,l,depth-1);
-    sort_medium_times(right,r,depth-1);
+    if lo == 0 || lo == n {
+        if IN_PLACE { values.sort_unstable(); } else { tmp.sort_unstable(); }
+        return;
+    }
+    // Each split has already placed its children in the other buffer.
+    // Only leaves at odd depth require copying into their final location.
+    let (left, right) = tmp.split_at_mut(lo);
+    let (left_tmp, right_tmp) = values.split_at_mut(lo);
+    if IN_PLACE {
+        sort_medium_times::<false>(left, left_tmp, depth - 1);
+        sort_medium_times::<false>(right, right_tmp, depth - 1);
+    } else {
+        sort_medium_times::<true>(left, left_tmp, depth - 1);
+        sort_medium_times::<true>(right, right_tmp, depth - 1);
+    }
 }
 
 fn session_worker(
@@ -1563,7 +1575,7 @@ fn session_worker(
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
                 } else {
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
-                    sort_medium_times(mine,&mut scratch[..mine.len()],12);
+                    sort_medium_times::<true>(mine,&mut scratch[..mine.len()],12);
                 }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
