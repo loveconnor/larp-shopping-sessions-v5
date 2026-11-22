@@ -922,6 +922,11 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
+    // The intermediate groups fit in the private cache. While a group is
+    // scattered, only its subset of destination pages receives writes.
+    const GROUP_BITS: u32 = 5;
+    let group_shift = person_bits.saturating_sub(GROUP_BITS);
+    let mut groups: [Vec<Event>; 1 << GROUP_BITS] = std::array::from_fn(|_| Vec::new());
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
@@ -1006,12 +1011,19 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    let part = person_part(person, person_bits);
+                    groups[part >> group_shift].push(Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
+            }
+            for group in &mut groups {
+                for &event in group.iter() {
+                    out.push(person_part(event.person, person_bits), event);
+                }
+                group.clear();
             }
         }
     }
