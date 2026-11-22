@@ -766,6 +766,34 @@ mod tests {
         assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&data));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_file_ends_match_pread() {
+        let path = std::env::temp_dir().join(format!("sessions-tail-{}",std::process::id()));
+        for length in [4095,4096,4097,8192] {
+            for terminated in [false,true] {
+                let mut bytes = b"header,header\nfoo,bar\n".to_vec();
+                bytes.resize(length - 3,b'a');
+                bytes.extend_from_slice(if terminated { b",b\n" } else { b",bc" });
+                std::fs::write(&path,&bytes).unwrap();
+                let mapped = Source::open(&path,true).unwrap();
+                let copied = Source::open(&path,false).unwrap();
+                assert!(mapped.guarded_tail);
+                let run = |source: &Source| {
+                    let mut out = Vec::new();
+                    let mut block = Block::new();
+                    for start in (0..length).step_by(1024) {
+                        block.load(source,start as u64,(start+1024).min(length) as u64).unwrap();
+                        out.extend(collect::<2>(&block,false));
+                    }
+                    out
+                };
+                assert_eq!(run(&mapped),run(&copied));
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn growing_a_block_preserves_the_partial_row() {
         let mut block = Block::new();
