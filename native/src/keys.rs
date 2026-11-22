@@ -103,6 +103,16 @@ pub fn prepare_users(bytes: u64) {
     });
 }
 
+/// At shutdown, give each worker a disjoint share of the published name table.
+pub fn release_user_pages(worker: usize, workers: usize) {
+    if let Some(slots) = USER_SLOTS.get() {
+        let from = slots.len() * worker / workers;
+        let to = slots.len() * (worker + 1) / workers;
+        let range = &slots[from..to];
+        crate::release(range.as_ptr(), range.len());
+    }
+}
+
 #[inline(always)]
 pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
