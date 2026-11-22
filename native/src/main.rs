@@ -287,13 +287,14 @@ struct AliasGroup {
 
 /// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
+    routes:Vec<u16>,
     slots: Vec<AliasGroup>,
     shift: u32,
     empty: bool,
 }
 
 impl Links {
-    fn build(pairs: &[(u64, u64)]) -> Self {
+    fn build(pairs: &[(u64, u64)], bits:u32) -> Self {
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
@@ -369,9 +370,19 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
+        const EMPTY:u16=u16::MAX;
+        const AMBIGUOUS:u16=u16::MAX-1;
+        let mut routes=if bits<15 {vec![EMPTY;(pairs.len()*4+1).next_power_of_two()]} else {Vec::new()};
+        let route_mask=routes.len().wrapping_sub(1);
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
+            if !routes.is_empty() {
+                let bucket=(key.wrapping_mul(MIX)>>21) as usize & route_mask;
+                let hint=&mut routes[bucket];
+                let dest=person_part(person,bits) as u16;
+                if *hint==EMPTY {*hint=dest;} else if *hint!=dest {*hint=AMBIGUOUS;}
+            }
             if key == person { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
@@ -384,14 +395,19 @@ impl Links {
                 at = (at + 1) & (count - 1);
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        Self { routes,slots: groups, shift, empty: aliases == 0 }
     }
 
     #[inline(always)]
-    fn prefetch(&self, key: u64) {
-        if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
-        }
+    fn route(&self,key:u64,bits:u32)->usize {
+        if self.routes.is_empty(){return person_part(self.person(key),bits);}
+        let hint=self.routes[(key.wrapping_mul(MIX)>>21) as usize &(self.routes.len()-1)];
+        if hint<u16::MAX-1 { return usize::from(hint); }
+        if hint==u16::MAX {person_part(key,bits)} else {person_part(self.person(key),bits)}
+    }
+    #[inline(always)]
+    fn prefetch(&self,key:u64){
+        if !self.routes.is_empty(){prefetch(&self.routes[(key.wrapping_mul(MIX)>>21) as usize &(self.routes.len()-1)]);}
     }
 
     #[inline(always)]
@@ -605,7 +621,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
             start = end;
         }
     }
-    Ok(Links::build(&pairs))
+    Ok(Links::build(&pairs,shared.person_bits))
 }
 
 #[inline(always)]
@@ -798,9 +814,9 @@ fn parse_clicks(
             links.prefetch(ahead.user);
         }
         let click = pending[at];
-        let person = links.person(click.user);
+        let person = click.user;
         out.buckets.push(
-            person_part(person, shared.person_bits),
+            links.route(person, shared.person_bits),
             Click {
                 person,
                 id: click.id,
@@ -919,9 +935,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = record.user;
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    out.push(links.route(person, person_bits), Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -1136,6 +1152,8 @@ fn session_worker(
     next: &AtomicUsize,
     thread: usize,
 ) -> io::Result<(Vec<Totals>, bool)> {
+    let links=shared.links.get().unwrap();
+    let mut memo=Vec::<(u64,u32)>::new();
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
         shared,
@@ -1174,6 +1192,9 @@ fn session_worker(
         // Group the events by person: number the people as they appear.
         let mut capacity = (total / 4 + 16).next_power_of_two();
         let mut mask = capacity - 1;
+        memo.clear();
+        let memo_mask=(total/3+16).next_power_of_two()-1;
+        memo.resize(memo_mask+1,(0,NONE));
         table_keys.clear();
         table_keys.resize(capacity, 0);
         table_ids.clear();
@@ -1184,7 +1205,11 @@ fn session_worker(
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
-                    let person = (*base.add(offset)).person;
+                    let raw=(*base.add(offset)).person;
+                    let home=(raw.wrapping_mul(MIX)>>17) as usize & memo_mask;
+                    let (cached,id)=*memo.get_unchecked(home);
+                    let id=if cached==raw {id} else {
+                    let person=links.person(raw);
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
@@ -1200,6 +1225,9 @@ fn session_worker(
                             break id;
                         }
                         slot = (slot + 1) & mask;
+                    };
+                        *memo.get_unchecked_mut(home)=(raw,id);
+                        id
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
                     local.push(id);
@@ -1255,7 +1283,11 @@ fn session_worker(
         unsafe {
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
-                    let person = (*base.add(offset)).person;
+                    let raw=(*base.add(offset)).person;
+                    let home=(raw.wrapping_mul(MIX)>>17) as usize & memo_mask;
+                    let (cached,id)=*memo.get_unchecked(home);
+                    let id=if cached==raw {id} else {
+                    let person=links.person(raw);
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
@@ -1266,6 +1298,9 @@ fn session_worker(
                             break NONE;
                         }
                         slot = (slot + 1) & mask;
+                    };
+                        *memo.get_unchecked_mut(home)=(raw,id);
+                        id
                     };
                     click_local.push(id);
                     if id != NONE {

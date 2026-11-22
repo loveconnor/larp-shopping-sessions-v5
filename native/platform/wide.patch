@@ -1,8 +1,7 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 371b35d..89968a0 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -335,6 +335,10 @@ impl Links {
+@@ -341,6 +341,10 @@
              }
              numbered.push(index);
          }
@@ -13,17 +12,17 @@ index 371b35d..89968a0 100644
          // Join. The smaller number is the root, so no cycle can form.
          let mut aliases = 0usize;
          let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-@@ -364,9 +368,7 @@ impl Links {
-         let shift = 64 - count.trailing_zeros();
-         let mut groups = vec![AliasGroup::default(); count];
-         huge(groups.as_ptr(), count);
+@@ -374,9 +378,7 @@
+         const AMBIGUOUS:u16=u16::MAX-1;
+         let mut routes=if bits<15 {vec![EMPTY;(pairs.len()*4+1).next_power_of_two()]} else {Vec::new()};
+         let route_mask=routes.len().wrapping_sub(1);
 -        for [key, id] in slots {
 -            if key == 0 { continue; }
 -            let person = names[id as usize];
 +        for (key, person) in original.into_iter().zip(names) {
-             if key == person { continue; }
-             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-             loop {
+             if !routes.is_empty() {
+                 let bucket=(key.wrapping_mul(MIX)>>21) as usize & route_mask;
+                 let hint=&mut routes[bucket];
 diff --git a/native/src/scan.rs b/native/src/scan.rs
 index ce3aae9..7743174 100644
 --- a/native/src/scan.rs
