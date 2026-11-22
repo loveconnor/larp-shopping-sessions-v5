@@ -82,7 +82,7 @@ unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
     /// Bytes of a chunk that hold records.
-    const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    const FILL: usize = if std::mem::size_of::<T>()==16 {CHUNK_BYTES-64} else {(CHUNK_BYTES-1)/std::mem::size_of::<T>()*std::mem::size_of::<T>()};
     /// Records per chunk.
     const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
     const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
@@ -916,11 +916,31 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
 
 // ---------------------------------------------------------------- phase 2
 
+#[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+impl Buckets<Event> {
+    #[inline(always)]
+    fn push_line(&mut self,part:usize,line:&[Event;4]) {
+        unsafe {
+            use std::arch::x86_64::*;
+            let slot=self.next.as_mut_ptr().add(part);
+            let mut at=*slot;
+            if at as usize & (CHUNK_BYTES-1)==Self::FILL {at=self.grow(part);}
+            let a=_mm256_loadu_si256(line.as_ptr().cast());
+            let b=_mm256_loadu_si256(line.as_ptr().add(2).cast());
+            _mm256_stream_si256(at.cast(),a);
+            _mm256_stream_si256(at.add(2).cast(),b);
+            *slot=at.add(4);
+        }
+    }
+}
+
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    let (mut lines,mut filled)=(vec![[Event{person:0,value:0};4];1<<shared.person_bits],vec![0u8;1<<shared.person_bits]);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -1006,13 +1026,29 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    let partition=person_part(person,person_bits);
+                    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+                    {
+                        let n=filled[partition] as usize;
+                        lines[partition][n]=Event{person,value};
+                        if n==3 {out.push_line(partition,&lines[partition]);filled[partition]=0;}
+                        else {filled[partition]=(n+1) as u8;}
+                    }
+                    #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
+                    out.push(partition,Event{person,value});
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
             }
+        }
+    }
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    {
+        unsafe {std::arch::x86_64::_mm_sfence();}
+        for (part,&count) in filled.iter().enumerate() {
+            for &event in &lines[part][..count as usize] {out.push(part,event);}
         }
     }
     out
