@@ -186,12 +186,10 @@ impl<T: Copy> Buckets<T> {
 struct Parsed {
     id: u64,
     user: u64,
-    /// Full UTC ingestion time, including copies ingested before the window.
-    ingest: i64,
-    /// Milliseconds after `window_start`, or `DEAD`.
+    // Common rows keep milliseconds since the ingest base. The high bit
+    // references a source-local entry for purchases or distant ingest times.
+    ingest: u32,
     ts: u32,
-    /// 0, or for a purchase its category in the top 8 bits and price below.
-    payload: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -601,9 +599,31 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+const EXTRA_INGEST: u32 = 1 << 31;
+
 struct EventSource {
     buckets: Buckets<Parsed>,
+    extra: Vec<(i64, u32)>,
     names: Vec<[u8; 33]>,
+}
+
+impl EventSource {
+    #[inline(always)]
+    fn encode(&mut self, ingest: i64, base: i64, payload: u32) -> u32 {
+        let relative = ingest.wrapping_sub(base) as u64;
+        if payload == 0 && relative < u64::from(EXTRA_INGEST) {
+            return relative as u32;
+        }
+        let index = u32::try_from(self.extra.len()).expect("too many exceptional records");
+        let token = index.checked_add(EXTRA_INGEST).expect("too many exceptional records");
+        self.extra.push((ingest, payload));
+        token
+    }
+
+    fn timestamp(&self, token: u32, base: i64) -> i64 {
+        if token < EXTRA_INGEST { base + i64::from(token) }
+        else { self.extra[(token - EXTRA_INGEST) as usize].0 }
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -668,9 +688,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest,
+            ingest: out.encode(ingest, window_start - DAY, payload),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
         };
         out.buckets.push((partition_hash >> id_shift) as usize, record);
     });
@@ -773,7 +792,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), extra: Vec::new(), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -848,7 +867,15 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            if (*record).ingest < (*other).ingest {
+                            let (a, b) = ((*record).ingest, (*other).ingest);
+                            let earlier = if (a | b) < EXTRA_INGEST {
+                                a < b
+                            } else {
+                                let other_owner = owners[(seen >> OFFSET_BITS) as usize];
+                                let base = shared.window_start - DAY;
+                                sources[owners[index]].timestamp(a, base) < sources[other_owner].timestamp(b, base)
+                            };
+                            if earlier {
                                 (*other).ts = DEAD;
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
@@ -860,7 +887,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
+            for (&(base, count), &owner) in chunks.iter().zip(&owners) {
                 for offset in 0..count {
                     if offset + ahead < count {
                         links.prefetch((*base.add(offset + ahead)).user);
@@ -870,7 +897,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         continue;
                     }
                     let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    let payload = if record.ingest < EXTRA_INGEST { 0 }
+                        else { sources[owner].extra[(record.ingest - EXTRA_INGEST) as usize].1 };
+                    let value = ((record.ts as u64) << 32) | u64::from(payload);
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
