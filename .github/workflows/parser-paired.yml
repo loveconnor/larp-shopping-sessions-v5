@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 600283}
-          - {events: 60000000, format: current, seed: 600283}
-          - {events: 20000000, format: current, seed: 853949}
-          - {events: 60000000, format: current, seed: 853949}
+          - {events: 20000000, format: current, seed: 174443}
+          - {events: 60000000, format: current, seed: 174443}
+          - {events: 20000000, format: current, seed: 319811}
+          - {events: 60000000, format: current, seed: 319811}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: a057b4a6243282ef33ea848a5c33157f2a50aa81
-      CANDIDATE: 5755427325269087ea66d1aa856d879c3edf0170
+      RANKED: 248ec5025f7a8357bf119b26aa7cb842c333ea0d
+      CANDIDATE: c5895e12d5388d16f1e8b2cde10ebcef3a4c37be
     steps:
       - uses: actions/checkout@v4
         with:
