@@ -1,7 +1,7 @@
 name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/narrow-delta-extract]
+    branches: [bench/vector-revenue-stream]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 292183, engine: n4}
-          - {events: 60000000, format: current, seed: 292183, engine: n4}
-          - {events: 20000000, format: current, seed: 891031, engine: n4}
-          - {events: 60000000, format: current, seed: 891031, engine: n4}
+          - {events: 20000000, format: current, seed: 471337, engine: n4}
+          - {events: 60000000, format: current, seed: 471337, engine: n4}
+          - {events: 20000000, format: current, seed: 817241, engine: n4}
+          - {events: 60000000, format: current, seed: 817241, engine: n4}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 7b780d344bacf0867a9fac63de1312232abda343
+      CANDIDATE: f92c3ee5eed2590dad2f25563383c2460f123d4b
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,11 +42,11 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
-      - name: Verify byte-exact narrow delta packing for every tested width
+      - name: Compare every packed byte for widths 17 through 32
         run: |
-          if grep -qw avx512bw /proc/cpuinfo; then
+          if grep -qw avx512vbmi /proc/cpuinfo; then
             cd "$RUNNER_TEMP/candidate-src"
-            RUSTFLAGS='-Ctarget-cpu=x86-64-v4' cargo test --release --manifest-path native/Cargo.toml packed_narrow_deltas_match_bit_stream_for_wrapping_minima | tee "$RUNNER_TEMP/narrow-delta-test.log"
+            RUSTFLAGS='-Ctarget-cpu=x86-64-v4' cargo test --release --manifest-path native/Cargo.toml vector_revenue_stream_matches_every_output_bit | tee "$RUNNER_TEMP/narrow-delta-test.log"
             grep -q '1 passed' "$RUNNER_TEMP/narrow-delta-test.log"
           fi
       - name: Generate fresh data
@@ -66,7 +66,7 @@ jobs:
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          if os.environ["ENGINE"] == "n4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
+          if os.environ["ENGINE"] == "n4" and "avx512vbmi" not in pathlib.Path("/proc/cpuinfo").read_text():
               print("Host has no v4 engine. Skipping this comparison.", flush=True)
               raise SystemExit(0)
           cpus = sorted(os.sched_getaffinity(0))[:8]
@@ -121,7 +121,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
+          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512vbmi /proc/cpuinfo; then exit 0; fi
           for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
