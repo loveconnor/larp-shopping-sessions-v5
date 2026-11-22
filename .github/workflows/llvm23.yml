@@ -1,19 +1,19 @@
 name: Train practice- and final-size profiles on matching native machines
 on:
   push:
-    branches: [bench/size-specific-profiles]
+    branches: [bench/busy-attribution-training]
 permissions:
   contents: read
 jobs:
   profile:
     strategy:
       matrix:
-        seed: [143711, 937819, 608329, 380887]
+        seed: [286125, 357263, 828303, 970127]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5280e1d01e1dda4f1a818842cc00a753b26bcd42
+          ref: 8f4377344ffb6c27b8a66f9a720d7a7d07eb9af6
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
