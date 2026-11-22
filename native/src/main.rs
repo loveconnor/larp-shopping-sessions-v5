@@ -1173,8 +1173,8 @@ impl Sessions<'_> {
         (low, high)
     }
 
-    fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
-        for &value in events {
+    fn person_binned(&mut self, person: u64, events: impl Iterator<Item = u64>, clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
+        for value in events {
             let ts = (value >> 32) as u32;
             let index = (ts >> BIN_SHIFT) as usize;
             let bin = &mut scratch.bins[index];
@@ -1369,24 +1369,30 @@ const EVENTS_PER_BLOCK: usize = 8;
 
 #[derive(Default, Clone, Copy)]
 struct PersonRun {
-    head: usize,
-    len: usize,
+    head: u32,
+    len: u32,
 }
 
 impl PersonRun {
-    fn values<'a>(self, blocks: &'a mut [[u64; EVENTS_PER_BLOCK]], older: &[usize], scratch: &'a mut Vec<u64>) -> &'a mut [u64] {
-        if self.len <= EVENTS_PER_BLOCK {
-            return &mut blocks[self.head][..self.len];
+    fn chunks<'a>(self, blocks: &'a [[u64; EVENTS_PER_BLOCK]], older: &'a [u32]) -> impl Iterator<Item = &'a [u64]> {
+        let (mut left, mut head) = (self.len as usize, self.head as usize);
+        std::iter::from_fn(move || {
+            if left == 0 { return None; }
+            let used = (left-1)%EVENTS_PER_BLOCK+1;
+            let values = &blocks[head][..used];
+            head = older[head] as usize;
+            left -= used;
+            Some(values)
+        })
+    }
+
+    fn values<'a>(self, blocks: &'a mut [[u64; EVENTS_PER_BLOCK]], older: &[u32], scratch: &'a mut Vec<u64>) -> &'a mut [u64] {
+        if self.len as usize <= EVENTS_PER_BLOCK {
+            return &mut blocks[self.head as usize][..self.len as usize];
         }
         scratch.clear();
-        scratch.reserve(self.len);
-        let (mut left, mut head) = (self.len, self.head);
-        while left != 0 {
-            let used = (left-1)%EVENTS_PER_BLOCK+1;
-            scratch.extend_from_slice(&blocks[head][..used]);
-            left -= used;
-            head = older[head];
-        }
+        scratch.reserve(self.len as usize);
+        for chunk in self.chunks(blocks, older) { scratch.extend_from_slice(chunk); }
         scratch.as_mut_slice()
     }
 }
@@ -1418,7 +1424,7 @@ fn session_worker(
     let mut persons: Vec<u64> = Vec::new();
     let mut runs: Vec<PersonRun> = Vec::new();
     let mut blocks: Vec<[u64; EVENTS_PER_BLOCK]> = Vec::new();
-    let mut older: Vec<usize> = Vec::new();
+    let mut older: Vec<u32> = Vec::new();
     let mut history: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
@@ -1446,7 +1452,6 @@ fn session_worker(
         table_ids.resize(capacity, 0);
         persons.clear();
         runs.clear();
-        blocks.clear();
         older.clear();
         unsafe {
             for &(base, count) in &event_chunks {
@@ -1471,13 +1476,14 @@ fn session_worker(
                     // Small histories stay in one block. Longer histories
                     // allocate another block without copying earlier events.
                     let run = runs.get_unchecked_mut(id as usize);
-                    let lane = run.len % EVENTS_PER_BLOCK;
+                    let lane = run.len as usize % EVENTS_PER_BLOCK;
                     if lane == 0 {
+                        let next = older.len();
                         older.push(run.head);
-                        run.head = blocks.len();
-                        blocks.push([0; EVENTS_PER_BLOCK]);
+                        run.head = u32::try_from(next).expect("too many event blocks in one partition");
+                        if next == blocks.len() { blocks.push([0; EVENTS_PER_BLOCK]); }
                     }
-                    blocks.get_unchecked_mut(run.head)[lane] = (*base.add(offset)).value;
+                    blocks.get_unchecked_mut(run.head as usize)[lane] = (*base.add(offset)).value;
                     run.len += 1;
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
@@ -1568,12 +1574,13 @@ fn session_worker(
         let mut click_from = 0;
         for (id, &person) in persons.iter().enumerate() {
             let click_to = click_ends[id] as usize;
-            let mine = runs[id].values(&mut blocks, &older, &mut history);
+            let run = runs[id];
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            if run.len < 512 {
+                let mine = run.values(&mut blocks, &older, &mut history);
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
@@ -1586,7 +1593,8 @@ fn session_worker(
                 sessions.person(person, mine, reached)?;
             } else {
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
-                sessions.person_binned(person, mine, reached, bins)?;
+                let values = run.chunks(&blocks, &older).flatten().copied();
+                sessions.person_binned(person, values, reached, bins)?;
             }
             click_from = click_to;
         }
