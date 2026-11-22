@@ -317,7 +317,7 @@ impl Links {
         // pass will touch a few steps on, since every touch is a cache miss.
         let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
         for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
+            if let Some(&(c, d)) = pairs.get(at + 32) {
                 prefetch(&slots[home(c)]);
                 prefetch(&slots[home(d)]);
             }
@@ -343,7 +343,7 @@ impl Links {
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
         for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
+            if let Some(&[c, d]) = numbered.get(at + 4) {
                 prefetch(&parent[c as usize]);
                 prefetch(&parent[d as usize]);
             }
