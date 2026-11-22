@@ -1215,6 +1215,40 @@ unsafe fn sort_short_times(values: &mut [u64]) {
     write(24,finish(_mm512_max_epu64(ah,bh)));
 }
 
+#[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
+fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+    use std::arch::x86_64::*;
+    let n=values.len();
+    if n<=32 {
+        if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
+        return;
+    }
+    if depth==0 { values.sort_unstable(); return; }
+    let (a,b,c)=(values[0],values[n/2],values[n-1]);
+    let pivot=a.min(b).max(a.max(b).min(c));
+    let (mut lo,mut hi)=(0,n);
+    unsafe {
+        let bound=_mm512_set1_epi64(pivot as i64);
+        for i in (0..n).step_by(8) {
+            let count=(n-i).min(8);
+            let valid=(0xffu16>>(8-count)) as u8;
+            let v=_mm512_maskz_loadu_epi64(valid,values.as_ptr().add(i).cast());
+            let below=_mm512_cmplt_epu64_mask(v,bound)&valid;
+            let small=below.count_ones() as usize;
+            hi-=count-small;
+            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(lo).cast(),below,v);
+            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(hi).cast(),valid & !below,v);
+            lo+=small;
+        }
+    }
+    if lo==0 || lo==n { values.sort_unstable(); return; }
+    values.copy_from_slice(&tmp[..n]);
+    let (left,right)=values.split_at_mut(lo);
+    let (l,r)=tmp.split_at_mut(lo);
+    sort_medium_times(left,l,depth-1);
+    sort_medium_times(right,r,depth-1);
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1405,7 +1439,12 @@ fn session_worker(
                 sort_by_time(mine, &mut scratch);
             } else {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
-                if (5..=32).contains(&mine.len()) { unsafe { sort_short_times(mine) } } else { mine.sort_unstable(); }
+                if mine.len() <= 32 {
+                    if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
+                } else {
+                    if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
+                    sort_medium_times(mine,&mut scratch[..mine.len()],12);
+                }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
             }
