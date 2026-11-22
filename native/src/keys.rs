@@ -79,32 +79,74 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
 // The tag and complete name share a cache line. A slot transitions once
 // from empty to writing to published, so readers can reuse it without a lock.
 const FIXED_USER: u64 = 1 << 61;
-#[repr(C, align(64))]
+#[repr(C, align(32))]
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
-    name: std::cell::UnsafeCell<[u8; 33]>,
+    packed: std::cell::UnsafeCell<[u8; 16]>,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
 // acquire publication or a key obtained from an already published slot.
 unsafe impl Sync for UserSlot {}
-static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::new();
+type OriginalName = std::cell::UnsafeCell<std::mem::MaybeUninit<[u8; 33]>>;
+struct UserTable {
+    slots: Box<[UserSlot]>,
+    names: Box<[OriginalName]>,
+}
+// A name is written by its slot owner before the release publication.
+unsafe impl Sync for UserTable {}
+static USER_SLOTS: std::sync::OnceLock<UserTable> = std::sync::OnceLock::new();
 
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
         let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
-        let mut slots = Vec::with_capacity(size);
-        slots.resize_with(size, || UserSlot { tag: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
-        slots.into_boxed_slice()
+        let slots = (0..size).map(|_| UserSlot { tag: 0.into(), packed: [0; 16].into() }).collect();
+        let names = (0..size).map(|_| std::mem::MaybeUninit::uninit().into()).collect();
+        UserTable { slots, names }
     });
 }
 
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    fn decode_user(bytes: &[u8; 33]) -> Option<[u8; 16]> {
+        use std::arch::x86_64::*;
+        if bytes[0] != b'u' { return None; }
+        unsafe {
+            let ascii = _mm256_loadu_si256(bytes.as_ptr().add(1).cast());
+            let digit = _mm256_sub_epi8(ascii, _mm256_set1_epi8(b'0' as i8));
+            let letter = _mm256_sub_epi8(ascii, _mm256_set1_epi8(b'a' as i8));
+            let non_digit = _mm256_subs_epu8(digit, _mm256_set1_epi8(9));
+            let non_letter = _mm256_subs_epu8(letter, _mm256_set1_epi8(5));
+            let invalid = _mm256_min_epu8(non_digit, non_letter);
+            if _mm256_testz_si256(invalid, invalid) == 0 { return None; }
+            let nibbles = _mm256_min_epu8(digit, _mm256_add_epi8(letter, _mm256_set1_epi8(10)));
+            let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+            let packed = _mm_packus_epi16(_mm256_castsi256_si128(pairs), _mm256_extracti128_si256::<1>(pairs));
+            Some(std::mem::transmute::<__m128i, [u8; 16]>(packed))
+        }
+    }
+
 #[inline(always)]
-unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
+unsafe fn fixed_user(p: *const u8, table: &UserTable) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
-    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
-    let mixed = (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
-        .wrapping_mul(0x9e3779b97f4a7c15);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let Some(packed) = decode_user(bytes) else { return intern(bytes); };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let packed = {
+        if bytes[0] != b'u' { return intern(bytes); }
+        let digit = |b: u8| match b { b'0'..=b'9' => b - b'0', b'a'..=b'f' => b - b'a' + 10, _ => 255 };
+        let mut packed = [0; 16];
+        for (pair, dst) in bytes[1..].chunks_exact(2).zip(&mut packed) {
+            let (hi,lo) = (digit(pair[0]), digit(pair[1]));
+            if (hi | lo) > 15 { return intern(bytes); }
+            *dst = hi << 4 | lo;
+        }
+        packed
+    };
+    let slots = &table.slots;
+    let lo = u64::from_le_bytes(packed[..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(packed[8..].try_into().unwrap());
+    let mixed = (lo ^ hi.rotate_left(27)).wrapping_mul(0x9e3779b97f4a7c15);
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
@@ -114,7 +156,7 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
         if tag == 0 {
             match slot.tag.compare_exchange(0, 1, Relaxed, Acquire) {
                 Ok(_) => {
-                    unsafe { slot.name.get().write(*bytes); }
+                    unsafe { slot.packed.get().write(packed); (*table.names[at].get()).write(*bytes); }
                     slot.tag.store(hash, Release);
                     return INTERNED | FIXED_USER | at as u64;
                 }
@@ -125,7 +167,7 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
             std::hint::spin_loop();
             tag = slot.tag.load(Acquire);
         }
-        if tag == hash && unsafe { *slot.name.get() == *bytes } {
+        if tag == hash && unsafe { *slot.packed.get() == packed } {
             return INTERNED | FIXED_USER | at as u64;
         }
         at = (at + 1) & mask;
@@ -145,8 +187,8 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
 
 fn name(key: u64) -> &'static [u8] {
     if key & FIXED_USER != 0 {
-        let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];
-        return unsafe { &*slot.name.get() };
+        let slot = &USER_SLOTS.get().unwrap().names[(key & !(INTERNED | FIXED_USER)) as usize];
+        return unsafe { (*slot.get()).assume_init_ref() };
     }
     let shard = (key & 255) as usize;
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
