@@ -792,21 +792,23 @@ struct ClickSource {
     worker: usize,
 }
 
-fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp::Ordering {
+fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool, arena:usize) -> std::cmp::Ordering {
     if !local || (a & LONG_EVENT != LONG_EVENT && b & LONG_EVENT != LONG_EVENT) {
         return keys::compare(a, b);
     }
-    fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
+    fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9], arena:usize) -> &'a [u8] {
         if key & LONG_EVENT == LONG_EVENT {
             if key & BORROWED_CLICK != 0 {
-                return unsafe { &*((key & !(LONG_EVENT | BORROWED_CLICK)) as *const [u8;33]) };
+                let offset = (key & NAME_MASK) as usize;
+                let len = ((key & !(LONG_EVENT|BORROWED_CLICK)) >> 35) as usize;
+                return unsafe { std::slice::from_raw_parts((arena+offset) as *const u8,len) };
             }
             &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
         } else {
             keys::bytes(key, scratch)
         }
     }
-    name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
+    name(a,sources,&mut [0;9],arena).cmp(name(b,sources,&mut [0;9],arena))
 }
 
 fn parse_clicks(
@@ -830,17 +832,16 @@ fn parse_clicks(
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let id = if n == 33 && shared.defer_long_events {
-            if borrowed && (p as u64) < BORROWED_CLICK {
-                LONG_EVENT | BORROWED_CLICK | (p as u64)
-            } else {
-                let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-                out.names.push(*p.cast::<[u8; 33]>());
-                LONG_EVENT | (out.worker as u64) << 32 | index as u64
-            }
-        } else {
-            keys::pack(p, n)
-        };
+        if n == 0 { return; }
+        let id = if borrowed && shared.defer_long_events && n < (1 << 26) {
+            // No decoding is necessary until two clicks at the very same
+            // timestamp need a byte-wise tie comparison.
+            LONG_EVENT | BORROWED_CLICK | ((n as u64) << 35) | (p as usize - shared.arena.0) as u64
+        } else if n == 33 && shared.defer_long_events {
+            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
+            out.names.push(*p.cast::<[u8;33]>());
+            LONG_EVENT | (out.worker as u64) << 32 | index as u64
+        } else { keys::pack(p,n) };
         let (name, n) = field(1);
         let deferred = n == 33 && shared.defer_long_events;
         let hash = if deferred { keys::prepare_long_user(name) } else { 0 };
@@ -1512,7 +1513,7 @@ fn session_worker(
             }
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id,b.id,clicks,shared.defer_long_events,shared.arena.0)));
             }
             sessions.person(person, mine, reached)?;
             from = to;
