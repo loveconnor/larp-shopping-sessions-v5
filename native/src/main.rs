@@ -1076,9 +1076,8 @@ struct Sessions<'a> {
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
-    /// Clicks of each campaign inside the current 7-day reach.
-    reach: Vec<u32>,
-    place: Vec<u32>,
+    /// Most recent eligible click timestamp per campaign, or NONE.
+    latest_touch: Vec<u32>,
     active: Vec<u32>,
     sums: [u64; 256],
     touched: Vec<u8>,
@@ -1124,8 +1123,7 @@ impl Sessions<'_> {
     }
 
     #[inline(always)]
-    fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
-        let (mut low, mut high) = cursor;
+    fn credit(&mut self, clicks: &[Touch], mut high: usize, start: u64, day: u32, revenue: u64, purchased: bool) -> usize {
         let days = self.shared.days;
         let mut credited = 0usize;
         if !clicks.is_empty() {
@@ -1134,43 +1132,36 @@ impl Sessions<'_> {
             let limit = start + WEEK as u64;
             while high < clicks.len() && clicks[high].ts as u64 <= limit {
                 let campaign = clicks[high].campaign as usize;
-                if self.reach[campaign] == 0 {
-                    self.place[campaign] = self.active.len() as u32;
+                if self.latest_touch[campaign] == NONE {
                     self.active.push(campaign as u32);
                 }
-                self.reach[campaign] += 1;
+                self.latest_touch[campaign] = clicks[high].ts;
                 high += 1;
             }
-            while low < high && (clicks[low].ts as u64) < start {
-                let campaign = clicks[low].campaign as usize;
-                self.reach[campaign] -= 1;
-                if self.reach[campaign] == 0 {
-                    let hole = self.place[campaign] as usize;
-                    let moved = self.active.pop().unwrap();
-                    if hole < self.active.len() {
-                        self.active[hole] = moved;
-                        self.place[moved as usize] = hole as u32;
-                    }
-                }
-                low += 1;
-            }
-            if high > low {
+            if high > 0 && u64::from(clicks[high - 1].ts) >= start {
                 let latest = clicks[high - 1].ts;
                 let mut pick = high - 1;
-                while pick > low && clicks[pick - 1].ts == latest {
+                while pick > 0 && clicks[pick - 1].ts == latest {
                     pick -= 1;
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
-            }
+            self.active.retain(|&campaign| {
+                let campaign = campaign as usize;
+                if u64::from(self.latest_touch[campaign]) < start {
+                    self.latest_touch[campaign] = NONE;
+                    false
+                } else {
+                    self.totals[campaign * days + day as usize][3] += 1;
+                    true
+                }
+            });
         }
         let totals = &mut self.totals[credited * days + day as usize];
         totals[0] += 1;
         totals[1] += i64::from(purchased);
         totals[2] += revenue as i64;
-        (low, high)
+        high
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
@@ -1190,7 +1181,7 @@ impl Sessions<'_> {
                 bin.category_bits[category / 64] |= 1 << (category % 64);
             }
         }
-        let mut cursor = (0, 0);
+        let mut cursor = 0;
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
         let (mut start, mut last, mut revenue) = (0u32, 0u32, 0u64);
@@ -1232,14 +1223,14 @@ impl Sessions<'_> {
         }
         self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
-        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        for campaign in self.active.drain(..) { self.latest_touch[campaign as usize] = NONE; }
         Ok(())
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
-        let (mut low, mut high) = (0usize, 0usize);
+        let mut high = 0;
         let mut at = 0;
         let mut current = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
@@ -1280,13 +1271,13 @@ impl Sessions<'_> {
             day_events += (at - first) as u32;
             day_revenue += revenue;
 
-            (low, high) = self.credit(clicks, (low, high), start, day, revenue, purchased);
+            high = self.credit(clicks, high, start, day, revenue, purchased);
         }
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
         }
         for campaign in self.active.drain(..) {
-            self.reach[campaign as usize] = 0;
+            self.latest_touch[campaign as usize] = NONE;
         }
         Ok(())
     }
@@ -1379,8 +1370,7 @@ fn session_worker(
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
-        reach: vec![0; campaigns],
-        place: vec![0; campaigns],
+        latest_touch: vec![NONE; campaigns],
         active: Vec::new(),
         sums: [0; 256],
         touched: Vec::new(),
