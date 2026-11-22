@@ -1755,9 +1755,11 @@ fn main() -> io::Result<()> {
     let setup = began.elapsed();
 
     let shards = &LinkShards::default();
+    // One reader may be constructing the alias graph while its peers parse.
+    let parser_threads = if large { (threads + 1).min(MAX_THREADS) } else { threads };
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
+        let handles: Vec<_> = (0..parser_threads)
+            .map(|thread| scope.spawn(move || parse_worker(shared, thread, parser_threads, shards)))
             .collect();
         handles
             .into_iter()
@@ -1883,9 +1885,11 @@ fn main() -> io::Result<()> {
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
-                parsed_events[thread].buckets.release();
+                for i in (thread..parsed_events.len()).step_by(threads) {
+                    parsed_events[i].buckets.release();
+                    clicks[i].buckets.release();
+                }
                 events[thread].release();
-                clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
