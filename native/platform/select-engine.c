@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     if (n < 0 || n >= (ssize_t)sizeof(path) - 6) return 1;
     const char *engine = ".base";
     if (__builtin_cpu_supports("x86-64-v4")) {
-        engine = (__builtin_cpu_is("amd") && __builtin_cpu_supports("avx512vbmi2")) ? ".wide" : ".v4";
+        engine = (__builtin_cpu_supports("avx512vbmi2")) ? ".wide" : ".v4";
     } else if (__builtin_cpu_supports("x86-64-v3")) {
         engine = ".v3";
     }
