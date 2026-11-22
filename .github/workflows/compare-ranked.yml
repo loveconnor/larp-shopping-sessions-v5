@@ -32,6 +32,8 @@ jobs:
           cd "$RUNNER_TEMP/profile-src"
           sed -i '/^WORKDIR \/src/a ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none' Dockerfile
           sed -i 's/install -y --no-install-recommends libjemalloc2/install -y --no-install-recommends libjemalloc2 google-perftools binutils/' Dockerfile
+          sed -i '1i#include <stdio.h>' native/platform/select-engine.c
+          sed -i 's/execv(path, argv);/puts(path); return 0;/' native/platform/select-engine.c
           docker build -q -t sampled .
       - name: Generate fresh data
         run: |
@@ -50,11 +52,12 @@ jobs:
           chmod 777 sampled-out profile
           docker run --rm -v "$RUNNER_TEMP/data:/data:ro" -v "$RUNNER_TEMP/profile:/profile" \
             -v "$RUNNER_TEMP/sampled-out:/output" -e NCPU=8 sampled sh -ec '
+              binary=$(/app/shopping-sessions)
+              test -x "$binary"
               for trial in 1 2 3; do
-                CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 /app/shopping-sessions
+                CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 "$binary"
               done
               ls -lh /profile
-              binary=$(strings /profile/cpu-1* | sed -n "s|.* \(/app/shopping-sessions\.[^ ]*\)$|\1|p" | head -1)
               test -x "$binary"
               echo "Sampled engine $binary"
               google-pprof --text --lines "$binary" /profile/cpu-* > /profile/lines.txt
