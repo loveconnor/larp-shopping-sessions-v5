@@ -946,52 +946,64 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         table.resize(capacity, NONE);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
-                for offset in 0..count {
-                    let record = base.add(offset);
-                    let id = (*record).id;
-                    let entry = ((index << OFFSET_BITS) | offset) as u32;
-                    let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
-                    loop {
-                        let seen = *table.get_unchecked(slot);
-                        if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
-                            break;
-                        }
-                        let other = chunks
-                            .get_unchecked((seen >> OFFSET_BITS) as usize)
-                            .0
-                            .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
-                        let other_id = (*other).id;
-                        let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
-                        } else {
-                            id == other_id
-                        };
-                        if equal {
-                            let a = (*record).ingest;
-                            let b = (*other).ingest;
-                            let earlier = if (a | b) < OVERFLOW_TIME {
-                                a < b
-                            } else {
-                                let origin = shared.window_start - DAY;
-                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
-                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
-                            };
-                            if earlier {
-                                (*other).ts = DEAD;
+                const LANES: usize = 16;
+                for first in (0..count).step_by(LANES) {
+                    let lanes = (count - first).min(LANES);
+                    let mut homes = [0usize; LANES];
+                    for (lane, home) in homes[..lanes].iter_mut().enumerate() {
+                        let id = (*base.add(first + lane)).id;
+                        let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
+                        let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
+                        *home = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                        prefetch(table.get_unchecked(*home));
+                    }
+                    for (lane, &home) in homes[..lanes].iter().enumerate() {
+                        let offset = first + lane;
+                        let record = base.add(offset);
+                        let id = (*record).id;
+                        let entry = ((index << OFFSET_BITS) | offset) as u32;
+                        let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
+                        let mut slot = home;
+                        loop {
+                            let seen = *table.get_unchecked(slot);
+                            if seen == NONE {
                                 *table.get_unchecked_mut(slot) = entry;
-                            } else {
-                                (*record).ts = DEAD;
+                                break;
                             }
-                            break;
+                            let other = chunks
+                                .get_unchecked((seen >> OFFSET_BITS) as usize)
+                                .0
+                                .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
+                            let other_id = (*other).id;
+                            let equal = if long {
+                                // Equal fingerprints select candidates. Only the full bytes
+                                // decide whether these two records are duplicates.
+                                id >> 32 == other_id >> 32
+                                    && sources[owners[index]].names[id as u32 as usize]
+                                        == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                            } else {
+                                id == other_id
+                            };
+                            if equal {
+                                let a = (*record).ingest;
+                                let b = (*other).ingest;
+                                let earlier = if (a | b) < OVERFLOW_TIME {
+                                    a < b
+                                } else {
+                                    let origin = shared.window_start - DAY;
+                                    decode_ingest(a, origin, &sources[owners[index]].overflow_times)
+                                        < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                };
+                                if earlier {
+                                    (*other).ts = DEAD;
+                                    *table.get_unchecked_mut(slot) = entry;
+                                } else {
+                                    (*record).ts = DEAD;
+                                }
+                                break;
+                            }
+                            slot = (slot + 1) & mask;
                         }
-                        slot = (slot + 1) & mask;
                     }
                 }
             }
