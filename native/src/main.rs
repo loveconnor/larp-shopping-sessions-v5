@@ -32,7 +32,7 @@ const SESSION_GAP: u64 = 1_800_000;
 /// Bytes of CSV a thread takes at a time.
 const BLOCK: u64 = 1 << 19;
 /// Bytes of a links file read at a time.
-const LINK_BLOCK: u64 = 1 << 19;
+const LINK_BLOCK: u64 = 1 << 21;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
@@ -618,7 +618,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
                 let a = user(left,nl,false);
                 let b = user(right,nr,true);
                 pairs.push((a,b));
-                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
+                if queued.len() >= 16 { drain(&mut queued, &mut pairs); }
             });
             drain(&mut queued, &mut pairs);
             start = end;
