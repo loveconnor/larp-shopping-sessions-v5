@@ -1292,9 +1292,9 @@ impl Sessions<'_> {
     }
 }
 
-#[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
-unsafe fn sort_short_times(values: &mut [u64]) {
+unsafe fn sorted_registers(values: &[u64]) -> [std::arch::x86_64::__m512i; 4] {
     use std::arch::x86_64::*;
     #[inline(always)]
     unsafe fn step<const SELECT: u8>(v: __m512i, order: __m512i) -> __m512i {
@@ -1311,24 +1311,36 @@ unsafe fn sort_short_times(values: &mut [u64]) {
         let br = _mm512_permutexvar_epi64(reverse,b);
         (finish(_mm512_min_epu64(a,br)), finish(_mm512_max_epu64(a,br)))
     };
-    let n = values.len();
-    let mask = |i:usize| (0xffu16 >> (8-n.saturating_sub(i).min(8))) as u8;
-    let p = values.as_mut_ptr();
-    let read = |i:usize| sort(_mm512_mask_loadu_epi64(_mm512_set1_epi64(-1),mask(i),p.wrapping_add(i).cast()));
-    let write = |i:usize,v| _mm512_mask_storeu_epi64(p.wrapping_add(i).cast(),mask(i),v);
+    let limit = _mm512_set1_epi64(-1);
+    let read = |i| {
+        let mask = (0xffu16 >> (8 - values.len().saturating_sub(i).min(8))) as u8;
+        sort(_mm512_mask_loadu_epi64(limit, mask, values.as_ptr().wrapping_add(i).cast()))
+    };
     let a = read(0);
-    if values.len() <= 8 { write(0,a); return; }
-    let (a,b) = pair(a,read(8));
-    if values.len() <= 16 { write(0,a); write(8,b); return; }
-    let (c,d) = pair(read(16),read(24));
-    let c = _mm512_permutexvar_epi64(reverse,c);
-    let d = _mm512_permutexvar_epi64(reverse,d);
-    let (al,ah) = (_mm512_min_epu64(a,d),_mm512_max_epu64(a,d));
-    let (bl,bh) = (_mm512_min_epu64(b,c),_mm512_max_epu64(b,c));
-    write(0,finish(_mm512_min_epu64(al,bl)));
-    write(8,finish(_mm512_max_epu64(al,bl)));
-    write(16,finish(_mm512_min_epu64(ah,bh)));
-    write(24,finish(_mm512_max_epu64(ah,bh)));
+    if values.len() <= 8 { return [a, limit, limit, limit]; }
+    let (a, b) = pair(a, read(8));
+    if values.len() <= 16 { return [a, b, limit, limit]; }
+    let (c, d) = pair(read(16), read(24));
+    let c = _mm512_permutexvar_epi64(reverse, c);
+    let d = _mm512_permutexvar_epi64(reverse, d);
+    let (al, ah) = (_mm512_min_epu64(a,d), _mm512_max_epu64(a,d));
+    let (bl, bh) = (_mm512_min_epu64(b,c), _mm512_max_epu64(b,c));
+    [finish(_mm512_min_epu64(al,bl)), finish(_mm512_max_epu64(al,bl)),
+     finish(_mm512_min_epu64(ah,bh)), finish(_mm512_max_epu64(ah,bh))]
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn sort_short_times(values: &mut [u64]) {
+    use std::arch::x86_64::*;
+    let n = values.len();
+    let vectors = unsafe { sorted_registers(values) };
+    let ptr = values.as_mut_ptr();
+    for (i, &v) in vectors[..n.div_ceil(8)].iter().enumerate() {
+        let offset = i * 8;
+        let mask = (0xffu16 >> (8 - (n - offset).min(8))) as u8;
+        unsafe { _mm512_mask_storeu_epi64(ptr.add(offset).cast(), mask, v); }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
@@ -1338,19 +1350,15 @@ unsafe fn merge_short_histories(values: &mut [u64]) {
     debug_assert!((33..=64).contains(&values.len()));
     let (left, right) = values.split_at_mut(32);
     unsafe {
-        sort_short_times(left);
-        sort_short_times(right);
+        let a = sorted_registers(left);
+        let b = sorted_registers(right);
         let reverse = _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0);
         let split = |a, b| (_mm512_min_epu64(a, b), _mm512_max_epu64(a, b));
         let lanes = |offset| (0xffu16 >> (8 - right.len().saturating_sub(offset).min(8))) as u8;
         let mut low = [_mm512_setzero_si512(); 4];
         let mut high = low;
         for i in 0..4 {
-            let a = _mm512_loadu_si512(left.as_ptr().add(8 * i).cast());
-            let offset = 8 * (3 - i);
-            let b = _mm512_mask_loadu_epi64(_mm512_set1_epi64(-1), lanes(offset),
-                right.as_ptr().wrapping_add(offset).cast());
-            (low[i], high[i]) = split(a, _mm512_permutexvar_epi64(reverse, b));
+            (low[i], high[i]) = split(a[i], _mm512_permutexvar_epi64(reverse, b[3 - i]));
         }
         // Each half is bitonic. The first two stages compare registers
         // sixteen and eight positions apart, then each vector merges locally.
