@@ -1397,8 +1397,8 @@ unsafe fn sort_up_to_64(values: &mut [u64]) {
 }
 
 #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
-fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
-    use std::arch::x86_64::*;
+fn sort_initial_run(values: &mut [u64]) {
+    debug_assert!(values.len() <= 128);
     let n=values.len();
     if n<=32 {
         if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
@@ -1416,11 +1416,12 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
         }
         return;
     }
-    let middle = n.next_power_of_two() / 2;
-    let (left, right) = values.split_at_mut(middle);
-    let (left_scratch, right_scratch) = tmp.split_at_mut(middle);
-    sort_medium_times(left, left_scratch);
-    sort_medium_times(right, right_scratch);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn merge_clock_runs(left: &[u64], right: &[u64], tmp: &mut [u64]) {
+    use std::arch::x86_64::*;
+    let n = left.len() + right.len();
     // Both input runs are sorted. Merge eight values at a time while carrying
     // the larger eight lanes forward, and write the last partial block exactly.
     unsafe {
@@ -1456,7 +1457,35 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
         let mask = (0xffu16 >> (8 - (n - written))) as u8;
         _mm512_mask_storeu_epi64(tmp.as_mut_ptr().add(written).cast(), mask, carry);
     }
-    values.copy_from_slice(&tmp[..n]);
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
+    const RUN: usize = 128;
+    let n = values.len();
+    if n <= RUN { sort_initial_run(values); return; }
+    for run in values.chunks_mut(RUN) { sort_initial_run(run); }
+    let scratch = &mut tmp[..n];
+    let mut width = RUN;
+    let mut in_scratch = false;
+    while width < n {
+        let (source, target) = if in_scratch {
+            (&scratch[..], &mut values[..])
+        } else {
+            (&values[..], &mut scratch[..])
+        };
+        for (block, destination) in source.chunks(2*width).zip(target.chunks_mut(2*width)) {
+            if block.len() <= width {
+                destination.copy_from_slice(block);
+            } else {
+                let (left, right) = block.split_at(width);
+                merge_clock_runs(left, right, destination);
+            }
+        }
+        in_scratch = !in_scratch;
+        width *= 2;
+    }
+    if in_scratch { values.copy_from_slice(scratch); }
 }
 
 #[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
