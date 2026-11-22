@@ -1365,6 +1365,32 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+const EVENTS_PER_BLOCK: usize = 8;
+
+#[derive(Default, Clone, Copy)]
+struct PersonRun {
+    head: usize,
+    len: usize,
+}
+
+impl PersonRun {
+    fn values<'a>(self, blocks: &'a mut [[u64; EVENTS_PER_BLOCK]], older: &[usize], scratch: &'a mut Vec<u64>) -> &'a mut [u64] {
+        if self.len <= EVENTS_PER_BLOCK {
+            return &mut blocks[self.head][..self.len];
+        }
+        scratch.clear();
+        scratch.reserve(self.len);
+        let (mut left, mut head) = (self.len, self.head);
+        while left != 0 {
+            let used = (left-1)%EVENTS_PER_BLOCK+1;
+            scratch.extend_from_slice(&blocks[head][..used]);
+            left -= used;
+            head = older[head];
+        }
+        scratch.as_mut_slice()
+    }
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1390,9 +1416,10 @@ fn session_worker(
     let mut table_keys: Vec<u64> = Vec::new();
     let mut table_ids: Vec<u32> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
-    let mut ends: Vec<u32> = Vec::new();
-    let mut local: Vec<u32> = Vec::new();
-    let mut values: Vec<u64> = Vec::new();
+    let mut runs: Vec<PersonRun> = Vec::new();
+    let mut blocks: Vec<[u64; EVENTS_PER_BLOCK]> = Vec::new();
+    let mut older: Vec<usize> = Vec::new();
+    let mut history: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
@@ -1418,8 +1445,9 @@ fn session_worker(
         table_ids.clear();
         table_ids.resize(capacity, 0);
         persons.clear();
-        ends.clear();
-        local.clear();
+        runs.clear();
+        blocks.clear();
+        older.clear();
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
@@ -1435,13 +1463,22 @@ fn session_worker(
                             *table_keys.get_unchecked_mut(slot) = person;
                             *table_ids.get_unchecked_mut(slot) = id;
                             persons.push(person);
-                            ends.push(0);
+                            runs.push(PersonRun::default());
                             break id;
                         }
                         slot = (slot + 1) & mask;
                     };
-                    *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
+                    // Small histories stay in one block. Longer histories
+                    // allocate another block without copying earlier events.
+                    let run = runs.get_unchecked_mut(id as usize);
+                    let lane = run.len % EVENTS_PER_BLOCK;
+                    if lane == 0 {
+                        older.push(run.head);
+                        run.head = blocks.len();
+                        blocks.push([0; EVENTS_PER_BLOCK]);
+                    }
+                    blocks.get_unchecked_mut(run.head)[lane] = (*base.add(offset)).value;
+                    run.len += 1;
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
                         mask = capacity - 1;
@@ -1458,26 +1495,6 @@ fn session_worker(
                             table_ids[slot] = id as u32;
                         }
                     }
-                }
-            }
-            // `ends` holds counts; make it each person's first slot, then fill,
-            // which leaves it at each person's end.
-            let mut sum = 0u32;
-            for end in ends.iter_mut() {
-                let count = *end;
-                *end = sum;
-                sum += count;
-            }
-            if values.len() < total {
-                values.resize(total, 0);
-            }
-            let mut index = 0;
-            for &(base, count) in &event_chunks {
-                for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
-                    *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
-                    *end += 1;
-                    index += 1;
                 }
             }
         }
@@ -1548,11 +1565,10 @@ fn session_worker(
             }
         }
 
-        let (mut from, mut click_from) = (0usize, 0usize);
+        let mut click_from = 0;
         for (id, &person) in persons.iter().enumerate() {
-            let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
-            let mine = &mut values[from..to];
+            let mine = runs[id].values(&mut blocks, &older, &mut history);
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
@@ -1572,7 +1588,6 @@ fn session_worker(
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
             }
-            from = to;
             click_from = click_to;
         }
     }
