@@ -1,7 +1,7 @@
 name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/v3-time-lanes]
+    branches: [bench/v3-quantized-lanes]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 319993, engine: v3}
-          - {events: 60000000, format: current, seed: 319993, engine: v3}
-          - {events: 20000000, format: current, seed: 854033, engine: v3}
-          - {events: 60000000, format: current, seed: 854033, engine: v3}
+          - {events: 20000000, format: current, seed: 720367, engine: v3}
+          - {events: 60000000, format: current, seed: 720367, engine: v3}
+          - {events: 20000000, format: current, seed: 243673, engine: v3}
+          - {events: 60000000, format: current, seed: 243673, engine: v3}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 7dc89590be73fd32ef6b7ac1ca748f4f8d6259de
+      CANDIDATE: 109cef244de4bc5152cf8fb9821670278416b73a
     steps:
       - uses: actions/checkout@v4
         with:
