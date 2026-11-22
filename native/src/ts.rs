@@ -34,6 +34,7 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// The epoch day of each `YYYY-MM-DD` seen, by its day of month: a dataset
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
+    epoch_prefixes: [(u64, i64); 256],
     month: [u64; 100],
     midnight: [i64; 100],
 }
@@ -41,6 +42,7 @@ pub struct Dates {
 impl Dates {
     pub fn new() -> Self {
         Self {
+            epoch_prefixes: [(u64::MAX, 0); 256],
             month: [0; 100],
             midnight: [0; 100],
         }
@@ -251,12 +253,17 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             return BAD;
         }
         if len == 13 {
-            let high = load64(p) ^ 0x3030_3030_3030_3030;
             let low = load64(p.add(5)) ^ 0x3030_3030_3030_3030;
-            if not_digits(high) | not_digits(low) == 0 {
-                return (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64;
+            if not_digits(low) != 0 { return BAD; }
+            let prefix = load64(p) & 0xff_ffff_ffff;
+            let slot = (((prefix >> 20) & 0xf0) | ((prefix >> 32) & 15)) as usize;
+            let entry = &mut dates.epoch_prefixes[slot];
+            if entry.0 != prefix {
+                let high = (prefix ^ 0x30_3030_3030) << 24;
+                if not_digits(high) != 0 { return BAD; }
+                *entry = (prefix, (eight_digits(high) * 100_000_000) as i64);
             }
-            return BAD;
+            return entry.1 + eight_digits(low) as i64;
         }
         if len == 25 {
             let sign = *p.add(19);
