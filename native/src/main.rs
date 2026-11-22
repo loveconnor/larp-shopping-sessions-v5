@@ -120,6 +120,24 @@ impl<T: Copy> Buckets<T> {
         }
     }
 
+    /// Append one partition run, splitting only at physical chunk boundaries.
+    fn extend(&mut self, part: usize, mut rows: &[T]) {
+        let mut at = self.next[part];
+        while !rows.is_empty() {
+            if at.addr() & (CHUNK_BYTES - 1) == Self::FILL {
+                at = self.grow(part);
+            }
+            let bytes = Self::FILL - (at.addr() & (CHUNK_BYTES - 1));
+            let n = rows.len().min(bytes / size_of::<T>());
+            unsafe {
+                std::ptr::copy_nonoverlapping(rows.as_ptr(), at, n);
+                at = at.add(n);
+            }
+            rows = &rows[n..];
+        }
+        self.next[part] = at;
+    }
+
     /// Hands over one whole chunk's memory, aligned to `CHUNK_BYTES`.
     fn donate(&mut self, memory: *mut u8) {
         debug_assert!(memory as usize % CHUNK_BYTES == 0);
@@ -922,6 +940,11 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
+    let parts = 1usize << person_bits;
+    let mut counts = vec![0usize; parts];
+    let mut ends = vec![0usize; parts];
+    let mut input = Vec::new();
+    let mut grouped = Vec::new();
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
@@ -995,6 +1018,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
+            input.clear();
+            counts.fill(0);
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
@@ -1006,12 +1031,29 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    counts[person_part(person, person_bits)] += 1;
+                    input.push(Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
+            }
+            let mut cursor = 0;
+            for (end, &count) in ends.iter_mut().zip(&counts) {
+                *end = cursor;
+                cursor += count;
+            }
+            grouped.resize(input.len(), Event { person: 0, value: 0 });
+            for &event in &input {
+                let end = &mut ends[person_part(event.person, person_bits)];
+                grouped[*end] = event;
+                *end += 1;
+            }
+            let mut start = 0;
+            for (part, &end) in ends.iter().enumerate() {
+                if start != end { out.extend(part, &grouped[start..end]); }
+                start = end;
             }
         }
     }
