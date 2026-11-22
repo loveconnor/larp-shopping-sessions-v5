@@ -1605,7 +1605,7 @@ fn main() -> io::Result<()> {
     let large = total >= 4u64 << 30;
     let map_by_default = total >= 1 << 30;
     let block = tune("SS_BLOCK", if map_by_default { 1 << 21 } else { BLOCK }).max(4096);
-    let map = tune("SS_MAP", u64::from(map_by_default || !cfg!(target_os = "linux"))) != 0;
+    let map = tune("SS_MAP", 1) != 0;
     // Release mapped working sets in parallel so exit does not reclaim
     // every input page on one thread.
     let release_pages = large || (cfg!(target_os = "linux") && map_by_default && map);

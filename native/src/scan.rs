@@ -33,6 +33,7 @@ pub struct Source {
     file: File,
     pub size: u64,
     map: *const u8,
+    guarded_tail: bool,
 }
 
 unsafe impl Send for Source {}
@@ -49,7 +50,7 @@ impl Source {
         if size > 0 {
             unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, 2) };
         }
-        let mut source = Self { file, size, map: std::ptr::null() };
+        let mut source = Self { file, size, map: std::ptr::null(), guarded_tail: false };
         if map {
             source.map_input();
         }
@@ -59,9 +60,33 @@ impl Source {
     pub fn map_input(&mut self) {
         use std::os::fd::AsRawFd;
         if self.size != 0 && self.map.is_null() {
-            let address = unsafe { mmap(std::ptr::null_mut(), self.size as usize, 1, 2, self.file.as_raw_fd(), 0) };
-            if address as usize != usize::MAX {
-                self.map = address.cast();
+            // Reserve our own virtual range and replace only its file prefix.
+            // The anonymous tail keeps SIMD overreads valid even at a page boundary.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                unsafe extern "C" {
+                    fn getpagesize() -> i32;
+                    fn munmap(address: *mut std::ffi::c_void, length: usize) -> i32;
+                }
+                let page = getpagesize() as usize;
+                let rounded = (self.size as usize).div_ceil(page) * page;
+                let length = rounded + page;
+                let region = mmap(std::ptr::null_mut(),length,1,2 | 0x20,-1,0);
+                if region as usize != usize::MAX {
+                    let file_map = mmap(region,self.size as usize,1,2 | 0x10,self.file.as_raw_fd(),0);
+                    if file_map == region {
+                        self.map = region.cast();
+                        self.guarded_tail = true;
+                    } else {
+                        munmap(region,length);
+                    }
+                }
+            }
+            if self.map.is_null() {
+                let address = unsafe { mmap(std::ptr::null_mut(), self.size as usize, 1, 2, self.file.as_raw_fd(), 0) };
+                if address as usize != usize::MAX {
+                    self.map = address as *const u8;
+                }
             }
         }
     }
@@ -375,6 +400,21 @@ impl Block {
             let tail = unsafe { std::slice::from_raw_parts(self.base.add(own), SLACK - 4 * PAD) };
             if let Some(at) = tail.iter().position(|&byte| byte == b'\n') {
                 self.end = own + at + 1;
+                return Ok(());
+            }
+        }
+        if source.guarded_tail && end + SLACK as u64 > source.size {
+            let base = unsafe { source.map.add(start as usize) };
+            let remaining = (source.size - end) as usize;
+            let tail = unsafe { std::slice::from_raw_parts(base.add(own), remaining) };
+            let length = tail.iter().position(|&b| b == b'\n').map(|i| own + i + 1)
+                .or_else(|| {
+                    let len = own + remaining;
+                    (len > 0 && unsafe { *base.add(len - 1) } == b'\n').then_some(len)
+                });
+            if let Some(length) = length {
+                self.base = base;
+                self.end = length;
                 return Ok(());
             }
         }
