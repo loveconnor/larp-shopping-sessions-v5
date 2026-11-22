@@ -1292,6 +1292,34 @@ impl Sessions<'_> {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+#[inline(always)]
+unsafe fn sort_five_to_eight(values: &mut [u64]) {
+    use std::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn step<const PERM: i32>(v: __m256i, take_max: __m256i) -> __m256i {
+        let other = _mm256_permute4x64_epi64::<PERM>(v);
+        let select = _mm256_xor_si256(_mm256_cmpgt_epi64(v, other), take_max);
+        _mm256_blendv_epi8(v, other, select)
+    }
+    let odd = _mm256_setr_epi64x(0, -1, 0, -1);
+    let upper = _mm256_setr_epi64x(0, 0, -1, -1);
+    let middle = _mm256_setr_epi64x(0, 0, -1, 0);
+    let sort_four = |v| step::<0xd8>(step::<0x4e>(step::<0xb1>(v, odd), upper), middle);
+    let merge_four = |v| step::<0xb1>(step::<0x4e>(v, upper), odd);
+    let sign = _mm256_set1_epi64x(i64::MIN);
+    let p = values.as_mut_ptr().cast::<i64>();
+    let valid = _mm256_cmpgt_epi64(_mm256_set1_epi64x(values.len() as i64), _mm256_setr_epi64x(4, 5, 6, 7));
+    let a = sort_four(_mm256_xor_si256(_mm256_loadu_si256(p.cast()), sign));
+    let tail = _mm256_xor_si256(_mm256_maskload_epi64(p.add(4), valid), sign);
+    let b = _mm256_permute4x64_epi64::<0x1b>(sort_four(_mm256_blendv_epi8(_mm256_set1_epi64x(i64::MAX), tail, valid)));
+    let swap = _mm256_cmpgt_epi64(a, b);
+    let lo = merge_four(_mm256_blendv_epi8(a, b, swap));
+    let hi = merge_four(_mm256_blendv_epi8(b, a, swap));
+    _mm256_storeu_si256(p.cast(), _mm256_xor_si256(lo, sign));
+    _mm256_maskstore_epi64(p.add(4), valid, _mm256_xor_si256(hi, sign));
+}
+
 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
 #[inline(always)]
 unsafe fn sort_short_times(values: &mut [u64]) {
@@ -1565,7 +1593,11 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch="x86_64", target_feature="avx2", not(target_feature="avx512f")))]
+                if (5..=8).contains(&mine.len()) {
+                    unsafe { sort_five_to_eight(mine); }
+                } else { mine.sort_unstable(); }
+                #[cfg(not(all(target_arch="x86_64", target_feature="avx2")))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
