@@ -17,10 +17,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the exact 128-value sorting image
+      - name: Build the exact streaming-merge release image
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in sorter:7e8f59da6626659f317f8ae7878a3b201dbd61f0; do
+          for item in sorter:bf5e73ec8064377d11ba8fcab23369d983df9efa; do
             label=${item%%:*}
             sha=${item#*:}
             mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
