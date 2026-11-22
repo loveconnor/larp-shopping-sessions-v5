@@ -15,7 +15,7 @@ labels = ("ranked", "candidate", "control")
 medians = {label: [] for label in labels}
 cpus = sorted(os.sched_getaffinity(0))[:8]
 cpuset = ",".join(map(str, cpus))
-print(f"Runner CPUs {cpuset}, 8 program workers, 12 GiB container cap", flush=True)
+print(f"Runner CPUs {cpuset}, {len(cpus)} program workers, 12 GiB container cap", flush=True)
 
 def timestamp(value):
     return datetime.datetime.fromisoformat(value.removesuffix("Z")[:26] + "+00:00")
@@ -24,7 +24,7 @@ def elapsed(label, output, scratch):
     cmd = ["docker", "create", "--cpuset-cpus", cpuset, "--memory", "12g",
            "--memory-swap", "12g", "--network", "none", "--read-only",
            "--user", "1000:1000", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-           "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m", "-e", "NCPU=8", "-e", "MEM_GB=24",
+           "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m", "-e", f"NCPU={len(cpus)}", "-e", "MEM_GB=24",
            "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
            "-e", "HOME=/scratch", "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output",
            "-v", f"{scratch}:/scratch", label]
@@ -37,9 +37,11 @@ def elapsed(label, output, scratch):
     finally:
         subprocess.run(["docker","rm","-f",container], check=True, stdout=subprocess.DEVNULL)
 
-for seed in seeds:
+for index, seed in enumerate(seeds):
+    events = 20_000_000 if index == 0 else 60_000_000
+    print("DATASET", seed, events, flush=True)
     subprocess.run([root/"generator/target/release/generate", "--seed",str(seed),
-                    "--events","60000000","--clicks","15000000","--threads",str(len(cpus)),
+                    "--events",str(events),"--clicks",str(events // 4),"--threads",str(len(cpus)),
                     "--output",root/"data"],check=True)
     samples = {label: [] for label in labels}
     # Each label appears first, second and third three times across nine rounds.
