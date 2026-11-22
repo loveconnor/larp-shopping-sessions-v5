@@ -280,6 +280,34 @@ struct Links {
     empty: bool,
 }
 
+/// Worker-local cache for canonical names, including users with no alias.
+struct PersonCache {
+    slots: Box<[[u64; 2]]>,
+}
+
+impl PersonCache {
+    fn new() -> Self {
+        Self { slots: vec![[0; 2]; 4096].into_boxed_slice() }
+    }
+
+    #[inline(always)]
+    fn slot(key: u64) -> usize { (key.wrapping_mul(MIX) >> 52) as usize }
+
+    #[inline(always)]
+    fn resolve(&mut self, links: &Links, key: u64) -> u64 {
+        let entry = &mut self.slots[Self::slot(key)];
+        if entry[0] != key {
+            *entry = [key, links.person(key)];
+        }
+        entry[1]
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, links: &Links, key: u64) {
+        if self.slots[Self::slot(key)][0] != key { links.prefetch(key); }
+    }
+}
+
 impl Links {
     fn build(pairs: &[(u64, u64)]) -> Self {
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
@@ -703,6 +731,7 @@ fn parse_clicks(
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
+    cache: &mut PersonCache,
 ) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
@@ -745,10 +774,10 @@ fn parse_clicks(
     };
     for at in 0..pending.len() {
         if let Some(ahead) = pending.get(at + shared.ahead) {
-            links.prefetch(ahead.user);
+            cache.prefetch(links, ahead.user);
         }
         let click = pending[at];
-        let person = links.person(click.user);
+        let person = cache.resolve(links, click.user);
         out.buckets.push(
             person_part(person, shared.person_bits),
             Click {
@@ -777,12 +806,13 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
+    let mut cache = PersonCache::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks, &mut cache);
         }
     }
     Ok((events, clicks))
@@ -792,6 +822,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
+    let mut cache = PersonCache::new();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
@@ -863,13 +894,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                        cache.prefetch(links, (*base.add(offset + ahead)).user);
                     }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = cache.resolve(links, record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
