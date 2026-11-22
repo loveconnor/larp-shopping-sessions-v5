@@ -76,29 +76,69 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     (INTERNED | ((i as u64) << 8) | shard as u64, table.entries[i].1)
 }
 
-thread_local! {
-    static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
-        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
+// A worker resolves each distinct 33-byte name with the shared interner
+// once. Fixed-size local entries avoid length checks and a second pointer
+// chase on repeated users. The hash only chooses where to look.
+#[derive(Clone, Copy)]
+struct UserEntry {
+    name: [u8; 33],
+    key: u64,
 }
 
-/// Repeated long user names can be resolved by comparing their full bytes
-/// with a worker-local entry. The shared interner assigns the canonical key.
+#[derive(Default)]
+struct UserDictionary {
+    slots: Vec<u32>,
+    entries: Vec<UserEntry>,
+}
+
+#[inline(always)]
+fn user_hash(name: &[u8; 33]) -> usize {
+    let head = u64::from_le_bytes(name[1..9].try_into().unwrap());
+    let tail = u64::from_le_bytes(name[25..33].try_into().unwrap());
+    ((head ^ tail.rotate_left(23)).wrapping_mul(0x9e3779b97f4a7c15) >> 24) as usize
+}
+
+impl UserDictionary {
+    #[cold]
+    fn grow(&mut self) {
+        let mut slots = vec![0; (self.slots.len() * 2).max(1024)];
+        let mask = slots.len() - 1;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let mut at = user_hash(&entry.name) & mask;
+            while slots[at] != 0 { at = (at + 1) & mask; }
+            slots[at] = (index + 1) as u32;
+        }
+        self.slots = slots;
+    }
+
+    #[inline(always)]
+    fn lookup(&mut self, name: &[u8; 33]) -> u64 {
+        if self.entries.len() * 2 >= self.slots.len() { self.grow(); }
+        let mask = self.slots.len() - 1;
+        let mut at = user_hash(name) & mask;
+        loop {
+            let token = self.slots[at];
+            if token == 0 {
+                let key = intern(name);
+                self.entries.push(UserEntry { key, name: *name });
+                self.slots[at] = u32::try_from(self.entries.len()).expect("too many user names");
+                return key;
+            }
+            let entry = &self.entries[token as usize - 1];
+            if entry.name == *name { return entry.key; }
+            at = (at + 1) & mask;
+        }
+    }
+}
+
+thread_local! {
+    static USERS: std::cell::RefCell<UserDictionary> = std::cell::RefCell::default();
+}
+
 #[inline(always)]
 pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
-    if n != 33 {
-        return unsafe { pack(p, n) };
-    }
-    let value = unsafe { std::slice::from_raw_parts(p, n) };
-    let prefix = u64::from_le_bytes(value[1..9].try_into().unwrap());
-    let slot = (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49) as usize;
-    USERS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let entry = &mut cache[slot];
-        if entry.1 != value {
-            *entry = intern_name(value);
-        }
-        entry.0
-    })
+    if n != 33 { return unsafe { pack(p, n) }; }
+    USERS.with(|users| users.borrow_mut().lookup(unsafe { &*p.cast::<[u8; 33]>() }))
 }
 
 fn name(key: u64) -> &'static [u8] {
