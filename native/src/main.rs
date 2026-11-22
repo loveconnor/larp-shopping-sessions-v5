@@ -795,6 +795,30 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
 }
 
+/// Keep all touches for assist counts. In each timestamp group the last
+/// touch must name the winning campaign, since inclusive windows cover
+/// either the entire group or none of it.
+fn order_click_groups(clicks: &mut [Touch], sources: &[ClickSource], local: bool) {
+    clicks.sort_unstable_by_key(|click| click.ts);
+    let mut start = 0;
+    while start < clicks.len() {
+        let mut end = start + 1;
+        let mut multiple_campaigns = false;
+        while end < clicks.len() && clicks[end].ts == clicks[start].ts {
+            multiple_campaigns |= clicks[end].campaign != clicks[start].campaign;
+            end += 1;
+        }
+        if multiple_campaigns {
+            let mut best = start;
+            for i in start+1..end {
+                if click_order(clicks[i].id, clicks[best].id, sources, local) == Order::Less { best = i; }
+            }
+            clicks.swap(best,end-1);
+        }
+        start = end;
+    }
+}
+
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
@@ -1155,12 +1179,7 @@ impl Sessions<'_> {
                 low += 1;
             }
             if high > low {
-                let latest = clicks[high - 1].ts;
-                let mut pick = high - 1;
-                while pick > low && clicks[pick - 1].ts == latest {
-                    pick -= 1;
-                }
-                credited = clicks[pick].campaign as usize;
+                credited = clicks[high - 1].campaign as usize;
             }
             for &campaign in &self.active {
                 self.totals[campaign as usize * days + day as usize][3] += 1;
@@ -1555,7 +1574,7 @@ fn session_worker(
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+                order_click_groups(reached, clicks, shared.defer_long_events);
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
