@@ -8,12 +8,12 @@ jobs:
   profile:
     strategy:
       matrix:
-        seed: [311951, 311957, 311963, 311981]
+        seed: [866173, 314159, 243493, 589441]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a057b4a6243282ef33ea848a5c33157f2a50aa81
+          ref: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
@@ -29,13 +29,13 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
             cp -a /src /tmp/native
             cd /tmp/native
-            apt-get update -qq && apt-get install -yq --no-install-recommends patch
+            apt-get update -qq && apt-get install -yq --no-install-recommends patch libjemalloc2
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
             levels=v3
             if grep -qw avx512bw /proc/cpuinfo; then
-              levels=n4
-              if grep -qw avx512_vbmi2 /proc/cpuinfo; then levels="n4 wide"; fi
+              levels="v3 n4"
+              if grep -qw avx512_vbmi2 /proc/cpuinfo; then levels="v3 n4 wide"; fi
             fi
             for level in $levels; do
               cpu=x86-64-$level
@@ -54,7 +54,7 @@ jobs:
               RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/tmp/profile" cargo build --release --locked $build_features --target x86_64-unknown-linux-gnu
               for rows in 20000000 60000000; do
                 mkdir -p /work/profile/$level-$rows
-                LLVM_PROFILE_FILE="/work/profile/$level-$rows/%m.profraw" NCPU=8 DATA_DIR="/work/train-$rows" OUTPUT_DIR="/work/out-$level-$rows" target/x86_64-unknown-linux-gnu/release/shopping-sessions
+                LD_PRELOAD=libjemalloc.so.2 MALLOC_CONF=narenas:2,background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto LLVM_PROFILE_FILE="/work/profile/$level-$rows/%m.profraw" NCPU=8 DATA_DIR="/work/train-$rows" OUTPUT_DIR="/work/out-$level-$rows" target/x86_64-unknown-linux-gnu/release/shopping-sessions
                 "$merger" merge --sparse /work/profile/$level-$rows/*.profraw -o /work/profile/$level-$rows.profdata
               done
             done
