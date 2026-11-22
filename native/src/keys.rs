@@ -182,21 +182,16 @@ fn name(key: u64) -> &'static [u8] {
 #[inline(always)]
 pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
     unsafe {
-        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
-        const LOW: u64 = 0x7F7F_7F7F_7F7F_7F7F;
-        const HIGH: u64 = 0x8080_8080_8080_8080;
-        if len == 0 {
-            return 0;
-        }
-        if len <= 9 {
-            // The first eight bytes, with those past the end cleared.
-            let x = _bzhi_u64(u64::from_le((p as *const u64).read_unaligned()), len as u32 * 8);
-            // 0x80 in every byte that is 1..=127: wanted in each byte of the ID.
-            let plain = (x & LOW).wrapping_add(LOW) & !x & HIGH;
-            let ninth = if len == 9 { *p.add(8) } else { 1 };
-            if plain == _bzhi_u64(HIGH, len as u32 * 8) && ninth.wrapping_sub(1) < 127 {
-                let ninth = if len == 9 { ninth as u64 } else { 0 };
-                return (_pext_u64(x.swap_bytes(), LOW) << 7) | ninth;
+        use std::arch::x86_64::*;
+        const LOW:u64=0x7f7f_7f7f_7f7f_7f7f;
+        if len==0 {return 0;}
+        if len<=9 {
+            let v=_mm_loadu_si128(p.cast());
+            let plain=_mm_movemask_epi8(_mm_cmpgt_epi8(v,_mm_setzero_si128())) as u32;
+            if (!plain).trailing_zeros() >= len as u32 {
+                let word=_mm_cvtsi128_si64(v) as u64;
+                let packed=(_pext_u64(word.swap_bytes(),LOW)<<7)|u64::from(*p.add(8)&127);
+                return packed & (u64::MAX << ((9-len)*7));
             }
         }
         intern(std::slice::from_raw_parts(p, len))
@@ -241,6 +236,10 @@ pub unsafe fn pack_plain(p: *const u8, len: usize) -> u64 {
 #[inline]
 pub fn unpack(key: u64, out: &mut Vec<u8>) {
     if key & INTERNED == 0 {
+        #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+        {out.extend_from_slice(bytes(key,&mut [0;9]));return;}
+        #[allow(unreachable_code)]
+
         let mut shift = 56i32;
         while shift >= 0 {
             let byte = ((key >> shift) & 0x7F) as u8;
@@ -259,6 +258,15 @@ pub fn bytes(key: u64, packed: &mut [u8; 9]) -> &[u8] {
     if key & INTERNED != 0 {
         return name(key);
     }
+    #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+    unsafe {
+        let eight=std::arch::x86_64::_pdep_u64(key>>7,0x7f7f_7f7f_7f7f_7f7f);
+        packed[..8].copy_from_slice(&eight.to_be_bytes());
+        packed[8]=(key&127) as u8;
+        let n=9-(key.trailing_zeros()/7) as usize;
+        return &packed[..n];
+    }
+    #[allow(unreachable_code)]
     for (i, byte) in packed.iter_mut().enumerate() {
         *byte = ((key >> (56 - i * 7)) & 127) as u8;
     }
