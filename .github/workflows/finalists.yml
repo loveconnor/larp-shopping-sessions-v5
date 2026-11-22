@@ -1,7 +1,7 @@
 name: Rehearse three final datasets with nine interleaved runs per commit on one host
 on:
   push:
-    branches: [bench/family19-128-finals]
+    branches: [bench/amd-v3-scheduling]
 permissions:
   contents: read
 jobs:
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["737641,200133,753138", "525986,710275,206262", "299500,711667,737697", "328821,861948,461809", "935329,852527,205156", "640914,352709,304060"]
+        seed_list: ["889198,444023,950750", "976050,891922,795357", "168468,954727,837544", "516548,715538,805168", "271855,286316,413908", "157340,973625,316190", "743086,104485,146270", "984666,442958,933192"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
-      RANKED: bf5e73ec8064377d11ba8fcab23369d983df9efa
-      CANDIDATE: faf7a64332db78809a950daf53ca0326d906e420
+      RANKED: 567939bcd88a63e39e62c4c803d57d67c0333d00
+      CANDIDATE: 90b1e53133cc2615ba6a7c35a9316319ebb37f67
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
           mkdir "$probe"
           git show "${CANDIDATE}:native/platform/select-engine.c" > "$probe/selector.c"
           cc -Os -static "$probe/selector.c" -o "$probe/selector"
-          for engine in base v3 v4 n4 wide p19; do
+          for engine in base v3 z3 v4 n4 wide istr p19; do
             cat > "$probe/selector.$engine" <<'EOF'
           #!/bin/sh
           echo "${0##*.}"
@@ -39,7 +39,7 @@ jobs:
           echo "Actual selector chose $selected"
           echo "SELECTED=$selected" >> "$GITHUB_ENV"
       - name: Build both release images on compatible hosts
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'z3'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           for label in ranked candidate; do
@@ -55,16 +55,14 @@ jobs:
             docker rm "$cid"
           done
           lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
-          for engine in base v3 v4 n4 wide; do
+          for engine in base v3 v4 n4 wide istr p19; do
             cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/candidate/shopping-sessions.$engine"
           done
           cd "$RUNNER_TEMP/candidate-src/native"
-          patch -p2 < platform/wide.patch
-          patch -p2 < platform/register-merge.patch
-          docker run --rm -v "$PWD:/src" -w /src -e RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+avx512vbmi2" rust:1.90-slim-bookworm cargo test --locked --release merged_histories_match_unsigned_sort
+          docker run --rm -v "$PWD:/src" -w /src -e RUSTFLAGS="-C target-cpu=x86-64-v3 -Ztune-cpu=znver3" -e RUSTC_BOOTSTRAP=1 rust:1.90-slim-bookworm cargo test --locked --release
           docker tag ranked control
       - name: Generate fresh data
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'z3'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
@@ -74,5 +72,5 @@ jobs:
           cargo build --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml"
           python -m pip install --quiet duckdb==1.4.5
       - name: Measure the mean of the three per-dataset medians
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'z3'
         run: python "$GITHUB_WORKSPACE/.github/workflows/final_rehearsal.py"
