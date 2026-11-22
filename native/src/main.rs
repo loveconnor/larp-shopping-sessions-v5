@@ -63,6 +63,7 @@ const OFFSET_BITS: u32 = 9;
 struct Buckets<T: Copy> {
     /// Where each partition's next record goes.
     next: Vec<*mut T>,
+    has_holes: Vec<bool>,
     /// Each partition's newest chunk, and how many chunks it has.
     head: Vec<u32>,
     chunks: Vec<u32>,
@@ -91,6 +92,7 @@ impl<T: Copy> Buckets<T> {
         Self {
             // A position that reads as a full chunk, so the first push grows.
             next: vec![Self::FILL as *mut T; parts],
+            has_holes: vec![false; parts],
             head: vec![NONE; parts],
             chunks: vec![0; parts],
             slabs: Vec::new(),
@@ -102,7 +104,7 @@ impl<T: Copy> Buckets<T> {
     }
 
     #[inline(always)]
-    fn push(&mut self, part: usize, value: T) {
+    fn push(&mut self, part: usize, value: T) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -111,6 +113,7 @@ impl<T: Copy> Buckets<T> {
             }
             at.write(value);
             *slot = at.add(1);
+            at
         }
     }
 
@@ -848,6 +851,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
                     let record = base.add(offset);
+                    if offset + ahead < count {
+                        links.prefetch((*base.add(offset + ahead)).user);
+                    }
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
@@ -875,7 +881,12 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         };
                         if equal {
                             if (*record).ingest < (*other).ingest {
-                                (*other).ts = DEAD;
+                                // Revoke a provisional winner if the earlier copy arrives later.
+                                if (*other).ts != DEAD {
+                                    let emitted = (*other).user as *mut Event;
+                                    out.has_holes[person_part((*emitted).person, person_bits)] = true;
+                                    (*emitted).person = 0;
+                                }
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
                                 (*record).ts = DEAD;
@@ -884,20 +895,14 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         }
                         slot = (slot + 1) & mask;
                     }
-                }
-            }
-            for &(base, count) in &chunks {
-                for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                    if (*record).ts != DEAD {
+                        let person = links.person((*record).user);
+                        let value = (((*record).ts as u64) << 32) | (*record).payload as u64;
+                        let emitted = out.push(person_part(person, person_bits), Event { person, value });
+                        // Chunks never move. After emission only dedup's winning slot can
+                        // access this pointer, and session workers start after the join.
+                        (*record).user = emitted as u64;
                     }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
-                        continue;
-                    }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -1140,7 +1145,21 @@ fn session_worker(
         let part = part as usize;
         event_chunks.clear();
         for source in events {
+            let start = event_chunks.len();
             source.chunks(part, &mut event_chunks);
+            if source.has_holes[part] {
+                for (base, count) in &mut event_chunks[start..] {
+                    let rows = unsafe { std::slice::from_raw_parts_mut(*base, *count) };
+                    let mut live = 0;
+                    for i in 0..rows.len() {
+                        if rows[i].person != 0 {
+                            if i != live { rows[live] = rows[i]; }
+                            live += 1;
+                        }
+                    }
+                    *count = live;
+                }
+            }
         }
         let total: usize = event_chunks.iter().map(|chunk| chunk.1).sum();
         if total == 0 {
