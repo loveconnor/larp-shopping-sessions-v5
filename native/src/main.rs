@@ -917,6 +917,9 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
+    let mut stages = [0u128; 2];
+    let mut max_partition = 0u128;
+    let mut work = 0usize;
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
@@ -926,6 +929,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
+        let begin = Instant::now();
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
             break;
@@ -995,6 +999,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
+            let middle = Instant::now();
+            stages[0] += middle.duration_since(begin).as_nanos();
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
@@ -1013,8 +1019,12 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
             }
+            stages[1] += middle.elapsed().as_nanos();
+            max_partition = max_partition.max(begin.elapsed().as_nanos());
+            work += total;
         }
     }
+    eprintln!("PROFILE_DEDUP {work} {} {} {max_partition}", stages[0], stages[1]);
     out
 }
 
@@ -1373,6 +1383,9 @@ fn session_worker(
     next: &AtomicUsize,
     thread: usize,
 ) -> io::Result<(Vec<Totals>, bool)> {
+    let mut stages = [0u128; 4];
+    let mut maximum = 0u128;
+    let mut seen = 0usize;
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
         shared,
@@ -1400,6 +1413,7 @@ fn session_worker(
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+        let begin = Instant::now();
         let part = part as usize;
         event_chunks.clear();
         for source in events {
@@ -1482,6 +1496,8 @@ fn session_worker(
             }
         }
 
+        let grouped = Instant::now();
+        stages[0] += grouped.duration_since(begin).as_nanos();
         // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
         for source in clicks {
@@ -1548,6 +1564,8 @@ fn session_worker(
             }
         }
 
+        let attributed = Instant::now();
+        stages[1] += attributed.duration_since(grouped).as_nanos();
         let (mut from, mut click_from) = (0usize, 0usize);
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
@@ -1575,11 +1593,17 @@ fn session_worker(
             from = to;
             click_from = click_to;
         }
+        stages[2] += attributed.elapsed().as_nanos();
+        maximum = maximum.max(begin.elapsed().as_nanos());
+        seen += total;
     }
+    let finish = Instant::now();
     let wrote = sessions.writer.is_some();
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
     }
+    stages[3] += finish.elapsed().as_nanos();
+    eprintln!("PROFILE_SESSION {thread} {seen} {} {} {} {} {maximum}", stages[0], stages[1], stages[2], stages[3]);
     Ok((sessions.totals, wrote))
 }
 
