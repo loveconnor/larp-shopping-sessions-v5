@@ -51,6 +51,8 @@ const AHEAD: usize = 16;
 /// position alone says when its chunk is full: the hot state of a partition is
 /// one pointer, and 2048 of them stay in the L1 cache.
 const CHUNK_BYTES: usize = 8192;
+// Rotate consecutive chunk starts through the cache sets.
+const CHUNK_STRIDE: usize = CHUNK_BYTES + 64;
 /// Chunks per slab.
 const SLAB: usize = 1 << 13;
 /// The dedup table packs a record's offset in its chunk into this many bits.
@@ -60,9 +62,15 @@ const OFFSET_BITS: u32 = 9;
 /// big slabs: no copying on growth, and a chunk never moves. A chunk can also
 /// be a stretch of memory someone else is done with, which saves faulting in
 /// fresh pages: on the scoring machines that costs about 75 ms per gigabyte.
+#[derive(Clone, Copy)]
+struct Cursor<T> {
+    next: *mut T,
+    end: *mut T,
+}
+
 struct Buckets<T: Copy> {
     /// Where each partition's next record goes.
-    next: Vec<*mut T>,
+    cursors: Vec<Cursor<T>>,
     /// Each partition's newest chunk, and how many chunks it has.
     head: Vec<u32>,
     chunks: Vec<u32>,
@@ -90,7 +98,7 @@ impl<T: Copy> Buckets<T> {
         let () = Self::FITS;
         Self {
             // A position that reads as a full chunk, so the first push grows.
-            next: vec![Self::FILL as *mut T; parts],
+            cursors: vec![Cursor { next: std::ptr::null_mut(), end: std::ptr::null_mut() }; parts],
             head: vec![NONE; parts],
             chunks: vec![0; parts],
             slabs: Vec::new(),
@@ -104,19 +112,20 @@ impl<T: Copy> Buckets<T> {
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) {
         unsafe {
-            let slot = self.next.as_mut_ptr().add(part);
-            let mut at = *slot;
-            if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
-                at = self.grow(part);
+            let mut cursor = *self.cursors.get_unchecked(part);
+            if cursor.next == cursor.end {
+                cursor.next = self.grow(part);
+                cursor.end = cursor.next.add(Self::CAPACITY);
+                self.cursors.get_unchecked_mut(part).end = cursor.end;
             }
-            at.write(value);
-            *slot = at.add(1);
+            cursor.next.write(value);
+            self.cursors.get_unchecked_mut(part).next = cursor.next.add(1);
         }
     }
 
     /// Hands over one whole chunk's memory, aligned to `CHUNK_BYTES`.
     fn donate(&mut self, memory: *mut u8) {
-        debug_assert!(memory as usize % CHUNK_BYTES == 0);
+        debug_assert!(memory as usize % 64 == 0);
         self.spare.push(memory as *mut T);
     }
 
@@ -127,14 +136,14 @@ impl<T: Copy> Buckets<T> {
             Some(base) => base,
             None => {
                 if self.carved % SLAB == 0 {
-                    let bytes = (SLAB + 1) * CHUNK_BYTES;
+                    let bytes = SLAB * CHUNK_STRIDE + 64;
                     let slab: Vec<u8> = Vec::with_capacity(bytes);
                     huge(slab.as_ptr(), bytes);
                     self.slabs.push(slab);
                 }
                 let slab = self.slabs.last().unwrap().as_ptr() as usize;
-                let first = (slab + CHUNK_BYTES - 1) & !(CHUNK_BYTES - 1);
-                let base = (first + (self.carved % SLAB) * CHUNK_BYTES) as *mut T;
+                let first = (slab + 63) & !63;
+                let base = (first + (self.carved % SLAB) * CHUNK_STRIDE) as *mut T;
                 // Commit only the next 2 MiB of chunks. Click and dedup
                 // workers often use a small fraction of their last slab.
                 const BATCH: usize = (1 << 21) / CHUNK_BYTES;
@@ -157,7 +166,7 @@ impl<T: Copy> Buckets<T> {
     /// kernel would free them page by page on one thread, inside the timed run.
     fn release(&self) {
         for slab in &self.slabs {
-            release(slab.as_ptr(), (SLAB + 1) * CHUNK_BYTES);
+            release(slab.as_ptr(), SLAB * CHUNK_STRIDE + 64);
         }
     }
 
@@ -168,7 +177,7 @@ impl<T: Copy> Buckets<T> {
             return;
         }
         let base = self.bases[chunk as usize];
-        out.push((base, unsafe { self.next[part].offset_from(base) } as usize));
+        out.push((base, unsafe { self.cursors[part].next.offset_from(base) } as usize));
         loop {
             chunk = self.previous[chunk as usize];
             if chunk == NONE {
