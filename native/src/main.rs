@@ -1084,6 +1084,59 @@ struct Sessions<'a> {
     touched: Vec<u8>,
 }
 
+/// Each active campaign occurs once. The eight writes within a vector
+/// therefore always address different counters, including at tied clicks.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline]
+fn credit_vector_assists(active: &[u32], totals: &mut [Totals], days: usize, day: usize) -> usize {
+    use std::arch::x86_64::*;
+    if active.len() < 8 || totals.len() > i32::MAX as usize / 4 {
+        return 0;
+    }
+    let end = active.len() & !7;
+    unsafe {
+        let stride = _mm256_set1_epi32((days * 4) as i32);
+        let base = totals.as_mut_ptr().cast::<i64>().add(day * 4 + 3);
+        for at in (0..end).step_by(8) {
+            let campaign = _mm256_loadu_si256(active.as_ptr().add(at).cast());
+            let offsets = _mm256_mullo_epi32(campaign, stride);
+            let old = _mm512_i32gather_epi64::<8>(offsets, base.cast_const());
+            _mm512_i32scatter_epi64::<8>(base, offsets, _mm512_add_epi64(old, _mm512_set1_epi64(1)));
+        }
+    }
+    end
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
+#[test]
+fn gathered_assists_preserve_other_days_and_counters() {
+    let mut seed = 73519u64;
+    for days in [1, 3, 14, 39] {
+        let mut active: Vec<u32> = (0..257).collect();
+        let mut actual = vec![[19, 23, 29, 31]; 257 * days];
+        let mut expected = actual.clone();
+        for length in (0..=65).chain([127, 128, 129, 255, 256, 257]) {
+            for i in (1..active.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                active.swap(i, seed as usize % (i + 1));
+            }
+            let day = seed as usize % days;
+            let campaigns = &active[..length];
+            let processed = credit_vector_assists(campaigns, &mut actual, days, day);
+            assert_eq!(processed, length & !7);
+            for &campaign in &campaigns[processed..] {
+                actual[campaign as usize * days + day][3] += 1;
+            }
+            for &campaign in campaigns {
+                expected[campaign as usize * days + day][3] += 1;
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
 impl Sessions<'_> {
     fn row(&mut self, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) -> io::Result<()> {
         let shared = self.shared;
@@ -1162,7 +1215,11 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            let start = credit_vector_assists(&self.active, &mut self.totals, days, day as usize);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+            let start = 0;
+            for &campaign in &self.active[start..] {
                 self.totals[campaign as usize * days + day as usize][3] += 1;
             }
         }
