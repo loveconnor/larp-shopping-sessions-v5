@@ -241,6 +241,32 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
     }
 }
 
+/// Enumerate two independent masks before writing their adjacent outputs.
+/// A short first mask can overlap the padded stores for the second, so the
+/// final writes are ordered even though the bit operations are independent.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn flatten_pair(mut a: u64, mut b: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        let (na, nb) = (a.count_ones() as usize, b.count_ones() as usize);
+        if na > 7 || nb > 7 {
+            flatten::<7>(a, base, out);
+            flatten::<7>(b, base + 64, out.add(na));
+        } else {
+            let (mut left, mut right) = ([0u32; 7], [0u32; 7]);
+            for i in 0..7 {
+                left[i] = base + a.trailing_zeros();
+                right[i] = base + 64 + b.trailing_zeros();
+                a &= a.wrapping_sub(1);
+                b &= b.wrapping_sub(1);
+            }
+            std::ptr::copy_nonoverlapping(left.as_ptr(), out, 7);
+            std::ptr::copy_nonoverlapping(right.as_ptr(), out.add(na), 7);
+        }
+        na + nb
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
 unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
@@ -550,6 +576,8 @@ impl Block {
                     seps.set_len(kept);
                     seps.reserve(WINDOW * 64 + 128);
                 }
+                #[cfg(target_arch = "x86_64")]
+                let mut pending = None;
                 let mut count = kept;
                 let mut lines = 0usize;
                 let out = seps.as_mut_ptr();
@@ -593,13 +621,25 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<7>(sep, at, out.add(count)) };
+                    let positions = if WIDE {
+                        wide_positions(sep, at, out.add(count))
+                    } else if let Some(prior) = pending.take() {
+                        flatten_pair(prior, sep, at - 64, out.add(count))
+                    } else {
+                        pending = Some(sep);
+                        0
+                    };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<7>(sep, at, out.add(count));
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
                 }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(last) = pending {
+                    count += flatten::<7>(last, at - 64, out.add(count));
+                }
+
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
                     *out.add(count + extra) = u32::MAX;
