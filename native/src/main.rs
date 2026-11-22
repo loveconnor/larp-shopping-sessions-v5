@@ -642,11 +642,10 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     unsafe {
         use std::arch::x86_64::_mm_crc32_u64;
-        let mut crc = u64::from(bytes[0]);
-        for word in bytes[1..].chunks_exact(8) {
-            crc = _mm_crc32_u64(crc, u64::from_le_bytes(word.try_into().unwrap()));
-        }
-        crc & EVENT_FINGERPRINT
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let first = _mm_crc32_u64(_mm_crc32_u64(u64::from(bytes[0]), word(1)), word(9)) as u32;
+        let second = _mm_crc32_u64(_mm_crc32_u64(0, word(17)), word(25)) as u32;
+        u64::from(first.rotate_left(13) ^ second) & EVENT_FINGERPRINT
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
     {
