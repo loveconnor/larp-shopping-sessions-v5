@@ -1478,8 +1478,11 @@ fn main() -> io::Result<()> {
     let shared = &shared;
     let setup = began.elapsed();
 
+    // Extra readers share the same CPU budget and overlap blocking preads
+    // and page faults. In-memory phases keep one worker per available CPU.
+    let readers = (threads + threads / 2).min(32);
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
+        let handles: Vec<_> = (0..readers)
             .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
             .collect();
         handles
@@ -1587,9 +1590,11 @@ fn main() -> io::Result<()> {
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
-                parsed_events[thread].buckets.release();
+                for owner in (thread..parsed_events.len()).step_by(threads) {
+                    parsed_events[owner].buckets.release();
+                    clicks[owner].buckets.release();
+                }
                 events[thread].release();
-                clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
