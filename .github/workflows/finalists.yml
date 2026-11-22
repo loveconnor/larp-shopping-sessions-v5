@@ -12,16 +12,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 223753}
-          - {events: 60000000, format: current, seed: 223753}
-          - {events: 20000000, format: current, seed: 783731}
-          - {events: 60000000, format: current, seed: 783731}
+          - {events: 20000000, format: current, seed: 456791}
+          - {events: 60000000, format: current, seed: 456791}
+          - {events: 20000000, format: current, seed: 817337}
+          - {events: 60000000, format: current, seed: 817337}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
-      CANDIDATE: a057b4a6243282ef33ea848a5c33157f2a50aa81
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, persist-credentials: false}
@@ -43,13 +41,13 @@ jobs:
           lscpu | grep -E "^Model name|^CPU\(s\)"
           mkdir "$RUNNER_TEMP/engines" "$RUNNER_TEMP/sources" "$RUNNER_TEMP/profiles"
           mkdir "$RUNNER_TEMP/sources/base"
-          git archive a057b4a6243282ef33ea848a5c33157f2a50aa81 native | tar -x -C "$RUNNER_TEMP/sources/base"
-          mkdir "$RUNNER_TEMP/sources/heavy"
-          git archive d2b3a5899e26dabd1fc17c771962550094e2c87e native | tar -x -C "$RUNNER_TEMP/sources/heavy"
-          mkdir "$RUNNER_TEMP/sources/tags"
-          git archive de94bb5a01a2cf68b153cb8e8ee308fcf7f92ab4 native | tar -x -C "$RUNNER_TEMP/sources/tags"
-          mkdir "$RUNNER_TEMP/sources/majority"
-          git archive 76bffc7777cc46579ddfcf265222e053144f2851 native | tar -x -C "$RUNNER_TEMP/sources/majority"
+          git archive f5364f4a92df4eec0d5f5556deadd3c2dcb64f30 native | tar -x -C "$RUNNER_TEMP/sources/base"
+          mkdir "$RUNNER_TEMP/sources/aligned"
+          git archive 03f9836b357ea5948fdbb4e95e95eb702558b5e8 native | tar -x -C "$RUNNER_TEMP/sources/aligned"
+          mkdir "$RUNNER_TEMP/sources/bins"
+          git archive 54da634670ddb6a9e00b0344c51f12895282f356 native | tar -x -C "$RUNNER_TEMP/sources/bins"
+          mkdir "$RUNNER_TEMP/sources/links"
+          git archive 31aaae79526656a2e5ac4867b9852c22de07d6e6 native | tar -x -C "$RUNNER_TEMP/sources/links"
           docker build --quiet -t profile-runtime - <<'EOF'
           FROM rust:1.90-slim-bookworm
           RUN apt-get update -qq && apt-get install -yq --no-install-recommends libjemalloc2 patch && rustup component add llvm-tools-preview

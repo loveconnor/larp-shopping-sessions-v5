@@ -17,7 +17,7 @@ if grep -qw avx512bw /proc/cpuinfo; then
 fi
 merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
 printf '%s\n' "$level" > /study/engines/level
-for label in base heavy tags majority; do
+for label in base aligned bins links; do
     cd "/study/sources/$label/native"
     if [ "$level" = wide ]; then patch -s -p2 < platform/wide.patch; fi
     export CARGO_TARGET_DIR="/tmp/target-$label"

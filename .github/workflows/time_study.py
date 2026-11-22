@@ -22,12 +22,14 @@ try:
             elapsed=run(n)
             if rnd: samples[n].append(elapsed)
             else:
-                for t in ['user_daily','campaign_daily']:
-                    x,y=[f"SELECT * FROM read_parquet('{root}/{d}/{t}/*.parquet')" for d in ['output','ref']]
-                    for a,b in ((x,y),(y,x)):
-                        assert duckdb.sql(f'SELECT count(*) FROM ({a} EXCEPT ALL {b})').fetchone()[0]==0
+                with duckdb.connect() as con:
+                    for t in ['user_daily','campaign_daily']:
+                        x,y=[f"SELECT * FROM read_parquet('{root}/{d}/{t}/*.parquet')" for d in ['output','ref']]
+                        for a,b in ((x,y),(y,x)):
+                            assert con.sql(f'SELECT count(*) FROM ({a} EXCEPT ALL {b})').fetchone()[0]==0
+    reference=samples['base-original']
     for n in sorted(names):
         m=statistics.median(samples[n])
-        print('MATCHED',n,'seconds',round(m,6),'vs-original',round(m/statistics.median(samples['base-original']),4),'vs-matched',round(m/statistics.median(samples['base-matched']),4),flush=True)
+        print('MATCHED',n,'seconds',round(m,6),'vs-original',round(m/statistics.median(samples['base-original']),4),'vs-matched',round(m/statistics.median(samples['base-matched']),4),'paired',round(statistics.median(x/y for x,y in zip(samples[n],reference)),4),'wins',sum(x<y for x,y in zip(samples[n],reference)),flush=True)
 finally:
     sp.run(['docker','rm','-f',cid],check=True)
