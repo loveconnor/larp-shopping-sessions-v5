@@ -1617,6 +1617,39 @@ fn default_threads() -> usize {
     }
 }
 
+fn read_products(path: &Path) -> io::Result<(Dim, Vec<Vec<u8>>, u32)> {
+    // Products, without an allocation per row: categories are numbered as they
+    // appear, then renumbered in byte order so the smaller number wins a tie.
+    let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+    let mut products = Dim::new(b"p");
+    dimension_rows(path, products.prefix, |product, number, category| {
+        if product.is_empty() {
+            return;
+        }
+        let index = match seen.iter().position(|name| name.as_slice() == category) {
+            Some(index) => index,
+            None => {
+                seen.push(category.to_vec());
+                seen.len() - 1
+            }
+        };
+        products.insert(product, number, index as u32 + 1);
+    })?;
+    assert!(seen.len() <= 256, "more than 256 categories");
+    let mut categories = seen.clone();
+    categories.sort();
+    let renumber: Vec<u32> = seen
+        .iter()
+        .map(|name| categories.binary_search(name).unwrap() as u32 + 1)
+        .collect();
+    for value in products.dense.iter_mut().chain(products.other.values_mut()) {
+        if *value != 0 {
+            *value = renumber[*value as usize - 1];
+        }
+    }
+    Ok((products, categories, renumber[0] - 1))
+}
+
 fn main() -> io::Result<()> {
     let began = Instant::now();
     if std::env::var_os("SS_DIAG").is_some() && std::env::var_os("SS_CHILD").is_none() {
@@ -1642,37 +1675,9 @@ fn main() -> io::Result<()> {
         "window"
     );
 
-    // Categories are numbered in byte order, so the smaller number wins a tie.
-    // Products, without an allocation per row: categories are numbered as they
-    // appear, then renumbered in byte order so the smaller number wins a tie.
-    let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
-    let mut products = Dim::new(b"p");
-    dimension_rows(&data.join("products.csv"), products.prefix, |product, number, category| {
-        if product.is_empty() {
-            return;
-        }
-        let index = match seen.iter().position(|name| name.as_slice() == category) {
-            Some(index) => index,
-            None => {
-                seen.push(category.to_vec());
-                seen.len() - 1
-            }
-        };
-        products.insert(product, number, index as u32 + 1);
-    })?;
-    assert!(seen.len() <= 256, "more than 256 categories");
-    let mut categories = seen.clone();
-    categories.sort();
-    let renumber: Vec<u32> = seen
-        .iter()
-        .map(|name| categories.binary_search(name).unwrap() as u32 + 1)
-        .collect();
-    for value in products.dense.iter_mut().chain(products.other.values_mut()) {
-        if *value != 0 {
-            *value = renumber[*value as usize - 1];
-        }
-    }
-    let unknown = renumber[0] - 1;
+    // Build the product catalog while the calling thread indexes the input files.
+    let product_path = data.join("products.csv");
+    let catalog = std::thread::spawn(move || read_products(&product_path));
 
     let mut campaigns = Dim::new(b"c_");
     let mut campaign_names = vec![b"organic".to_vec()];
@@ -1724,6 +1729,7 @@ fn main() -> io::Result<()> {
     let person_bits = partition_bits(if medium && !fine { 4 << 20 } else { 1 << 20 });
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
+    let (products, categories, unknown) = catalog.join().expect("product catalog worker panicked")?;
     let shared = Shared {
         window_start,
         window_end,
