@@ -126,6 +126,7 @@ fn fetch(target: *const u8) {
 }
 
 pub struct Block {
+    index: std::cell::RefCell<(Vec<u32>, Vec<u32>, Vec<u32>)>,
     buf: Vec<u8>,
     base: *const u8,
     own_end: usize,
@@ -373,6 +374,7 @@ impl Block {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            index: std::cell::RefCell::new((Vec::with_capacity(WINDOW * 64 + 256), Vec::with_capacity(WINDOW * 64 + 64), Vec::new())),
             base: std::ptr::null(),
             own_end: 0,
             end: 0,
@@ -533,10 +535,11 @@ impl Block {
                 return;
             }
             let end = end as u32;
-            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
-            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            let mut index = self.index.borrow_mut();
+            let (seps, newlines, bad) = &mut *index;
+            seps.clear();
+            bad.clear();
             // Starts of chunks that break a quote rule; the last is a sentinel.
-            let mut bad: Vec<u32> = Vec::new();
             let mut bad_at = 0usize;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
@@ -746,6 +749,7 @@ mod tests {
         let mut buf = vec![0u8; PAD + data.len() + 4 * PAD + 64];
         buf[PAD..PAD + data.len()].copy_from_slice(&data);
         let block = Block {
+            index: Block::new().index,
             buf,
             base: std::ptr::null(),
             own_end: own,
