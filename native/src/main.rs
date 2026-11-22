@@ -1236,6 +1236,48 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    fn person_sparse(&mut self, person: u64, times: &[u32], purchases: &[u64], clicks: &[Touch]) -> io::Result<()> {
+        let mut cursor = (0, 0);
+        let mut current_day = NONE;
+        let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
+        let (mut event, mut purchase) = (0, 0);
+        while event < times.len() {
+            let first = event;
+            let start = u64::from(times[event]);
+            let day = ((start + self.shared.day_offset) / DAY as u64) as u32;
+            if day != current_day {
+                if current_day != NONE { self.row(person, current_day, day_sessions, day_events, day_revenue)?; }
+                current_day = day;
+                (day_sessions, day_events, day_revenue) = (0, 0, 0);
+            }
+            event += 1;
+            while event < times.len() && times[event] - times[event-1] <= SESSION_GAP as u32 {
+                event += 1;
+            }
+            let last = times[event-1];
+            let mut revenue = 0u64;
+            // Equal timestamps always belong to the same session. This consumes
+            // every purchase exactly once without storing an index per event.
+            while purchase < purchases.len() && (purchases[purchase] >> 32) as u32 <= last {
+                let details = purchases[purchase] as u32;
+                let category = (details >> 24) as usize;
+                let price = u64::from(details & 0xff_ffff);
+                if self.sums[category] == 0 { self.touched.push(category as u8); }
+                self.sums[category] += price;
+                revenue += price;
+                purchase += 1;
+            }
+            day_sessions += 1;
+            day_events += (event - first) as u32;
+            day_revenue += revenue;
+            cursor = self.credit(clicks, cursor, start, day, revenue, revenue != 0);
+        }
+        debug_assert_eq!(purchase, purchases.len());
+        if current_day != NONE { self.row(person, current_day, day_sessions, day_events, day_revenue)?; }
+        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        Ok(())
+    }
+
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
@@ -1398,6 +1440,8 @@ fn session_worker(
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
+    let mut times = [0u32; 512];
+    let mut purchases = [0u64; 512];
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
@@ -1556,6 +1600,24 @@ fn session_worker(
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+            }
+            if (5..512).contains(&mine.len()) {
+                let times = &mut times[..mine.len()];
+                let mut count = 0;
+                for (time, &value) in times.iter_mut().zip(mine.iter()) {
+                    *time = (value >> 32) as u32;
+                    if value as u32 != 0 {
+                        purchases[count] = value;
+                        count += 1;
+                    }
+                }
+                times.sort_unstable();
+                let tagged = &mut purchases[..count];
+                tagged.sort_unstable();
+                sessions.person_sparse(person, times, tagged, reached)?;
+                from = to;
+                click_from = click_to;
+                continue;
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
