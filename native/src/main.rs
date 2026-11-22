@@ -1365,6 +1365,45 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// For purchase-free histories only the event times carry information. Sort
+/// eight 32-bit times in a single AVX2 register, preserving repeated times.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+unsafe fn sort_short_plain(values: &mut [u64]) -> bool {
+    use std::arch::x86_64::*;
+    if !(5..=8).contains(&values.len()) { return false; }
+    unsafe {
+        let p = values.as_mut_ptr();
+        let tail = _mm256_cmpgt_epi64(
+            _mm256_set1_epi64x((values.len() - 4) as i64),
+            _mm256_setr_epi64x(0, 1, 2, 3),
+        );
+        let a = _mm256_loadu_si256(p.cast());
+        let b = _mm256_maskload_epi64(p.add(4).cast(), tail);
+        if _mm256_testz_si256(_mm256_or_si256(a,b), _mm256_set1_epi64x(i64::from(u32::MAX))) == 0 {
+            return false;
+        }
+        let b = _mm256_or_si256(b, _mm256_andnot_si256(tail, _mm256_set1_epi64x(-1)));
+        let mut v = _mm256_castps_si256(_mm256_shuffle_ps::<0xdd>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+        macro_rules! compare {
+            ($other:expr, $lanes:literal) => {{
+                let other = $other;
+                v = _mm256_blend_epi32::<$lanes>(_mm256_min_epu32(v, other), _mm256_max_epu32(v, other));
+            }};
+        }
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0x66);
+        compare!(_mm256_shuffle_epi32::<0x4e>(v), 0x3c);
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0x5a);
+        compare!(_mm256_permute2x128_si256::<0x01>(v, v), 0xf0);
+        compare!(_mm256_shuffle_epi32::<0x4e>(v), 0xcc);
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0xaa);
+        let first = _mm256_slli_epi64::<32>(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(v)));
+        let last = _mm256_slli_epi64::<32>(_mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(v)));
+        _mm256_storeu_si256(p.cast(), first);
+        _mm256_maskstore_epi64(p.add(4).cast(), tail, last);
+    }
+    true
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1565,7 +1604,9 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                if !unsafe { sort_short_plain(mine) } { mine.sort_unstable(); }
+                #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), all(target_arch = "x86_64", target_feature = "avx512f"))))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
