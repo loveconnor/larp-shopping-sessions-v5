@@ -1128,6 +1128,47 @@ fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
     to.copy_from_slice(from);
 }
 
+/// Sort up to 32 timestamps with register comparisons. Padding sorts to the
+/// end and masked loads and stores touch only the person's own records.
+#[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
+#[inline(always)]
+unsafe fn sort_short_times(values: &mut [u64]) {
+    use std::arch::x86_64::*;
+    #[inline(always)]
+    unsafe fn step<const SELECT: u8>(v: __m512i, order: __m512i) -> __m512i {
+        let other = _mm512_permutexvar_epi64(order,v);
+        _mm512_mask_max_epu64(_mm512_min_epu64(v,other),SELECT,v,other)
+    }
+    let swap1 = _mm512_setr_epi64(1,0,3,2,5,4,7,6);
+    let swap2 = _mm512_setr_epi64(2,3,0,1,6,7,4,5);
+    let swap4 = _mm512_setr_epi64(4,5,6,7,0,1,2,3);
+    let reverse = _mm512_setr_epi64(7,6,5,4,3,2,1,0);
+    let finish = |v| step::<0xaa>(step::<0xcc>(step::<0xf0>(v,swap4),swap2),swap1);
+    let sort = |v| finish(step::<0x5a>(step::<0x3c>(step::<0x66>(v,swap1),swap2),swap1));
+    let pair = |a,b| {
+        let br = _mm512_permutexvar_epi64(reverse,b);
+        (finish(_mm512_min_epu64(a,br)), finish(_mm512_max_epu64(a,br)))
+    };
+    let n = values.len();
+    let mask = |i:usize| (0xffu16 >> (8-n.saturating_sub(i).min(8))) as u8;
+    let p = values.as_mut_ptr();
+    let read = |i:usize| sort(_mm512_mask_loadu_epi64(_mm512_set1_epi64(-1),mask(i),p.wrapping_add(i).cast()));
+    let write = |i:usize,v| _mm512_mask_storeu_epi64(p.wrapping_add(i).cast(),mask(i),v);
+    let a = read(0);
+    if values.len() <= 8 { write(0,a); return; }
+    let (a,b) = pair(a,read(8));
+    if values.len() <= 16 { write(0,a); write(8,b); return; }
+    let (c,d) = pair(read(16),read(24));
+    let c = _mm512_permutexvar_epi64(reverse,c);
+    let d = _mm512_permutexvar_epi64(reverse,d);
+    let (al,ah) = (_mm512_min_epu64(a,d),_mm512_max_epu64(a,d));
+    let (bl,bh) = (_mm512_min_epu64(b,c),_mm512_max_epu64(b,c));
+    write(0,finish(_mm512_min_epu64(al,bl)));
+    write(8,finish(_mm512_max_epu64(al,bl)));
+    write(16,finish(_mm512_min_epu64(ah,bh)));
+    write(24,finish(_mm512_max_epu64(ah,bh)));
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1317,6 +1358,9 @@ fn session_worker(
             if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
             } else {
+                #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
+                if (5..=32).contains(&mine.len()) { unsafe { sort_short_times(mine) } } else { mine.sort_unstable(); }
+                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
             }
             let reached = &mut touches[click_from..click_to];
