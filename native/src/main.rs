@@ -925,6 +925,11 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    // Repeated event users, including those with no links, retain their exact
+    // canonical result near the worker. A collision only evicts an entry.
+    const CACHE: usize = 1024;
+    let mut recent = vec![(0u64, 0u64); CACHE];
+    let home = |key: u64| (key.wrapping_mul(MIX) >> (64 - CACHE.trailing_zeros())) as usize;
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -998,13 +1003,23 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                        let user = (*base.add(offset + ahead)).user;
+                        if recent[home(user)].0 != user {
+                            links.prefetch(user);
+                        }
                     }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let cached = &mut recent[home(record.user)];
+                    let person = if cached.0 == record.user {
+                        cached.1
+                    } else {
+                        let person = links.person(record.user);
+                        *cached = (record.user, person);
+                        person
+                    };
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
