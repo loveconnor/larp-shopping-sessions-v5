@@ -398,8 +398,12 @@ impl Links {
         if self.empty {
             return key;
         }
+        self.person_at(key, (key.wrapping_mul(MIX) >> self.shift) as usize)
+    }
+
+    #[inline(always)]
+    fn person_at(&self, key: u64, mut slot: usize) -> u64 {
         let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -995,18 +999,25 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
+            let width = ahead.clamp(1, 64);
+            let mut homes = [0usize; 64];
             for &(base, count) in &chunks {
-                for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                for from in (0..count).step_by(width) {
+                    let rows = (count - from).min(width);
+                    if !links.empty {
+                        for (lane, home) in homes[..rows].iter_mut().enumerate() {
+                            let key = (*base.add(from + lane)).user;
+                            *home = (key.wrapping_mul(MIX) >> links.shift) as usize;
+                            if ahead != 0 { prefetch(links.slots.get_unchecked(*home)); }
+                        }
                     }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
-                        continue;
+                    for (lane, &home) in homes[..rows].iter().enumerate() {
+                        let row = *base.add(from + lane);
+                        if row.ts == DEAD { continue; }
+                        let person = if links.empty { row.user } else { links.person_at(row.user, home) };
+                        let value = ((row.ts as u64) << 32) | u64::from(row.payload);
+                        out.push(person_part(person, person_bits), Event { person, value });
                     }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
