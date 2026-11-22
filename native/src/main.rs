@@ -632,8 +632,66 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+/// Parse sequentially into a tile, then scatter only inside the tile. The
+/// deduplicator visits all runs of an ID partition without relocating rows.
+struct EventTiles {
+    rows: Vec<Parsed>,
+    route: Vec<u16>,
+    counts: Vec<usize>,
+    heads: Vec<usize>,
+    runs: Vec<Vec<(usize, usize)>>,
+    tiles: Vec<Vec<Parsed>>,
+}
+impl EventTiles {
+    fn new(parts:usize)->Self {
+        Self{ rows:Vec::with_capacity(65536),route:Vec::with_capacity(65536),
+              counts:vec![0;parts],heads:vec![0;parts],runs:vec![Vec::new();parts],tiles:Vec::new() }
+    }
+    #[inline(always)]
+    fn push(&mut self,part:usize,value:Parsed)->usize {
+        let idx=self.rows.len();
+        self.rows.push(value);
+        self.route.push(part as u16);
+        self.counts[part]+=1;
+        idx
+    }
+    fn flush(&mut self){
+        if self.rows.is_empty(){return;}
+        let n=self.rows.len();
+        let mut tile=Vec::<Parsed>::with_capacity(n);
+        let base=tile.as_mut_ptr();
+        let mut sum=0;
+        for (part,count) in self.counts.iter_mut().enumerate(){
+            self.heads[part]=sum;
+            let end=sum+*count;
+            while sum<end {
+                let len=(end-sum).min(1<<OFFSET_BITS);
+                self.runs[part].push((unsafe{base.add(sum)} as usize,len));
+                sum+=len;
+            }
+            *count=0;
+        }
+        debug_assert_eq!(sum,n);
+        unsafe {
+            for (&part,&row) in self.route.iter().zip(&self.rows){
+                let slot=self.heads.get_unchecked_mut(part as usize);
+                base.add(*slot).write(row);
+                *slot+=1;
+            }
+            tile.set_len(n);
+        }
+        self.tiles.push(tile);
+        self.rows.clear();
+        self.route.clear();
+    }
+    fn chunks(&self,part:usize,dest:&mut Vec<(*mut Parsed,usize)>){
+        dest.extend(self.runs[part].iter().map(|&(addr,count)|(addr as *mut Parsed,count)));
+    }
+    fn release(&self){for tile in &self.tiles{release(tile.as_ptr(),tile.len());}}
+}
+
 struct EventSource {
-    buckets: Buckets<Parsed>,
+    buckets: EventTiles,
     names: Vec<[u8; 33]>,
 }
 
@@ -645,11 +703,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     const LOOKUPS: usize = 16;
-    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    let mut lookups = [(std::ptr::null::<u8>(), 0usize, 0u64); LOOKUPS];
     let mut queued = 0;
-    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
+    let drain = |items: &[(*const u8, usize, u64)], buckets:&mut EventTiles| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+            unsafe { buckets.rows.get_unchecked_mut(dest).user = keys::finish_long_user(name,mixed); }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -718,12 +776,13 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             lookups[queued] = (name,dest,mixed);
             queued += 1;
             if queued == LOOKUPS {
-                drain(&lookups);
+                drain(&lookups,&mut out.buckets);
                 queued = 0;
             }
         }
     });
-    drain(&lookups[..queued]);
+    drain(&lookups[..queued],&mut out.buckets);
+    if out.buckets.rows.len()>=65536{out.buckets.flush();}
 }
 
 struct ClickSource {
@@ -823,7 +882,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: EventTiles::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -835,6 +894,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
+    events.buckets.flush();
     Ok((events, clicks))
 }
 
@@ -924,10 +984,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
-            // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
-            }
+
         }
     }
     out
