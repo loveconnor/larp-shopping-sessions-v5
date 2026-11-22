@@ -44,7 +44,7 @@ const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
 const GROUP_ROWS: usize = 1 << 17;
 /// How many records ahead to prefetch a links lookup.
-const AHEAD: usize = 16;
+const AHEAD: usize = 8;
 
 // ---------------------------------------------------------------- buckets
 
@@ -940,7 +940,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
-        let capacity = (total * 5).div_ceil(2).next_power_of_two();
+        let capacity = (total * 8).div_ceil(4).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
         table.resize(capacity, NONE);
