@@ -637,6 +637,11 @@ struct EventSource {
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    if block.ascii_nonzero() { parse_event_block::<true>(shared,block,copy,dates,out); }
+    else { parse_event_block::<false>(shared,block,copy,dates,out); }
+}
+
+fn parse_event_block<const ASCII: bool>(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -653,7 +658,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
-            let id = keys::pack(p, n);
+            let id = keys::block_key::<ASCII>(p,n);
             if id == 0 {
                 return;
             }
@@ -666,7 +671,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let user = keys::block_user::<ASCII>(p,n);
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);

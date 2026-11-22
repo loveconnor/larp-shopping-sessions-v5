@@ -359,6 +359,31 @@ impl Block {
         }
     }
 
+    /// All IDs in this block can use the existing 7-bit inline encoding if
+    /// the actual input contains only nonzero ASCII. Other blocks use pack().
+    #[inline]
+    pub fn ascii_nonzero(&self) -> bool {
+        let bytes = unsafe { std::slice::from_raw_parts(self.base,self.end) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let mut chunks = bytes.chunks_exact(128);
+            let zero = _mm256_setzero_si256();
+            for chunk in &mut chunks {
+                let p = chunk.as_ptr();
+                let a = _mm256_loadu_si256(p.cast());
+                let b = _mm256_loadu_si256(p.add(32).cast());
+                let c = _mm256_loadu_si256(p.add(64).cast());
+                let d = _mm256_loadu_si256(p.add(96).cast());
+                let min = _mm256_min_epi8(_mm256_min_epi8(a,b),_mm256_min_epi8(c,d));
+                if _mm256_movemask_epi8(_mm256_cmpgt_epi8(min,zero)) != -1 { return false; }
+            }
+            return chunks.remainder().iter().all(|&b| (b as i8)>0);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        { bytes.iter().all(|&b| (b as i8)>0) }
+    }
+
     fn reserve(&mut self, data: usize) {
         let need = PAD + data + 1 + 4 * PAD;
         if self.buf.len() < need {

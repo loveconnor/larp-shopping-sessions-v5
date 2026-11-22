@@ -143,6 +143,25 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
     unsafe { pack(p, n) }
 }
 
+#[inline(always)]
+pub unsafe fn block_key<const ASCII: bool>(p: *const u8, len: usize) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    if ASCII && len <= 9 {
+        use std::arch::x86_64::{_bzhi_u64,_pext_u64};
+        unsafe {
+            let x = _bzhi_u64(p.cast::<u64>().read_unaligned(), len as u32 * 8);
+            let last = if len == 9 { *p.add(8) } else { 0 };
+            return _pext_u64(x.swap_bytes(),0x7f7f7f7f7f7f7f7f) << 7 | u64::from(last);
+        }
+    }
+    unsafe { pack(p,len) }
+}
+
+#[inline(always)]
+pub unsafe fn block_user<const ASCII: bool>(p: *const u8, len: usize) -> u64 {
+    if ASCII && len <= 9 { unsafe { block_key::<ASCII>(p,len) } } else { unsafe { pack_user(p,len) } }
+}
+
 fn name(key: u64) -> &'static [u8] {
     if key & FIXED_USER != 0 {
         let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];
