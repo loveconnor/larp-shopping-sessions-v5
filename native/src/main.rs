@@ -805,7 +805,6 @@ fn parse_clicks(
 ) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
-    pending.clear();
     let mut queued = Vec::with_capacity(16);
     let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
         for (name, hash, index) in queued.drain(..) {
@@ -850,12 +849,16 @@ fn parse_clicks(
         }
     });
     drain(&mut queued,pending);
-    let links = loop {
-        match shared.links.get() {
-            Some(links) => break links,
-            None => std::thread::yield_now(),
-        }
-    };
+    // RawClick owns its fields. A worker can safely load another input
+    // block while the last link shard is building the canonical table.
+    if let Some(links) = shared.links.get() {
+        route_clicks(shared, links, pending, out);
+    } else if pending.len() >= 65536 {
+        route_clicks(shared, shared.links.wait(), pending, out);
+    }
+}
+
+fn route_clicks(shared: &Shared, links: &Links, pending: &mut Vec<RawClick>, out: &mut ClickSource) {
     for at in 0..pending.len() {
         if let Some(ahead) = pending.get(at + shared.ahead) {
             links.prefetch(ahead.user);
@@ -872,6 +875,7 @@ fn parse_clicks(
             },
         );
     }
+    pending.clear();
 }
 
 type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
@@ -910,6 +914,9 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         } else {
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
+    }
+    if !pending.is_empty() {
+        route_clicks(shared, shared.links.wait(), &mut pending, &mut clicks);
     }
     Ok((events, clicks))
 }
