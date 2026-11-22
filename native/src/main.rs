@@ -56,6 +56,31 @@ const SLAB: usize = 1 << 13;
 /// The dedup table packs a record's offset in its chunk into this many bits.
 const OFFSET_BITS: u32 = 9;
 
+/// An aligned, uninitialized region owned by one bucket collection.
+struct Slab(std::ptr::NonNull<u8>);
+
+impl Slab {
+    const BYTES: usize = SLAB * CHUNK_BYTES;
+    const ALIGN: usize = 2 << 20;
+    const LAYOUT: std::alloc::Layout = match std::alloc::Layout::from_size_align(Self::BYTES, Self::ALIGN) {
+        Ok(layout) => layout,
+        Err(_) => panic!("invalid slab layout"),
+    };
+
+    fn new() -> Self {
+        let ptr = std::ptr::NonNull::new(unsafe { std::alloc::alloc(Self::LAYOUT) })
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(Self::LAYOUT));
+        huge(ptr.as_ptr(), Self::BYTES);
+        Self(ptr)
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.0.as_ptr(), Self::LAYOUT); }
+    }
+}
+
 /// Records appended to one of many partitions, in fixed chunks carved from
 /// big slabs: no copying on growth, and a chunk never moves. A chunk can also
 /// be a stretch of memory someone else is done with, which saves faulting in
@@ -66,7 +91,7 @@ struct Buckets<T: Copy> {
     /// Each partition's newest chunk, and how many chunks it has.
     head: Vec<u32>,
     chunks: Vec<u32>,
-    slabs: Vec<Vec<u8>>,
+    slabs: Vec<Slab>,
     /// Every chunk's first record, and the chunk before it in its partition.
     bases: Vec<*mut T>,
     previous: Vec<u32>,
@@ -127,14 +152,10 @@ impl<T: Copy> Buckets<T> {
             Some(base) => base,
             None => {
                 if self.carved % SLAB == 0 {
-                    let bytes = (SLAB + 1) * CHUNK_BYTES;
-                    let slab: Vec<u8> = Vec::with_capacity(bytes);
-                    huge(slab.as_ptr(), bytes);
-                    self.slabs.push(slab);
+                    self.slabs.push(Slab::new());
                 }
-                let slab = self.slabs.last().unwrap().as_ptr() as usize;
-                let first = (slab + CHUNK_BYTES - 1) & !(CHUNK_BYTES - 1);
-                let base = (first + (self.carved % SLAB) * CHUNK_BYTES) as *mut T;
+                let first = self.slabs.last().unwrap().0.as_ptr();
+                let base = unsafe { first.add((self.carved % SLAB) * CHUNK_BYTES) }.cast::<T>();
                 // Commit only the next 2 MiB of chunks. Click and dedup
                 // workers often use a small fraction of their last slab.
                 const BATCH: usize = (1 << 21) / CHUNK_BYTES;
@@ -157,7 +178,7 @@ impl<T: Copy> Buckets<T> {
     /// kernel would free them page by page on one thread, inside the timed run.
     fn release(&self) {
         for slab in &self.slabs {
-            release(slab.as_ptr(), (SLAB + 1) * CHUNK_BYTES);
+            release(slab.0.as_ptr(), Slab::BYTES);
         }
     }
 
