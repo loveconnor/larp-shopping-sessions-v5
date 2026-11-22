@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: [459983, 546503, 697091, 814189, 905991, 382781]
+        seed: [264757, 552263, 983777, 781673, 604171, 935789]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,5 +36,8 @@ jobs:
         if: env.CAPABLE == 'yes'
         run: |
           cd "$RUNNER_TEMP"
+          mkdir native-check
+          git -C "$GITHUB_WORKSPACE" archive 5403f8a7e02a7663123d07a5b5073a8cf8722b93 native | tar xf - -C native-check
+          docker run --rm -v "$RUNNER_TEMP:/study" -w /study -e RUSTFLAGS=-Ctarget-cpu=x86-64-v4 rust:1.90-slim-bookworm cargo test --release --locked --manifest-path native-check/native/Cargo.toml merged_histories_match_unsigned_sort
           cp "$GITHUB_WORKSPACE/.github/workflows/history_sort.rs" .
           docker run --rm -v "$RUNNER_TEMP:/study" -w /study rust:1.90-slim-bookworm sh -c 'rustc --edition 2024 -Awarnings -O -Ctarget-cpu=x86-64-v4 history_sort.rs -o /tmp/compare && /tmp/compare'

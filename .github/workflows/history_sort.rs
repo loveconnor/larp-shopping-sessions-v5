@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Instant};
 mod current;
 mod merge64;
 mod merge128;
-mod registers;
+mod stream;
 
 fn main() {
     let mut samples: [Vec<Vec<u64>>; 7] = Default::default();
@@ -21,7 +21,7 @@ fn main() {
     }
     let sorters: [(&str, fn(&mut [u64], &mut [u64])); 4] = [
         ("current",current::apply), ("merge64",merge64::apply),
-        ("merge128",merge128::apply), ("registers",registers::apply),
+        ("merge128",merge128::apply), ("stream",stream::apply),
     ];
     for (bin, input) in samples.iter().enumerate() {
         if input.is_empty() { continue; }
