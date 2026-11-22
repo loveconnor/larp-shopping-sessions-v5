@@ -618,7 +618,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
                 let a = user(left,nl,false);
                 let b = user(right,nr,true);
                 pairs.push((a,b));
-                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
+                if queued.len() >= 32 { drain(&mut queued, &mut pairs); }
             });
             drain(&mut queued, &mut pairs);
             start = end;
@@ -693,7 +693,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    const LOOKUPS: usize = 16;
+    const LOOKUPS: usize = 8;
     let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
