@@ -1,8 +1,8 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 4b7bb4e..0679182 100644
+index 4b7bb4e..85bdad4 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -1331,6 +1331,71 @@ unsafe fn sort_short_times(values: &mut [u64]) {
+@@ -1331,38 +1331,160 @@ unsafe fn sort_short_times(values: &mut [u64]) {
      write(24,finish(_mm512_max_epu64(ah,bh)));
  }
  
@@ -72,12 +72,30 @@ index 4b7bb4e..0679182 100644
 +}
 +
  #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
- fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+-fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
++fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
      use std::arch::x86_64::*;
-@@ -1339,6 +1404,18 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+     let n=values.len();
+     if n<=32 {
          if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
          return;
      }
+-    if depth==0 { values.sort_unstable(); return; }
+-    let (a,b,c)=(values[0],values[n/2],values[n-1]);
+-    let pivot=a.min(b).max(a.max(b).min(c));
+-    let (mut lo,mut hi)=(0,n);
+-    unsafe {
+-        let bound=_mm512_set1_epi64(pivot as i64);
+-        for i in (0..n).step_by(8) {
+-            let count=(n-i).min(8);
+-            let valid=(0xffu16>>(8-count)) as u8;
+-            let v=_mm512_maskz_loadu_epi64(valid,values.as_ptr().add(i).cast());
+-            let below=_mm512_cmplt_epu64_mask(v,bound)&valid;
+-            let small=below.count_ones() as usize;
+-            hi-=count-small;
+-            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(lo).cast(),below,v);
+-            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(hi).cast(),valid & !below,v);
+-            lo+=small;
 +    if n <= 128 {
 +        unsafe {
 +            if n <= 64 { sort_up_to_64(values); }
@@ -87,16 +105,57 @@ index 4b7bb4e..0679182 100644
 +                sort_up_to_64(right);
 +                merge_histories::<8>(values);
 +            }
-+        }
+         }
 +        return;
 +    }
-     if depth==0 { values.sort_unstable(); return; }
-     let (a,b,c)=(values[0],values[n/2],values[n-1]);
-     let pivot=a.min(b).max(a.max(b).min(c));
-@@ -1365,6 +1442,34 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
-     sort_medium_times(right,r,depth-1);
- }
- 
++    let middle = n.next_power_of_two() / 2;
++    let (left, right) = values.split_at_mut(middle);
++    let (left_scratch, right_scratch) = tmp.split_at_mut(middle);
++    sort_medium_times(left, left_scratch);
++    sort_medium_times(right, right_scratch);
++    // Both input runs are sorted. Merge eight values at a time while carrying
++    // the larger eight lanes forward, and write the last partial block exactly.
++    unsafe {
++        let finish = |v| {
++            let other = _mm512_permutexvar_epi64(_mm512_setr_epi64(4,5,6,7,0,1,2,3), v);
++            let v = _mm512_mask_max_epu64(_mm512_min_epu64(v,other),0xf0,v,other);
++            let other = _mm512_permutexvar_epi64(_mm512_setr_epi64(2,3,0,1,6,7,4,5), v);
++            let v = _mm512_mask_max_epu64(_mm512_min_epu64(v,other),0xcc,v,other);
++            let other = _mm512_permutexvar_epi64(_mm512_setr_epi64(1,0,3,2,5,4,7,6), v);
++            _mm512_mask_max_epu64(_mm512_min_epu64(v,other),0xaa,v,other)
++        };
++        let reverse = _mm512_setr_epi64(7,6,5,4,3,2,1,0);
++        let mut carry = _mm512_loadu_si512(left.as_ptr().cast());
++        let (mut x, mut y, mut written) = (8, 0, 0);
++        while x < left.len() || y < right.len() {
++            let block = if y == right.len() || (x < left.len() && left[x] <= right[y]) {
++                let v = _mm512_loadu_si512(left.as_ptr().add(x).cast());
++                x += 8;
++                v
++            } else {
++                let count = (right.len() - y).min(8);
++                let mask = (0xffu16 >> (8 - count)) as u8;
++                let v = _mm512_mask_loadu_epi64(_mm512_set1_epi64(-1), mask, right.as_ptr().add(y).cast());
++                y += count;
++                v
++            };
++            let reversed = _mm512_permutexvar_epi64(reverse, block);
++            let low = finish(_mm512_min_epu64(carry, reversed));
++            carry = finish(_mm512_max_epu64(carry, reversed));
++            _mm512_storeu_si512(tmp.as_mut_ptr().add(written).cast(), low);
++            written += 8;
++        }
++        let mask = (0xffu16 >> (8 - (n - written))) as u8;
++        _mm512_mask_storeu_epi64(tmp.as_mut_ptr().add(written).cast(), mask, carry);
+     }
+-    if lo==0 || lo==n { values.sort_unstable(); return; }
+     values.copy_from_slice(&tmp[..n]);
+-    let (left,right)=values.split_at_mut(lo);
+-    let (l,r)=tmp.split_at_mut(lo);
+-    sort_medium_times(left,l,depth-1);
+-    sort_medium_times(right,r,depth-1);
++}
++
 +#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
 +#[test]
 +fn merged_histories_match_unsigned_sort() {
@@ -118,13 +177,20 @@ index 4b7bb4e..0679182 100644
 +            }
 +            let mut reference = values.to_vec();
 +            reference.sort_unstable();
-+            sort_medium_times(values, &mut vec![0; n], 12);
++            sort_medium_times(values, &mut vec![0; n]);
 +            assert_eq!(values, reference, "length={n} mode={mode}");
 +            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
 +        }
 +    }
-+}
-+
+ }
+ 
  fn session_worker(
-     shared: &Shared,
-     events: &[Buckets<Event>],
+@@ -1563,7 +1685,7 @@ fn session_worker(
+                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
+                 } else {
+                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
+-                    sort_medium_times(mine,&mut scratch[..mine.len()],12);
++                    sort_medium_times(mine,&mut scratch[..mine.len()]);
+                 }
+                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                 mine.sort_unstable();
