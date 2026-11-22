@@ -82,6 +82,9 @@ const FIXED_USER: u64 = 1 << 61;
 #[repr(C, align(64))]
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
+    // The full spelling remains contiguous; its 32-byte suffix starts at
+    // byte 32 in this cache line for a single aligned comparison.
+    _pad: [u8;23],
     name: std::cell::UnsafeCell<[u8; 33]>,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
@@ -130,7 +133,9 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
 unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
-    let hash = (mixed ^ (mixed >> 31)) | 2;
+    // The high bit reserves the publication sentinels. The low byte
+    // records the complete prefix, leaving only the suffix to compare.
+    let hash = (1u64 << 63) | ((mixed ^ (mixed >> 31)) & !255) | u64::from(bytes[0]);
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
     for _ in 0..12 {
@@ -150,7 +155,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
             std::hint::spin_loop();
             tag = slot.tag.load(Acquire);
         }
-        if tag == hash && unsafe { *slot.name.get() == *bytes } {
+        if tag == hash && unsafe { (&*slot.name.get())[1..] == bytes[1..] } {
             return INTERNED | FIXED_USER | at as u64;
         }
         at = (at + 1) & mask;
