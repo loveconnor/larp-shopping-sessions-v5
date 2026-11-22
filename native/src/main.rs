@@ -1092,6 +1092,11 @@ impl Sessions<'_> {
         let mut at = 0;
         let mut current = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
+        // Tiny click sets need no sliding counters when every campaign is
+        // distinct. The existing sort places the winning ID first at a tie.
+        let distinct_clicks = clicks.len() <= 6 && clicks.iter().enumerate().all(|(i, click)| {
+            !clicks[..i].iter().any(|prior| prior.campaign == click.campaign)
+        });
         while at < events.len() {
             let start = events[at] >> 32;
             let day = ((start + day_offset) / DAY as u64) as u32;
@@ -1130,7 +1135,21 @@ impl Sessions<'_> {
             day_revenue += revenue;
 
             let mut credited = 0usize;
-            if !clicks.is_empty() {
+            if distinct_clicks {
+                // Scan backwards so equal timestamps finish at the smallest ID.
+                let mut latest = None;
+                for click in clicks.iter().rev() {
+                    let time = u64::from(click.ts);
+                    if time.wrapping_sub(start) <= WEEK as u64 {
+                        let campaign = click.campaign as usize;
+                        self.totals[campaign * days + day as usize][3] += 1;
+                        if latest.is_none_or(|stamp| stamp == time) {
+                            latest = Some(time);
+                            credited = campaign;
+                        }
+                    }
+                }
+            } else if !clicks.is_empty() {
                 // A click's `ts` counts from 7 days before the events' zero, so
                 // the clicks in reach are those with start <= ts <= start + 7 days.
                 let limit = start + WEEK as u64;
