@@ -999,9 +999,56 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    fn credit(&mut self, start: u64, day: u32, revenue: u64, purchased: bool,
+              clicks: &[Touch], low: &mut usize, high: &mut usize) {
+        let days = self.shared.days;
+        let mut credited = 0usize;
+        if !clicks.is_empty() {
+            // A click's `ts` counts from 7 days before the events' zero, so
+            // the clicks in reach are those with start <= ts <= start + 7 days.
+            let limit = start + WEEK as u64;
+            while (*high) < clicks.len() && clicks[(*high)].ts as u64 <= limit {
+                let campaign = clicks[(*high)].campaign as usize;
+                if self.reach[campaign] == 0 {
+                    self.place[campaign] = self.active.len() as u32;
+                    self.active.push(campaign as u32);
+                }
+                self.reach[campaign] += 1;
+                (*high) += 1;
+            }
+            while (*low) < (*high) && (clicks[(*low)].ts as u64) < start {
+                let campaign = clicks[(*low)].campaign as usize;
+                self.reach[campaign] -= 1;
+                if self.reach[campaign] == 0 {
+                    let hole = self.place[campaign] as usize;
+                    let moved = self.active.pop().unwrap();
+                    if hole < self.active.len() {
+                        self.active[hole] = moved;
+                        self.place[moved as usize] = hole as u32;
+                    }
+                }
+                (*low) += 1;
+            }
+            if (*high) > (*low) {
+                let latest = clicks[(*high) - 1].ts;
+                let mut pick = (*high) - 1;
+                while pick > (*low) && clicks[pick - 1].ts == latest {
+                    pick -= 1;
+                }
+                credited = clicks[pick].campaign as usize;
+            }
+            for &campaign in &self.active {
+                self.totals[campaign as usize * days + day as usize][3] += 1;
+            }
+        }
+        let totals = &mut self.totals[credited * days + day as usize];
+        totals[0] += 1;
+        totals[1] += i64::from(purchased);
+        totals[2] += revenue as i64;
+    }
+
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
-        let days = self.shared.days;
         let day_offset = self.shared.day_offset;
         let (mut low, mut high) = (0usize, 0usize);
         let mut at = 0;
@@ -1044,49 +1091,7 @@ impl Sessions<'_> {
             day_events += (at - first) as u32;
             day_revenue += revenue;
 
-            let mut credited = 0usize;
-            if !clicks.is_empty() {
-                // A click's `ts` counts from 7 days before the events' zero, so
-                // the clicks in reach are those with start <= ts <= start + 7 days.
-                let limit = start + WEEK as u64;
-                while high < clicks.len() && clicks[high].ts as u64 <= limit {
-                    let campaign = clicks[high].campaign as usize;
-                    if self.reach[campaign] == 0 {
-                        self.place[campaign] = self.active.len() as u32;
-                        self.active.push(campaign as u32);
-                    }
-                    self.reach[campaign] += 1;
-                    high += 1;
-                }
-                while low < high && (clicks[low].ts as u64) < start {
-                    let campaign = clicks[low].campaign as usize;
-                    self.reach[campaign] -= 1;
-                    if self.reach[campaign] == 0 {
-                        let hole = self.place[campaign] as usize;
-                        let moved = self.active.pop().unwrap();
-                        if hole < self.active.len() {
-                            self.active[hole] = moved;
-                            self.place[moved as usize] = hole as u32;
-                        }
-                    }
-                    low += 1;
-                }
-                if high > low {
-                    let latest = clicks[high - 1].ts;
-                    let mut pick = high - 1;
-                    while pick > low && clicks[pick - 1].ts == latest {
-                        pick -= 1;
-                    }
-                    credited = clicks[pick].campaign as usize;
-                }
-                for &campaign in &self.active {
-                    self.totals[campaign as usize * days + day as usize][3] += 1;
-                }
-            }
-            let totals = &mut self.totals[credited * days + day as usize];
-            totals[0] += 1;
-            totals[1] += i64::from(purchased);
-            totals[2] += revenue as i64;
+            self.credit(start, day, revenue, purchased, clicks, &mut low, &mut high);
         }
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
@@ -1098,34 +1103,76 @@ impl Sessions<'_> {
     }
 }
 
-/// Sorts many events of one person by their `ts` (the top 32 bits): three
-/// counting passes of 11 bits. Whales have a million events each.
-fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
-    scratch.clear();
-    scratch.resize(values.len(), 0);
-    let mut histograms = [[0u32; 2048]; 3];
-    for &value in values.iter() {
-        histograms[0][(value >> 32) as usize & 2047] += 1;
-        histograms[1][(value >> 43) as usize & 2047] += 1;
-        histograms[2][(value >> 54) as usize] += 1;
-    }
-    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for (shift, counts) in [32, 43, 54].into_iter().zip(&mut histograms) {
-        let mut sum = 0;
-        for count in counts.iter_mut() {
-            let here = *count;
-            *count = sum;
-            sum += here;
+/// All events in one gap-width bucket lie in the same session. Two
+/// occupied buckets join exactly when their adjacent extrema are close enough.
+#[derive(Clone, Copy, Default)]
+struct SessionBin {
+    min: u32,
+    max: u32,
+    count: u32,
+    revenue: u64,
+    day: usize,
+}
+
+impl Sessions<'_> {
+    fn dense_person(&mut self, person: u64, events: &[u64], clicks: &[Touch],
+                    bins: &mut Vec<SessionBin>, categories: &mut Vec<[u64; 256]>) -> io::Result<()> {
+        bins.clear();
+        let bucket = |value: u64| ((value >> 32) / SESSION_GAP) as usize;
+        for &value in events {
+            let i = bucket(value);
+            if i >= bins.len() { bins.resize(i + 1, SessionBin::default()); }
+            let bin = &mut bins[i];
+            let time = (value >> 32) as u32;
+            bin.min = if bin.count == 0 { time } else { bin.min.min(time) };
+            bin.max = bin.max.max(time);
+            bin.count += 1;
+            bin.revenue += value & 0xFF_FFFF;
         }
-        for &value in from.iter() {
-            let slot = &mut counts[(value >> shift) as usize & 2047];
-            to[*slot as usize] = value;
-            *slot += 1;
+        categories.clear();
+        categories.resize(self.shared.days, [0; 256]);
+        let mut daily = vec![(0u32,0u32,0u64); self.shared.days];
+        let (mut low,mut high) = (0,0);
+        let mut session: Option<(u64,u32,u32,u64)> = None;
+        for bin in bins.iter_mut().filter(|bin| bin.count != 0) {
+            if session.is_some_and(|(_, previous, _, _)| u64::from(bin.min - previous) > SESSION_GAP) {
+                let (start,_,day,revenue) = session.take().unwrap();
+                self.credit(start,day,revenue,revenue != 0,clicks,&mut low,&mut high);
+            }
+            let (_,previous,day,revenue) = session.get_or_insert_with(|| {
+                let start = u64::from(bin.min);
+                let day = ((start + self.shared.day_offset) / DAY as u64) as u32;
+                daily[day as usize].0 += 1;
+                (start,bin.max,day,0)
+            });
+            *previous = bin.max;
+            *revenue += bin.revenue;
+            bin.day = *day as usize;
+            daily[bin.day].1 += bin.count;
+            daily[bin.day].2 += bin.revenue;
         }
-        std::mem::swap(&mut from, &mut to);
+        if let Some((start,_,day,revenue)) = session {
+            self.credit(start,day,revenue,revenue != 0,clicks,&mut low,&mut high);
+        }
+        for &value in events {
+            let price = value & 0xFF_FFFF;
+            if price != 0 {
+                categories[bins[bucket(value)].day][((value >> 24) & 255) as usize] += price;
+            }
+        }
+        for (day,(count,events,revenue)) in daily.into_iter().enumerate() {
+            if count == 0 { continue; }
+            for (index,&amount) in categories[day].iter().enumerate() {
+                if amount != 0 {
+                    self.sums[index] = amount;
+                    self.touched.push(index as u8);
+                }
+            }
+            self.row(person,day as u32,count,events,revenue)?;
+        }
+        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        Ok(())
     }
-    // Three passes: the sorted values are in the scratch buffer.
-    to.copy_from_slice(from);
 }
 
 fn session_worker(
@@ -1159,7 +1206,8 @@ fn session_worker(
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
-    let mut scratch: Vec<u64> = Vec::new();
+    let mut bins = Vec::new();
+    let mut categories = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1314,16 +1362,16 @@ fn session_worker(
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
-            } else {
-                mine.sort_unstable();
-            }
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            sessions.person(person, mine, reached)?;
+            if mine.len() > 2048 {
+                sessions.dense_person(person,mine,reached,&mut bins,&mut categories)?;
+            } else {
+                mine.sort_unstable();
+                sessions.person(person, mine, reached)?;
+            }
             from = to;
             click_from = click_to;
         }
