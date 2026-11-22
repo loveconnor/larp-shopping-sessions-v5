@@ -523,7 +523,9 @@ struct Shared {
     files: Vec<Source>,
     work: Vec<Work>,
     next: AtomicUsize,
-    link_files: Vec<PathBuf>,
+    link_files: Vec<Source>,
+    link_blocks: Vec<(usize, u64)>,
+    next_link: AtomicUsize,
     id_bits: u32,
     defer_long_events: bool,
     person_bits: u32,
@@ -588,41 +590,35 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize) -> io::Result<Vec<(u64, u64)>> {
+fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Vec<(u64, u64)>> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for path in shared.link_files.iter().skip(worker).step_by(threads) {
-        let source = Source::open(path, true)?;
-        let size = source.size;
-        let mut start = 0;
-        while start < size {
-            let end = (start + LINK_BLOCK).min(size);
-            block.load(&source, start, end)?;
-            let mut queued = Vec::with_capacity(32);
-            let drain = |queued: &mut Vec<(*const u8, u64, usize, bool)>, pairs: &mut Vec<(u64,u64)>| {
-                for (name, hash, row, right) in queued.drain(..) {
-                    let user = unsafe { keys::finish_long_user(name, hash) };
-                    if right { pairs[row].1 = user; } else { pairs[row].0 = user; }
-                }
+    while let Some(&(file, start)) = shared.link_blocks.get(shared.next_link.fetch_add(1, Ordering::Relaxed)) {
+        let source = &shared.link_files[file];
+        block.load(source, start, source.size.min(start + LINK_BLOCK))?;
+        let mut queued = Vec::with_capacity(32);
+        let drain = |queued: &mut Vec<(*const u8, u64, usize, bool)>, pairs: &mut Vec<(u64,u64)>| {
+            for (name, hash, row, right) in queued.drain(..) {
+                let user = unsafe { keys::finish_long_user(name, hash) };
+                if right { pairs[row].1 = user; } else { pairs[row].0 = user; }
+            }
+        };
+        block.raw_lines::<2>(|buf, start, seps| unsafe {
+            let (left, nl) = scan::field(buf, start, seps, 0);
+            let (right, nr) = scan::field(buf, start, seps, 1);
+            if nl == 0 || nr == 0 { return; }
+            let row = pairs.len();
+            let mut user = |p,n,is_right| {
+                if n == 33 && shared.defer_long_events {
+                    queued.push((p, keys::prepare_long_user(p), row, is_right));
+                    1
+                } else { keys::pack_user(p,n) }
             };
-            block.raw_lines::<2>(|buf, start, seps| unsafe {
-                let (left, nl) = scan::field(buf, start, seps, 0);
-                let (right, nr) = scan::field(buf, start, seps, 1);
-                if nl == 0 || nr == 0 { return; }
-                let row = pairs.len();
-                let mut user = |p,n,is_right| {
-                    if n == 33 && shared.defer_long_events {
-                        queued.push((p, keys::prepare_long_user(p), row, is_right));
-                        1
-                    } else { keys::pack_user(p,n) }
-                };
-                let a = user(left,nl,false);
-                let b = user(right,nr,true);
-                pairs.push((a,b));
-                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
-            });
-            drain(&mut queued, &mut pairs);
-            start = end;
-        }
+            let a = user(left,nl,false);
+            let b = user(right,nr,true);
+            pairs.push((a,b));
+            if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
+        });
+        drain(&mut queued, &mut pairs);
     }
     pairs.retain(|&(a,b)| a != 0 && b != 0 && a != b);
     Ok(pairs)
@@ -879,7 +875,7 @@ type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
 fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
     let began = Instant::now();
-    let own = read_links(shared, &mut block, worker, threads).unwrap_or_else(|error| {
+    let own = read_links(shared, &mut block).unwrap_or_else(|error| {
         eprintln!("links: {error}");
         std::process::exit(1);
     });
@@ -1724,6 +1720,14 @@ fn main() -> io::Result<()> {
     let person_bits = partition_bits(if medium && !fine { 4 << 20 } else { 1 << 20 });
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
+    let link_files = csv_files(&data.join("links"))?.iter()
+        .map(|path| Source::open(path, true)).collect::<io::Result<Vec<_>>>()?;
+    let mut link_blocks = Vec::new();
+    for (file, source) in link_files.iter().enumerate() {
+        for start in (0..source.size).step_by(LINK_BLOCK as usize) {
+            link_blocks.push((file, start));
+        }
+    }
     let shared = Shared {
         window_start,
         window_end,
@@ -1736,7 +1740,9 @@ fn main() -> io::Result<()> {
         files,
         work,
         next: AtomicUsize::new(0),
-        link_files: csv_files(&data.join("links"))?,
+        link_files,
+        link_blocks,
+        next_link: AtomicUsize::new(0),
         defer_long_events: copies == 1,
         id_bits: tune("SS_ID_BITS", id_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", person_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
