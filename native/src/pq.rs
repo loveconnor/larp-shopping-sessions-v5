@@ -376,9 +376,22 @@ impl Writer {
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
-                Kind::Date | Kind::Int32 | Kind::Int64 => {
-                    delta_binary_packed(&mut body, &column.ints);
-                    Self::page(&mut self.out, &body, rows, false, 5);
+                Kind::Date | Kind::Int32 => {
+                    body.resize(rows * 4, 0);
+                    for (bytes, &v) in body.chunks_exact_mut(4).zip(&column.ints) {
+                        bytes.copy_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    Self::page(&mut self.out, &body, rows, false, 0);
+                }
+                Kind::Int64 => {
+                    #[cfg(target_endian = "little")]
+                    let bytes = unsafe { std::slice::from_raw_parts(column.ints.as_ptr().cast::<u8>(), rows * 8) };
+                    #[cfg(target_endian = "big")]
+                    let bytes = {
+                        body.extend(column.ints.iter().flat_map(|v| v.to_le_bytes()));
+                        &body[..]
+                    };
+                    Self::page(&mut self.out, bytes, rows, false, 0);
                 }
             }
             chunks.push(ChunkMeta {
@@ -440,8 +453,8 @@ impl Writer {
                     Kind::Text => (6, &[0]),
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
-                    Kind::Date | Kind::Int32 => (1, &[5]),
-                    Kind::Int64 => (2, &[5]),
+                    Kind::Date | Kind::Int32 => (1, &[0]),
+                    Kind::Int64 => (2, &[0]),
                 };
                 meta.begin(0);
                 meta.i64(2, chunk.offset as i64);
