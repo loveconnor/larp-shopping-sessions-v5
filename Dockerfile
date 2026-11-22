@@ -16,14 +16,16 @@ RUN case "$TARGETARCH" in \
     fi && \
     rustup target add "$target" && printf '%s\n%s\n' "$target" "$linker" > /target-info
 COPY native/ ./
-# x86-64-v3 (AVX2, BMI2): every scorer machine is Cascade Lake or newer.
+# Build the ranked v3/v4 sources first. Only the final wide build applies the
+# changes measured on byte-compression-capable AMD hosts.
 RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
     mkdir -p /app && \
     if [ "$TARGETARCH" = amd64 ]; then \
+        apt-get update && apt-get install -y --no-install-recommends patch && \
         for level in base v3 v4 wide; do \
             cpu=x86-64-$level; profile=v5; features=; \
-            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
+            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
             RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
