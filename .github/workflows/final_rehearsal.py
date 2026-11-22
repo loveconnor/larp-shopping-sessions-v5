@@ -49,7 +49,9 @@ for seed in seeds:
         for label in order:
             out, scratch = root/f"{label}-out", root/f"{label}-scratch"
             for path in [out, scratch]:
-                if path.exists(): shutil.rmtree(path)
+                if path.exists():
+                    # Container UID 1000 owns its Parquet subdirectories.
+                    subprocess.run(["sudo", "rm", "-rf", "--", str(path)], check=True)
                 path.mkdir()
                 path.chmod(0o777)
             seconds = elapsed(label,out,scratch)
