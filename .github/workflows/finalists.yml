@@ -1,7 +1,7 @@
 name: Rehearse three final datasets with nine interleaved runs per commit on one host
 on:
   push:
-    branches: [bench/final-rehearsal]
+    branches: [bench/family19-profile-finals]
 permissions:
   contents: read
 jobs:
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["405799,570233,734709", "825601,604721,311137", "674971,296227,552169", "847697,428779,219133"]
+        seed_list: ["913393,492713,560447", "819703,329791,107417", "206833,419033,210671", "210481,779189,409987", "207257,569303,684257", "795727,339391,282089"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 5c85f9fad2efdec48ab64255fecdb25320a87935
+      CANDIDATE: 846a15a7bd3eda7a2a04581f25b48087093b42ea
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,18 +36,26 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
-          cat > "$RUNNER_TEMP/which-engine.c" <<'EOF'
-          #include <stdio.h>
-          int main(void) {
-              puts(__builtin_cpu_supports("x86-64-v4") ? (__builtin_cpu_supports("avx512vbmi2") ? "wide" : "n4") : (__builtin_cpu_supports("x86-64-v3") ? "v3" : "base"));
-          }
+          lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
+          for engine in base v3 v4 n4 wide; do
+            cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/candidate/shopping-sessions.$engine"
+          done
+          probe="$RUNNER_TEMP/selector-probe"
+          mkdir "$probe"
+          cp "$RUNNER_TEMP/candidate/shopping-sessions" "$probe/selector"
+          for engine in base v3 v4 n4 wide p19; do
+            cat > "$probe/selector.$engine" <<'EOF'
+          #!/bin/sh
+          echo "${0##*.}"
           EOF
-          cc "$RUNNER_TEMP/which-engine.c" -o "$RUNNER_TEMP/which-engine"
-          level=$("$RUNNER_TEMP/which-engine")
-          echo "Selected CPU engine $level"
-          sha256sum "$RUNNER_TEMP/ranked/shopping-sessions.$level" "$RUNNER_TEMP/candidate/shopping-sessions.$level"
+            chmod +x "$probe/selector.$engine"
+          done
+          selected=$("$probe/selector")
+          echo "Actual selector chose $selected"
+          echo "SELECTED=$selected" >> "$GITHUB_ENV"
           docker tag ranked control
       - name: Generate fresh data
+        if: env.SELECTED == 'p19'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
@@ -57,4 +65,5 @@ jobs:
           cargo build --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml"
           python -m pip install --quiet duckdb==1.4.5
       - name: Measure the mean of the three per-dataset medians
+        if: env.SELECTED == 'p19'
         run: python "$GITHUB_WORKSPACE/.github/workflows/final_rehearsal.py"
