@@ -176,6 +176,84 @@ fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) 
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod revenue_stream {
+    use std::arch::x86_64::*;
+
+    struct Layout {
+        shifts: [u32; 8],
+        left: [u8; 32],
+        right: [u8; 32],
+        seam: [u8; 16],
+    }
+
+    const fn layout(width: usize) -> Layout {
+        let mut p = Layout { shifts: [0; 8], left: [128; 32], right: [128; 32], seam: [128; 16] };
+        let mut i = 0;
+        while i < 8 {
+            p.shifts[i] = ((i * width) % 8) as u32;
+            i += 1;
+        }
+        let split = width / 2;
+        if width % 2 != 0 { p.seam[0] = split as u8; }
+        let mut byte = 0;
+        while byte < width {
+            let lane = byte * 8 / width;
+            let lane_base = if lane < 4 { 0 } else { split };
+            let dst = 16 * (lane / 4) + byte - lane_base;
+            p.left[dst] = (4 * (lane % 4) + byte - (lane * width / 8)) as u8;
+            if lane < 7 && (lane + 1) * width < (byte + 1) * 8 {
+                let next = lane + 1;
+                let next_base = if next < 4 { 0 } else { split };
+                let dst = 16 * (next / 4) + byte - next_base;
+                p.right[dst] = (4 * (next % 4)) as u8;
+            }
+            byte += 1;
+        }
+        p
+    }
+
+    const LAYOUTS: [Layout; 8] = {
+        let mut plans = [const { layout(17) }; 8];
+        let mut i = 0;
+        while i < 8 { plans[i] = layout(i + 17); i += 1; }
+        plans
+    };
+
+    /// Shift the low dword of each adjusted delta to its byte offset. The two
+    /// 128-bit shuffle lanes each produce four packed values and share at most
+    /// one output byte. The final unaligned store uses allocated tail space.
+    pub fn append(out: &mut Vec<u8>, deltas: &[i64], least: i64, width: usize) {
+        debug_assert_eq!(deltas.len(), 32);
+        let plan = &LAYOUTS[width - 17];
+        let start = out.len();
+        let size = 4 * width;
+        out.reserve(size + 16);
+        unsafe {
+            let shifts = _mm256_loadu_si256(plan.shifts.as_ptr().cast());
+            let left = _mm256_loadu_si256(plan.left.as_ptr().cast());
+            let right = _mm256_loadu_si256(plan.right.as_ptr().cast());
+            let seam = _mm_loadu_si128(plan.seam.as_ptr().cast());
+            let bias = _mm256_set1_epi32(least as i32);
+            let mut dst = out.as_mut_ptr().add(start);
+            for group in deltas.chunks_exact(8) {
+                let a = _mm256_loadu_si256(group.as_ptr().cast());
+                let b = _mm256_loadu_si256(group.as_ptr().add(4).cast());
+                let halves = _mm256_shuffle_ps::<0x88>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b));
+                let words = _mm256_permute4x64_epi64::<0xd8>(_mm256_castps_si256(halves));
+                let shifted = _mm256_sllv_epi32(_mm256_sub_epi32(words, bias), shifts);
+                let pieces = _mm256_or_si256(_mm256_shuffle_epi8(shifted, left), _mm256_shuffle_epi8(shifted, right));
+                let lo = _mm256_castsi256_si128(pieces);
+                let hi = _mm_or_si128(_mm256_extracti128_si256::<1>(pieces), _mm_shuffle_epi8(lo, seam));
+                _mm_storeu_si128(dst.cast(), lo);
+                _mm_storeu_si128(dst.add(width / 2).cast(), hi);
+                dst = dst.add(width);
+            }
+            out.set_len(start + size);
+        }
+    }
+}
+
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
 /// miniblock packed at the width its largest delta above the block's minimum needs.
 fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
@@ -211,6 +289,11 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
             if widths[mini] == 0 { continue; }
             if from + MINI <= count {
                 let group = &deltas[from..from + MINI];
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                if (17..=24).contains(&widths[mini]) {
+                    revenue_stream::append(out, group, least, widths[mini] as usize);
+                    continue;
+                }
                 match widths[mini] {
                     1 => { pack_eight::<1>(out, group, least); continue; }
                     2 => { pack_eight::<2>(out, group, least); continue; }
@@ -563,6 +646,32 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn vector_revenue_stream_matches_every_output_bit() {
+        let mut state = 930815u64;
+        for width in 17..=24 {
+            let mask = (1u64 << width) - 1;
+            for least in [i64::MIN, -1, 0, 547, i64::MAX] {
+                for bit in 0..width {
+                    let mut offsets = [0; 32];
+                    for (i, value) in offsets.iter_mut().enumerate() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *value = match i % 4 { 0 => mask, 1 => 1 << bit, 2 => 0, _ => state & mask };
+                    }
+                    let deltas = offsets.map(|v| least.wrapping_add(v as i64));
+                    let mut expected = vec![9, 1, 3];
+                    let mut actual = expected.clone();
+                    pack(&mut expected, offsets.into_iter(), width as u32);
+                    revenue_stream::append(&mut actual, &deltas, least, width);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
     }
 
     #[test]
