@@ -225,6 +225,19 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
 unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) -> usize {
     unsafe {
         let count = bits.count_ones() as usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if UNROLL == 7 && count <= 7 {
+            use std::arch::x86_64::*;
+            let mut relative = [0u8; 8];
+            for slot in &mut relative[..7] {
+                *slot = bits.trailing_zeros() as u8;
+                bits &= bits.wrapping_sub(1);
+            }
+            let packed = _mm_cvtsi64_si128(i64::from_le_bytes(relative));
+            let positions = _mm256_cvtepu8_epi32(packed);
+            _mm256_storeu_si256(out.cast(), _mm256_add_epi32(positions, _mm256_set1_epi32(base as i32)));
+            return count;
+        }
         for at in 0..UNROLL {
             *out.add(at) = base + bits.trailing_zeros();
             bits &= bits.wrapping_sub(1);
