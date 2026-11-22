@@ -239,6 +239,40 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Eight ISO ingestion clocks share the date dictionary of this parser.
+#[cfg(all(target_arch="x86_64",target_feature="avx512bw"))]
+#[inline]
+pub unsafe fn ingest_eight(base:*const u8, starts:&[u32;8], lengths:&[u32;8], dates:&mut Dates) -> [i64;8] {
+    unsafe {
+        use std::arch::x86_64::*;
+        let offsets = _mm256_loadu_si256(starts.as_ptr().cast());
+        let prefix = _mm512_i32gather_epi64::<1>(offsets,base.cast());
+        let body = _mm512_i32gather_epi64::<1>(offsets,base.add(8).cast());
+        let tail = _mm512_i32gather_epi64::<1>(offsets,base.add(16).cast());
+        let byte = _mm512_set1_epi64(15);
+        // In each lane the body is DDTHH:MM and the tail begins :SSZ.
+        let pair = |a,b| _mm512_add_epi64(_mm512_mullo_epi32(a,_mm512_set1_epi64(10)),b);
+        let day = pair(_mm512_and_si512(body,byte),_mm512_and_si512(_mm512_srli_epi64::<8>(body),byte));
+        let hour = pair(_mm512_and_si512(_mm512_srli_epi64::<24>(body),byte),_mm512_and_si512(_mm512_srli_epi64::<32>(body),byte));
+        let minute = pair(_mm512_and_si512(_mm512_srli_epi64::<48>(body),byte),_mm512_and_si512(_mm512_srli_epi64::<56>(body),byte));
+        let second = pair(_mm512_and_si512(_mm512_srli_epi64::<8>(tail),byte),_mm512_and_si512(_mm512_srli_epi64::<16>(tail),byte));
+        let bounded = _mm512_min_epu64(day,_mm512_set1_epi64((dates.month.len()-1) as i64));
+        let index = _mm512_cvtepi64_epi32(bounded);
+        let months = _mm512_i32gather_epi64::<8>(index,dates.month.as_ptr().cast());
+        let midnight = _mm512_i32gather_epi64::<8>(index,dates.midnight.as_ptr());
+        let z = _mm512_and_si512(_mm512_srli_epi64::<24>(tail),_mm512_set1_epi64(255));
+        let ok = _mm512_cmpeq_epi64_mask(months,prefix) & _mm512_cmpeq_epi64_mask(day,bounded) & _mm512_cmpeq_epi64_mask(z,_mm512_set1_epi64(90));
+        let times = _mm512_add_epi64(_mm512_add_epi64(_mm512_mullo_epi32(hour,_mm512_set1_epi64(3600)),_mm512_mullo_epi32(minute,_mm512_set1_epi64(60))),second);
+        let sec = _mm512_add_epi64(midnight,times);
+        let mut result = [0i64;8];
+        _mm512_storeu_si512(result.as_mut_ptr().cast(),_mm512_mullo_epi64(sec,_mm512_set1_epi64(1000)));
+        for i in 0..8 {
+            if lengths[i] != 20 || ok & (1<<i)==0 {result[i]=ingest(base.add(starts[i] as usize),lengths[i] as usize,dates);}
+        }
+        result
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {

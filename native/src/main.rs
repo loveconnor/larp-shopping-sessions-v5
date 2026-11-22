@@ -701,7 +701,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
+    let mut consume = |buf:*const u8, start:u32, seps:&[u32;7], supplied:Option<i64>, dates:&mut ts::Dates| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
@@ -719,7 +719,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             (id, id.wrapping_mul(MIX))
         };
         let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
+        let ingest = supplied.unwrap_or_else(|| ts::ingest(p,n,dates));
         if ingest == ts::BAD {
             return;
         }
@@ -771,7 +771,33 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 queued = 0;
             }
         }
-    });
+    };
+    #[cfg(all(target_arch="x86_64",target_feature="avx512bw",target_feature="avx512dq"))]
+    {
+        let mut rows=[(0u32,[0u32;7]);8];
+        let mut used=0;
+        let mut base=std::ptr::null();
+        block.raw_lines::<7>(|buf,start,seps| {
+            base=buf;
+            rows[used]=(start,*seps);
+            used+=1;
+            if used==8 {
+                let mut starts=[0;8];
+                let mut lengths=[0;8];
+                for (i,(line,fields)) in rows.iter().enumerate() {
+                    let (from,to)=unsafe {scan::bounds(buf,*line,fields,3)};
+                    starts[i]=from;
+                    lengths[i]=to-from;
+                }
+                let ingests=unsafe {ts::ingest_eight(buf,&starts,&lengths,dates)};
+                for ((line,fields),ingest) in rows.iter().zip(ingests) {consume(buf,*line,fields,Some(ingest),dates);}
+                used=0;
+            }
+        });
+        for (start,seps) in &rows[..used] {consume(base,*start,seps,None,dates);}
+    }
+    #[cfg(not(all(target_arch="x86_64",target_feature="avx512bw",target_feature="avx512dq")))]
+    block.raw_lines::<7>(|buf,start,seps| consume(buf,start,seps,None,dates));
     drain(&lookups[..queued]);
 }
 
