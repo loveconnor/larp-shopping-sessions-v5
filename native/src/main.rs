@@ -64,13 +64,9 @@ const OFFSET_BITS: u32 = 9;
 struct Buckets<T: Copy> {
     /// Where each partition's next record goes.
     next: Vec<*mut T>,
-    /// Each partition's newest chunk, and how many chunks it has.
-    head: Vec<u32>,
-    chunks: Vec<u32>,
+    /// Chunk bases in allocation order for each partition.
+    by_partition: Vec<Vec<*mut T>>,
     slabs: Vec<Vec<u8>>,
-    /// Every chunk's first record, and the chunk before it in its partition.
-    bases: Vec<*mut T>,
-    previous: Vec<u32>,
     /// Chunks carved from our own slabs so far.
     carved: usize,
     /// Donated memory, each stretch a whole aligned chunk.
@@ -92,11 +88,8 @@ impl<T: Copy> Buckets<T> {
         Self {
             // A position that reads as a full chunk, so the first push grows.
             next: vec![Self::FILL as *mut T; parts],
-            head: vec![NONE; parts],
-            chunks: vec![0; parts],
+            by_partition: vec![Vec::new(); parts],
             slabs: Vec::new(),
-            bases: Vec::new(),
-            previous: Vec::new(),
             carved: 0,
             spare: Vec::new(),
         }
@@ -151,11 +144,7 @@ impl<T: Copy> Buckets<T> {
                 base
             }
         };
-        let chunk = self.bases.len() as u32;
-        self.bases.push(base);
-        self.previous.push(self.head[part]);
-        self.head[part] = chunk;
-        self.chunks[part] += 1;
+        self.by_partition[part].push(base);
         base
     }
 
@@ -169,20 +158,44 @@ impl<T: Copy> Buckets<T> {
 
     /// Appends every chunk of `part` to `out` as (first record, count).
     fn chunks(&self, part: usize, out: &mut Vec<(*mut T, usize)>) {
-        let mut chunk = self.head[part];
-        if chunk == NONE {
-            return;
-        }
-        let base = self.bases[chunk as usize];
-        out.push((base, unsafe { self.next[part].offset_from(base) } as usize));
-        loop {
-            chunk = self.previous[chunk as usize];
-            if chunk == NONE {
-                break;
-            }
-            out.push((self.bases[chunk as usize], Self::CAPACITY));
+        if let Some((&last, full)) = self.by_partition[part].split_last() {
+            out.push((last, unsafe { self.next[part].offset_from(last) } as usize));
+            out.extend(full.iter().rev().map(|&base| (base, Self::CAPACITY)));
         }
     }
+}
+
+#[test]
+fn partition_directory_visits_each_live_row_once() {
+    fn check<const WORDS: usize>() {
+        let mut buckets = Buckets::<[u32; WORDS]>::new(7);
+        let n = 4 * Buckets::<[u32; WORDS]>::CAPACITY + 1;
+        let mut expected = vec![Vec::new(); 7];
+        let mut addresses = Vec::new();
+        for i in 0..n {
+            for part in [0, 2, 5] {
+                let value = (i * 7 + part) as u32;
+                addresses.push((buckets.push(part, [value; WORDS]), value));
+                expected[part].push(value);
+            }
+        }
+        for (ptr, value) in addresses {
+            unsafe { assert_eq!((*ptr)[0], value); (*ptr)[WORDS - 1] = !value; }
+        }
+        for (part, wanted) in expected.into_iter().enumerate() {
+            let mut chunks = Vec::new();
+            buckets.chunks(part, &mut chunks);
+            let mut values = Vec::new();
+            for (base, count) in chunks.into_iter().rev() {
+                for row in unsafe { std::slice::from_raw_parts(base, count) } {
+                    assert_eq!(row[WORDS - 1], !row[0]);
+                    values.push(row[0]);
+                }
+            }
+            assert_eq!(values, wanted);
+        }
+    }
+    check::<4>(); check::<6>(); check::<7>(); check::<8>();
 }
 
 // ---------------------------------------------------------------- records
@@ -1782,7 +1795,7 @@ fn main() -> io::Result<()> {
     let weight = |part: u32| {
         events
             .iter()
-            .map(|buckets| buckets.chunks[part as usize] as u64)
+            .map(|buckets| buckets.by_partition[part as usize].len() as u64)
             .sum::<u64>()
     };
     order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
