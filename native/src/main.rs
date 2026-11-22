@@ -364,7 +364,8 @@ impl Links {
         for (id, &up) in parent.iter().enumerate() {
             names[id] = names[up as usize];
         }
-        let count = aliases.div_ceil(2).next_power_of_two().max(2);
+        let per_group = tune("SS_ALIASES_PER_GROUP", 2).clamp(1, 3) as usize;
+        let count = aliases.div_ceil(per_group).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
@@ -918,6 +919,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
+    let load_quarters = tune("SS_DEDUP_TABLE_QUARTERS", 8).clamp(4, 32) as usize;
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
@@ -940,7 +942,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
-        let capacity = (total * 2).next_power_of_two();
+        let capacity = (total * load_quarters).div_ceil(4).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
         table.resize(capacity, NONE);
@@ -1399,6 +1401,7 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
+    let group_divisor = tune("SS_GROUP_DIVISOR", 4).clamp(1, 64) as usize;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1411,7 +1414,7 @@ fn session_worker(
         }
 
         // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
+        let mut capacity = (total / group_divisor + 16).next_power_of_two();
         let mut mask = capacity - 1;
         table_keys.clear();
         table_keys.resize(capacity, 0);
