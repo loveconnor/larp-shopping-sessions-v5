@@ -92,9 +92,15 @@ static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::n
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
         let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
-        let mut slots = Vec::with_capacity(size);
-        slots.resize_with(size, || UserSlot { tag: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
-        slots.into_boxed_slice()
+        // All-zero bytes represent an empty atomic tag and a zeroed inline name.
+        // Let workers fault in the table as they populate it, including its NUMA placement.
+        let layout = std::alloc::Layout::array::<UserSlot>(size).unwrap();
+        unsafe {
+            let slots = std::alloc::alloc_zeroed(layout).cast::<UserSlot>();
+            if slots.is_null() { std::alloc::handle_alloc_error(layout); }
+            crate::huge(slots.cast(), layout.size());
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(slots, size))
+        }
     });
 }
 
