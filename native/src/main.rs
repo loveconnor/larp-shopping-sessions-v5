@@ -629,6 +629,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 
 struct EventSource {
     buckets: Buckets<Parsed>,
+    users: Vec<[u8; 33]>,
     names: Vec<[u8; 33]>,
 }
 
@@ -662,7 +663,12 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let user = if n == 33 && shared.defer_long_events {
+            let home = keys::user_home(p) as u64;
+            let index = u32::try_from(out.users.len()).expect("too many deferred user names");
+            out.users.push(*p.cast::<[u8; 33]>());
+            LONG_EVENT | (home << 32) | u64::from(index)
+        } else { keys::pack_user(p, n) };
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
@@ -799,7 +805,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), users: Vec::new(), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -886,7 +892,24 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
+            for (&(base, count), &owner) in chunks.iter().zip(&owners) {
+                if shared.defer_long_events {
+                    let names = &sources[owner].users;
+                    for offset in 0..count {
+                        if offset + ahead < count {
+                            let future = (*base.add(offset + ahead)).user;
+                            if future & LONG_EVENT == LONG_EVENT {
+                                keys::prefetch_user_home(((future & !LONG_EVENT) >> 32) as usize);
+                                prefetch(&names[future as u32 as usize]);
+                            }
+                        }
+                        let record = &mut *base.add(offset);
+                        let user = record.user;
+                        if user & LONG_EVENT == LONG_EVENT && record.ts != DEAD {
+                            record.user = keys::pack_user(names[user as u32 as usize].as_ptr(), 33);
+                        }
+                    }
+                }
                 for offset in 0..count {
                     if offset + ahead < count {
                         links.prefetch((*base.add(offset + ahead)).user);
