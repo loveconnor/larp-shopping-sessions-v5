@@ -925,6 +925,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    let mut controls: Vec<u64> = Vec::new();
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const ONES: u64 = 0x0101_0101_0101_0101;
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -940,8 +943,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
-        let capacity = (total * 2).next_power_of_two();
-        let mask = capacity - 1;
+        let capacity = (total * 2).max(8).next_power_of_two();
+        let mask = capacity / 8 - 1;
+        controls.clear();
+        controls.resize(capacity / 8, 0);
         table.clear();
         table.resize(capacity, NONE);
         unsafe {
@@ -952,46 +957,60 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
-                    loop {
-                        let seen = *table.get_unchecked(slot);
-                        if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
-                            break;
-                        }
-                        let other = chunks
-                            .get_unchecked((seen >> OFFSET_BITS) as usize)
-                            .0
-                            .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
-                        let other_id = (*other).id;
-                        let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
-                        } else {
-                            id == other_id
-                        };
-                        if equal {
-                            let a = (*record).ingest;
-                            let b = (*other).ingest;
-                            let earlier = if (a | b) < OVERFLOW_TIME {
-                                a < b
+                    let hash = hash_key.wrapping_mul(MIX);
+                    let tag = (hash as u8 | 128) as u64;
+                    let mut group = (hash >> 24) as usize & mask;
+                    'probe: loop {
+                        let bytes = *controls.get_unchecked(group);
+                        let delta = bytes ^ (tag * ONES);
+                        let mut matches = (delta.wrapping_sub(ONES) & !delta & HIGH) & bytes;
+                        while matches != 0 {
+                            let lane = matches.trailing_zeros() as usize / 8;
+                            matches &= matches - 1;
+                            let slot = 8 * group + lane;
+                            let seen = *table.get_unchecked(slot);
+                            let other = chunks
+                                .get_unchecked((seen >> OFFSET_BITS) as usize)
+                                .0
+                                .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
+                            let other_id = (*other).id;
+                            let equal = if long {
+                                // Equal fingerprints select candidates. Only the full bytes
+                                // decide whether these two records are duplicates.
+                                id >> 32 == other_id >> 32
+                                    && sources[owners[index]].names[id as u32 as usize]
+                                        == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
                             } else {
-                                let origin = shared.window_start - DAY;
-                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
-                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                id == other_id
                             };
-                            if earlier {
-                                (*other).ts = DEAD;
-                                *table.get_unchecked_mut(slot) = entry;
-                            } else {
-                                (*record).ts = DEAD;
+                            if equal {
+                                let a = (*record).ingest;
+                                let b = (*other).ingest;
+                                let earlier = if (a | b) < OVERFLOW_TIME {
+                                    a < b
+                                } else {
+                                    let origin = shared.window_start - DAY;
+                                    decode_ingest(a, origin, &sources[owners[index]].overflow_times)
+                                        < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                };
+                                if earlier {
+                                    (*other).ts = DEAD;
+                                    *table.get_unchecked_mut(slot) = entry;
+                                } else {
+                                    (*record).ts = DEAD;
+                                }
+                                break 'probe;
                             }
+                        }
+                        // Occupied control bytes always have the high bit set.
+                        let empty = !bytes & HIGH;
+                        if empty != 0 {
+                            let shift = empty.trailing_zeros() & !7;
+                            *controls.get_unchecked_mut(group) = bytes | (tag << shift);
+                            *table.get_unchecked_mut(8 * group + shift as usize / 8) = entry;
                             break;
                         }
-                        slot = (slot + 1) & mask;
+                        group = (group + 1) & mask;
                     }
                 }
             }
