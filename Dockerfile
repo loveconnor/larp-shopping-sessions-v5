@@ -24,9 +24,9 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     if [ "$TARGETARCH" = amd64 ]; then \
         apt-get update && apt-get install -y --no-install-recommends patch && \
         for level in base v3 v4 wide; do \
-            cpu=x86-64-$level; profile=v5; features=; \
-            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
-            RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
+            cpu=x86-64-$level; profile=v5; features=; tune=znver3; \
+            case "$level" in base) cpu=x86-64; tune=generic ;; v4) profile=v4; tune=icelake-server ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide; tune=znver4 ;; esac; \
+            RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Z tune-cpu=$tune -C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
         done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
