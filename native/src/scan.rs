@@ -541,24 +541,47 @@ impl Block {
                         let after = *p.add(64);
                         let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
                         let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
-                        let quote_before = (quote << 1) | u64::from(before == b'"');
-                        let quote_after = (quote >> 1) | (u64::from(after == b'"') << 63);
-                        let opening = quote & sep_before;
-                        let closing = quote & sep_after;
-                        let mut wrong = (quote & !(opening | closing)) | (opening & closing);
-                        // The separator ending each field that opened with a quote,
-                        // found by a carry through the run of non-separators after
-                        // it; it must be a separator right after a closing quote.
-                        // A field opening at the chunk's first byte counts here,
-                        // not in the chunk before: that one may have skipped
-                        // these checks for having no quotes.
-                        let opens = sep & quote_after & !(1u64 << 63);
-                        let first_opens = opening & 1;
-                        let (sum, over) = (!sep).overflowing_add(opens << 1);
-                        let (sum, over2) = sum.overflowing_add(carry | first_opens);
-                        let closes = sum & sep;
-                        wrong |= closes ^ (sep & quote_before);
-                        carry = u64::from(over | over2);
+                        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+                        let wrong = {
+                            use std::arch::x86_64::*;
+                            // Multiplication by a polynomial of all ones gives
+                            // the inclusive prefix XOR of the quote mask.
+                            let prefix = _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(
+                                _mm_cvtsi64_si128(quote as i64), _mm_set1_epi64x(-1))) as u64;
+                            let parity = prefix ^ 0u64.wrapping_sub(carry);
+                            let opening = quote & sep_before;
+                            let closing = quote & sep_after;
+                            // Inside a valid field quotes can occur only at its
+                            // two distinct boundaries. Every delimiter must be
+                            // at even quote parity. A bad chunk is reparsed.
+                            let wrong = (quote ^ (opening ^ closing)) | (parity & sep);
+                            let last_separator = (1u64 << 63) >> sep.leading_zeros().min(63);
+                            let at_last = u64::from(sep != 0 && parity & last_separator != 0);
+                            carry = (parity >> 63) ^ at_last;
+                            wrong
+                        };
+                        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+                        let wrong = {
+                            let quote_before = (quote << 1) | u64::from(before == b'"');
+                            let quote_after = (quote >> 1) | (u64::from(after == b'"') << 63);
+                            let opening = quote & sep_before;
+                            let closing = quote & sep_after;
+                            let mut wrong = (quote & !(opening | closing)) | (opening & closing);
+                            // The separator ending each field that opened with a quote,
+                            // found by a carry through the run of non-separators after
+                            // it; it must be a separator right after a closing quote.
+                            // A field opening at the chunk's first byte counts here,
+                            // not in the chunk before: that one may have skipped
+                            // these checks for having no quotes.
+                            let opens = sep & quote_after & !(1u64 << 63);
+                            let first_opens = opening & 1;
+                            let (sum, over) = (!sep).overflowing_add(opens << 1);
+                            let (sum, over2) = sum.overflowing_add(carry | first_opens);
+                            let closes = sum & sep;
+                            wrong |= closes ^ (sep & quote_before);
+                            carry = u64::from(over | over2);
+                            wrong
+                        };
                         if wrong != 0 {
                             bad.push(at);
                         }
