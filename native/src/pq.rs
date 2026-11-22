@@ -193,7 +193,25 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
             widths[mini] = width(most) as u8;
         }
         out.extend_from_slice(&widths);
+        deltas[count..minis*MINI].fill(least);
         for mini in 0..minis {
+            #[cfg(all(target_arch="x86_64",target_feature="avx512bw",target_feature="bmi2"))]
+            if widths[mini]<=8 {
+                let bits=usize::from(widths[mini]);
+                if bits==0 {continue;}
+                let mask=((1u64<<bits)-1)*0x0101_0101_0101_0101;
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let low=_mm512_set1_epi64(least);
+                    for tile in deltas[mini*MINI..(mini+1)*MINI].chunks_exact(8) {
+                        let words=_mm512_sub_epi64(_mm512_loadu_si512(tile.as_ptr().cast()),low);
+                        let bytes=_mm_cvtsi128_si64(_mm512_cvtepi64_epi8(words)) as u64;
+                        let packed=_pext_u64(bytes,mask);
+                        out.extend_from_slice(&packed.to_le_bytes()[..bits]);
+                    }
+                }
+                continue;
+            }
             // A short last miniblock is padded with zeros to its full 32 values.
             let from = mini * MINI;
             let packed = (from..from + MINI).map(|slot| {
