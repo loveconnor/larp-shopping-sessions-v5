@@ -82,6 +82,9 @@ const FIXED_USER: u64 = 1 << 61;
 #[repr(C, align(64))]
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
+    // The full spelling remains contiguous; its 32-byte suffix starts at
+    // byte 32 in this cache line for a single aligned comparison.
+    _pad: [u8;23],
     name: std::cell::UnsafeCell<[u8; 33]>,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
@@ -130,7 +133,9 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
 unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
-    let hash = (mixed ^ (mixed >> 31)) | 2;
+    // The high bit reserves the publication sentinels. The low byte
+    // records the complete prefix, leaving only the suffix to compare.
+    let hash = (1u64 << 63) | ((mixed ^ (mixed >> 31)) & !255) | u64::from(bytes[0]);
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
     for _ in 0..12 {
@@ -150,7 +155,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
             std::hint::spin_loop();
             tag = slot.tag.load(Acquire);
         }
-        if tag == hash && unsafe { *slot.name.get() == *bytes } {
+        if tag == hash && unsafe { (&*slot.name.get())[1..] == bytes[1..] } {
             return INTERNED | FIXED_USER | at as u64;
         }
         at = (at + 1) & mask;
@@ -175,6 +180,24 @@ fn name(key: u64) -> &'static [u8] {
     }
     let shard = (key & 255) as usize;
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
+}
+
+/// Pack two nine-byte ASCII IDs after a shared validation of both words.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+pub unsafe fn pair_nine(a: *const u8, b: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let x = unsafe { a.cast::<u64>().read_unaligned() };
+    let y = unsafe { b.cast::<u64>().read_unaligned() };
+    let words = _mm_set_epi64x(y as i64,x as i64);
+    // Signed positive bytes are precisely the supported range 1..=127.
+    let valid = _mm_movemask_epi8(_mm_cmpgt_epi8(words,_mm_setzero_si128())) == 65535;
+    let (last_a, last_b) = unsafe { (*a.add(8), *b.add(8)) };
+    if valid && last_a.wrapping_sub(1) < 127 && last_b.wrapping_sub(1) < 127 {
+        const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        Some(((_pext_u64(x.swap_bytes(),LOW)<<7)|u64::from(last_a),
+              (_pext_u64(y.swap_bytes(),LOW)<<7)|u64::from(last_b)))
+    } else { None }
 }
 
 /// The key of the `len` bytes at `p`. At least 9 bytes must be readable at `p`.
