@@ -499,6 +499,9 @@ impl Block {
             }
             let end = end as u32;
             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            // The portable mask enumerator benefits from fixed-stride rows.
+            // Hardware byte compression already handles the wide engine.
+            let regular = cfg!(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw"))) && !WIDE;
             let mut newline_masks = [0u64; WINDOW];
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
@@ -571,15 +574,19 @@ impl Block {
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
-                    lines += newline.count_ones() as usize;
-                    newline_masks[blocks] = newline;
-                    blocks += 1;
+                    if regular {
+                        lines += newline.count_ones() as usize;
+                        newline_masks[blocks] = newline;
+                        blocks += 1;
+                    } else {
+                        lines += flatten::<2>(newline, at, ends.add(lines));
+                    }
                     at += 64;
                 }
                 // If all expected terminators are newlines, and their number
                 // equals the actual newline count, no row can have an extra
                 // or missing separator. An unfinished last line stays buffered.
-                if bad_at == bad.len() && lines <= count / N {
+                if regular && bad_at == bad.len() && lines <= count / N {
                     let mut mismatch = 0u8;
                     for i in 0..lines {
                         let stop = *out.add((i + 1) * N - 1);
@@ -599,9 +606,11 @@ impl Block {
                 }
                 // Irregular windows recover each real row ending from the
                 // saved masks, including malformed rows across window edges.
-                lines = 0;
-                for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
-                    lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
+                if regular {
+                    lines = 0;
+                    for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
+                        lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
+                    }
                 }
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
