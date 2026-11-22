@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 694241}
-          - {events: 60000000, format: current, seed: 694241}
-          - {events: 20000000, format: current, seed: 694447}
-          - {events: 60000000, format: current, seed: 694447}
+          - {events: 20000000, format: current, seed: 704281}
+          - {events: 60000000, format: current, seed: 704281}
+          - {events: 20000000, format: current, seed: 704497}
+          - {events: 60000000, format: current, seed: 704497}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 2495dfc9e31fe401f60bade9b07508a5933a2766
-      CANDIDATE: 0660c6ff3f958fd0585b2588540b6f92679bb9ca
+      CANDIDATE: 6af8ed2142b6d557ac13c3b65832453f810113a6
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +33,7 @@ jobs:
           for label in ranked candidate v4; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=3be21c50098eab6549cddd61447a51fa0f9ba7df; fi
+            if [ "$label" = v4 ]; then sha=b8945dd1440fe69d20acf5261ad8ae8341e73026; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
