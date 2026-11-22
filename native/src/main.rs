@@ -287,6 +287,8 @@ struct AliasGroup {
 /// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
     slots: Vec<AliasGroup>,
+    spill_offsets: Vec<u32>,
+    spills: Vec<[u64; 2]>,
     shift: u32,
     empty: bool,
 }
@@ -368,22 +370,39 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
+        let mut overflow = Vec::new();
+        let mut spill_offsets = vec![0u32; count + 1];
+        for (key, person) in slots.into_iter().filter_map(|[key, id]| {
+            (key != 0).then(|| (key, names[id as usize]))
+        }) {
             if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
+            let home = (key.wrapping_mul(MIX) >> shift) as usize;
+            let group = &mut groups[home];
+            if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
+                group.keys[lane] = key;
+                group.values[lane] = person;
+            } else {
+                spill_offsets[home + 1] += 1;
+                overflow.push((home, [key, person]));
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        // End offsets reserve one contiguous range for each overflowing home.
+        for i in 1..spill_offsets.len() {
+            spill_offsets[i] += spill_offsets[i - 1];
+        }
+        let mut spills = vec![[0; 2]; overflow.len()];
+        for (home, entry) in overflow {
+            spill_offsets[home + 1] -= 1;
+            spills[spill_offsets[home + 1] as usize] = entry;
+        }
+        spill_offsets.copy_within(1.., 0);
+        spill_offsets[count] = spills.len() as u32;
+        for range in spill_offsets.windows(2) {
+            if range[1] - range[0] >= 16 {
+                spills[range[0] as usize..range[1] as usize].sort_unstable_by_key(|entry| entry[0]);
+            }
+        }
+        Self { slots: groups, shift, empty: aliases == 0, spill_offsets, spills }
     }
 
     #[inline(always)]
@@ -398,25 +417,33 @@ impl Links {
         if self.empty {
             return key;
         }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
-        loop {
-            let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use std::arch::x86_64::*;
-                let keys = _mm256_load_si256(group.keys.as_ptr().cast());
-                let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
-            }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
-            }
-            if group.keys[3] == 0 { return key; }
-            slot = (slot + 1) & mask;
+        let slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+        let group = unsafe { self.slots.get_unchecked(slot) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let keys = _mm256_load_si256(group.keys.as_ptr().cast());
+            let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
+            let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
+            if found != 0 { return group.values[found.trailing_zeros() as usize]; }
         }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        if let Some(lane) = group.keys.iter().position(|&k| k == key) {
+            return group.values[lane];
+        }
+        if group.keys[3] != 0 {
+            let start = self.spill_offsets[slot] as usize;
+            let end = self.spill_offsets[slot + 1] as usize;
+            let entries = &self.spills[start..end];
+            if entries.len() >= 16 {
+                return entries.binary_search_by_key(&key, |entry| entry[0])
+                    .map_or(key, |index| entries[index][1]);
+            }
+            for &[other, person] in entries {
+                if other == key { return person; }
+            }
+        }
+        key
     }
 }
 
