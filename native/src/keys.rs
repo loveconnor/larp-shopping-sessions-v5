@@ -99,12 +99,26 @@ pub fn prepare_users(bytes: u64) {
 }
 
 #[inline(always)]
+unsafe fn user_hash(p: *const u8) -> u64 {
+    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
+    (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
+        .wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn prefetch_user(p: *const u8) {
+    if let Some(slots) = USER_SLOTS.get() {
+        let at = (unsafe { user_hash(p) } >> 24) as usize & (slots.len() - 1);
+        unsafe { std::arch::x86_64::_mm_prefetch(slots.as_ptr().add(at).cast(), std::arch::x86_64::_MM_HINT_T0); }
+    }
+}
+
+#[inline(always)]
 unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
-    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
-    let mixed = (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
-        .wrapping_mul(0x9e3779b97f4a7c15);
+    let mixed = unsafe { user_hash(p) };
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;

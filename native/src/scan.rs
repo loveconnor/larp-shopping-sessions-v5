@@ -578,6 +578,19 @@ impl Block {
                 bad.push(u32::MAX - 64);
                 let mut sep_at = 0usize;
                 for &stop in std::slice::from_raw_parts(ends, lines) {
+                    // The next candidate boundaries may come from an irregular row.
+                    // Prefetch only when both positions exist and enclose all 33 bytes.
+                    #[cfg(target_arch = "x86_64")]
+                    if N == 7 {
+                        let ahead = sep_at + 8 * N;
+                        if ahead + 1 < count {
+                            let left = *out.add(ahead);
+                            let right = *out.add(ahead + 1);
+                            if right - left == 34 {
+                                crate::keys::prefetch_user(buf.add(left as usize + 1));
+                            }
+                        }
+                    }
                     let start = line;
                     line = stop + 1;
                     while *bad.get_unchecked(bad_at) + 64 <= start {
