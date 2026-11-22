@@ -1,19 +1,19 @@
-name: Collect host-specific Shopping Sessions compiler profiles
+name: Train target-specific profiles using Rust 1.100 and LLVM 23
 on:
   push:
-    branches: [bench/parser-training]
+    branches: [bench/llvm23-training]
 permissions:
   contents: read
 jobs:
   profile:
     strategy:
       matrix:
-        seed: [284239, 284311, 284377]
+        seed: [385699, 385741, 385813]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+          ref: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
@@ -23,18 +23,20 @@ jobs:
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
           rows=20000000
-          if [ ${{ matrix.seed }} = 284377 ]; then rows=60000000; fi
+          if [ ${{ matrix.seed }} = 385813 ]; then rows=60000000; fi
           generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
           mkdir "$RUNNER_TEMP/profile"
-          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
+          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.100-slim-bookworm sh -ec '
             cp -a /src /tmp/native
             cd /tmp/native
             apt-get update -qq && apt-get install -yq --no-install-recommends patch
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
-            for level in v3 v4 wide; do
+            for level in v3 v4 n4 wide; do
               cpu=x86-64-$level
               feature=
+              build_features=
+              if [ "$level" = n4 ]; then cpu=x86-64-v4; build_features="--features narrow-v4"; fi
               if [ "$level" != v3 ]; then
                 grep -qw avx512bw /proc/cpuinfo || continue
               fi
@@ -45,7 +47,7 @@ jobs:
                 feature="-C target-feature=+avx512vbmi2"
               fi
               mkdir /work/profile/$level
-              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --release --locked --target x86_64-unknown-linux-gnu
+              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --release --locked $build_features --target x86_64-unknown-linux-gnu
               NCPU=8 DATA_DIR=/work/train OUTPUT_DIR=/work/out-$level target/x86_64-unknown-linux-gnu/release/shopping-sessions
               "$merger" merge --sparse /work/profile/$level/*.profraw -o /work/profile/$level.profdata
             done
