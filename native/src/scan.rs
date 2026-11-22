@@ -281,8 +281,9 @@ pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N]
     unsafe {
         let from = if at == 0 { start } else { *seps.get_unchecked(at - 1) + 1 };
         let to = *seps.get_unchecked(at);
-        // In a well-formed line a field that starts with a quote ends with one.
-        let quoted = u32::from(*buf.add(from as usize) == b'"');
+        // Every validated field has paired quotes. An empty field follows
+        // a comma or newline, so the preceding byte is safe to inspect.
+        let quoted = u32::from(*buf.add(to as usize - 1) == b'"');
         (from + quoted, to - quoted)
     }
 }
