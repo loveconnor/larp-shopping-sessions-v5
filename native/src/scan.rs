@@ -485,6 +485,18 @@ impl Block {
         self.raw_indexed::<N, true>(visit)
     }
 
+    // In separator order, every Nth bit of a regular window is a newline.
+    // Comparing that periodic pattern verifies all row widths at once.
+    const fn every_nth<const N: usize>() -> u64 {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < 64 {
+            mask |= 1 << i;
+            i += N;
+        }
+        mask
+    }
+
     #[inline(always)]
     fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
         let buf = self.base;
@@ -516,6 +528,8 @@ impl Block {
                     seps.reserve(WINDOW * 64 + 128);
                 }
                 let mut count = kept;
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                let mut regular = kept < N;
                 let mut lines = 0usize;
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
@@ -567,9 +581,36 @@ impl Block {
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
+                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                    {
+                        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
+                        let expected = Self::every_nth::<N>() << (N - 1 - count % N);
+                        regular &= _pext_u64(newline, sep) == _bzhi_u64(expected, positions as u32);
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                    { lines += flatten::<2>(newline, at, ends.add(lines)); }
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
+                }
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                {
+                    if regular && bad_at == bad.len() {
+                        let consumed = count - count % N;
+                        for seps in std::slice::from_raw_parts(out.cast::<[u32; N]>(), consumed / N) {
+                            visit(buf, line, seps);
+                            line = seps[N - 1] + 1;
+                        }
+                        kept = count - consumed;
+                        std::ptr::copy(out.add(consumed), out, kept);
+                        continue;
+                    }
+                    // Only this window's new separators can include newlines.
+                    for &pos in std::slice::from_raw_parts(out.add(kept), count - kept) {
+                        if *buf.add(pos as usize) == b'\n' {
+                            *ends.add(lines) = pos;
+                            lines += 1;
+                        }
+                    }
                 }
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
