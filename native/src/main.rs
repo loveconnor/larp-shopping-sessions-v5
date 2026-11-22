@@ -296,7 +296,8 @@ impl Links {
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
-        let mut slots = vec![[0u64; 2]; capacity];
+        let id_mask = pairs.len().saturating_mul(2).saturating_add(1).next_power_of_two().saturating_sub(1).min(u32::MAX as usize) as u32;
+        let mut slots = vec![0u32;capacity];
         huge(slots.as_ptr(), capacity);
         let mut names: Vec<u64> = Vec::new();
         let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
@@ -323,22 +324,28 @@ impl Links {
             }
             let mut index = [0u32; 2];
             for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
+                let mixed=key.wrapping_mul(MIX);
+                let tag=mixed as u32 & !id_mask;
+                let mut slot=(mixed>>shift) as usize;
                 index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
+                    let entry=slots[slot];
+                    if entry==0 {
+                        let id=u32::try_from(names.len()).expect("too many linked users");
+                        slots[slot]=tag|(id+1);
                         names.push(key);
-                        break (names.len() - 1) as u32;
+                        break id;
+                    }
+                    if entry & !id_mask==tag {
+                        let id=(entry&id_mask)-1;
+                        if names[id as usize]==key {break id;}
                     }
                     slot = (slot + 1) & mask;
                 };
             }
             numbered.push(index);
         }
+        drop(slots);
+        let original=names.clone();
         // Join. The smaller number is the root, so no cycle can form.
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
@@ -368,9 +375,7 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
+        for (key,person) in original.into_iter().zip(names) {
             if key == person { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
