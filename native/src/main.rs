@@ -1365,6 +1365,76 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// Partition by the leading five window-relative time bits. Histories in
+/// different groups are already chronologically ordered. Only events inside
+/// each group need sorting before the usual cross-midnight session scan.
+fn sort_time_groups<'a>(values: &mut [u64], scratch: &'a mut Vec<u64>, shift: u32) -> &'a [u64] {
+    let mut end = [0usize;32];
+    let group = |v: u64| ((v >> (32+shift)) & 31) as usize;
+    for &v in values.iter() { end[group(v)] += 1; }
+    let mut sum = 0;
+    for count in &mut end {
+        let n = *count;
+        *count = sum;
+        sum += n;
+    }
+    if scratch.len() < sum { scratch.resize(sum, 0); }
+    for &v in values.iter() {
+        let pos = &mut end[group(v)];
+        scratch[*pos] = v;
+        *pos += 1;
+    }
+    let mut start = 0;
+    for stop in end {
+        let part = &mut scratch[start..stop];
+        #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
+        if part.len() > 32 {
+            sort_medium_times(part, &mut values[..part.len()], 12);
+        } else if part.len() >= 5 {
+            unsafe { sort_short_times(part); }
+        } else {
+            part.sort_unstable();
+        }
+        #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+        part.sort_unstable();
+        start = stop;
+    }
+    &scratch[..sum]
+}
+
+#[cfg(test)]
+#[test]
+fn coarse_time_groups_order_full_millisecond_histories() {
+    let mut random = 436905u64;
+    let mut scratch = Vec::new();
+    for width in [1u32, 2, 5, 16, 30, 31, 32] {
+        let shift = width.saturating_sub(5);
+        let mask = u32::MAX >> (32-width);
+        for len in [47, 48, 49, 63, 64, 65, 255, 256, 511] {
+            for sample in 0..35 {
+                let mut values: Vec<u64> = (0..len).map(|i| {
+                    random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+                    let time = match sample%5 {
+                        0 => mask,
+                        1 => (i as u32).wrapping_shl(shift) & mask,
+                        2 => ((i/3) as u32) & mask,
+                        3 => (mask as u64 * (len-i) as u64 / len as u64) as u32,
+                        _ => random as u32 & mask,
+                    };
+                    (u64::from(time)<<32) | (random>>32)
+                }).collect();
+                let mut expected = values.clone();
+                let result = sort_time_groups(&mut values, &mut scratch, shift);
+                assert!(result.windows(2).all(|p| p[0]>>32 <= p[1]>>32));
+                let mut found = result.to_vec();
+                found.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(found, expected);
+            }
+        }
+    }
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1399,6 +1469,9 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
+    let mut grouped_times = Vec::new();
+    let last_time = (shared.window_end-shared.window_start-1) as u32;
+    let time_shift = (32-last_time.leading_zeros()).saturating_sub(5);
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1557,7 +1630,10 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            if (48..512).contains(&mine.len()) {
+                let sorted = sort_time_groups(mine, &mut grouped_times, time_shift);
+                sessions.person(person, sorted, reached)?;
+            } else if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
