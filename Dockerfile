@@ -23,10 +23,10 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     mkdir -p /app && \
     if [ "$TARGETARCH" = amd64 ]; then \
         apt-get update && apt-get install -y --no-install-recommends patch && \
-        for level in base v3 v4 wide; do \
-            cpu=x86-64-$level; profile=v5; features=; \
-            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
-            RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
+        for level in base v3 intel3 v4 ice wide; do \
+            cpu=x86-64-$level; profile=v5; features=; schedule=; \
+            case "$level" in base) cpu=x86-64 ;; v3) schedule="-Ztune-cpu=znver3" ;; intel3) cpu=x86-64-v3; schedule="-Ztune-cpu=haswell" ;; v4) profile=v4; schedule="-Ztune-cpu=skylake-avx512" ;; ice) cpu=x86-64-v4; profile=v4; schedule="-Ztune-cpu=icelake-server" ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide; schedule="-Ztune-cpu=znver4" ;; esac; \
+            RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $schedule $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
         done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
