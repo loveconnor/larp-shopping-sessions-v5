@@ -29,7 +29,7 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
             RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release $build_features --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
-        done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
+        done && "$linker" -Os -static -s platform/select-engine.c -o /app/shopping-sessions; \
     else \
         RUSTFLAGS="-C linker=$linker -C target-cpu=generic" cargo build --locked --release --target "$target" && \
         cp "target/$target/release/shopping-sessions" /app/shopping-sessions; \
