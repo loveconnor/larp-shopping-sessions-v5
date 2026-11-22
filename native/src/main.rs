@@ -959,12 +959,12 @@ impl FrequentPeople {
     }
 }
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, frequent: &FrequentPeople) -> (Buckets<Event>, Vec<Vec<u64>>) {
+fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, frequent: &FrequentPeople) -> (Buckets<Event>, Vec<Option<TimeBins>>) {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
-    let mut dense = vec![Vec::<u64>::new(); frequent.keys.len()];
+    let mut dense: Vec<Option<TimeBins>> = (0..frequent.keys.len()).map(|_| None).collect();
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -1053,7 +1053,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, fr
                     let part = person_part(person, person_bits);
                     let (key, index) = frequent.by_part[part];
                     if key == person {
-                        dense[index].push(value);
+                        if let Some(bins) = &mut dense[index] {
+                            bins.record(value);
+                        } else {
+                            dense[index] = Some(TimeBins::new(shared));
+                            // This real event keeps click grouping active for the person.
+                            out.push(part, Event { person, value });
+                        }
                     } else {
                         out.push(part, Event { person, value });
                     }
@@ -1064,11 +1070,6 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, fr
                 out.donate(base as *mut u8);
             }
         }
-    }
-    // Keep one genuine event in its partition so the ordinary click grouping
-    // discovers this person even when every one of their rows took this path.
-    for (&(part, person), extra) in frequent.keys.iter().zip(&mut dense) {
-        if let Some(value) = extra.pop() { out.push(part, Event { person, value }); }
     }
     (out, dense)
 }
@@ -1122,6 +1123,50 @@ impl TimeBins {
             occupied: vec![0; count.div_ceil(64)],
             revenue: vec![0; count * categories],
             categories,
+        }
+    }
+
+    #[inline(always)]
+    fn record(&mut self, value: u64) {
+        let ts = (value >> 32) as u32;
+        let index = (ts >> BIN_SHIFT) as usize;
+        let bin = &mut self.bins[index];
+        bin.first = bin.first.min(ts);
+        bin.last = bin.last.max(ts);
+        bin.events += 1;
+        self.occupied[index / 64] |= 1 << (index % 64);
+        let payload = value as u32;
+        if payload != 0 {
+            let category = (payload >> 24) as usize;
+            let price = u64::from(payload & 0xff_ffff);
+            self.revenue[index * self.categories + category] += price;
+            bin.category_bits[category / 64] |= 1 << (category % 64);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (word, &occupied) in other.occupied.iter().enumerate() {
+            self.occupied[word] |= occupied;
+            let mut bits = occupied;
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let src = &other.bins[index];
+                let dest = &mut self.bins[index];
+                dest.first = dest.first.min(src.first);
+                dest.last = dest.last.max(src.last);
+                dest.events += src.events;
+                for (group, &mask) in src.category_bits.iter().enumerate() {
+                    dest.category_bits[group] |= mask;
+                    let mut cats = mask;
+                    while cats != 0 {
+                        let category = group * 64 + cats.trailing_zeros() as usize;
+                        cats &= cats - 1;
+                        let cell = index * self.categories + category;
+                        self.revenue[cell] += other.revenue[cell];
+                    }
+                }
+            }
         }
     }
 }
@@ -1229,22 +1274,7 @@ impl Sessions<'_> {
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
-        for &value in events {
-            let ts = (value >> 32) as u32;
-            let index = (ts >> BIN_SHIFT) as usize;
-            let bin = &mut scratch.bins[index];
-            bin.first = bin.first.min(ts);
-            bin.last = bin.last.max(ts);
-            bin.events += 1;
-            scratch.occupied[index / 64] |= 1 << (index % 64);
-            let payload = value as u32;
-            if payload != 0 {
-                let category = (payload >> 24) as usize;
-                let price = u64::from(payload & 0xff_ffff);
-                scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
-            }
-        }
+        for &value in events { scratch.record(value); }
         let mut cursor = (0, 0);
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
@@ -1426,7 +1456,7 @@ fn session_worker(
     clicks: &[ClickSource],
     order: &[u32],
     frequent: &FrequentPeople,
-    dense: &[Vec<Vec<u64>>],
+    dense: &[Vec<Option<TimeBins>>],
     next: &AtomicUsize,
     thread: usize,
 ) -> io::Result<(Vec<Totals>, bool)> {
@@ -1456,7 +1486,6 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
-    let mut dense_values = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1617,13 +1646,11 @@ fn session_worker(
             }
             let (frequent_key, index) = frequent.by_part[part];
             if person == frequent_key {
-                dense_values.clear();
-                dense_values.extend_from_slice(mine);
-                for source in dense {
-                    dense_values.extend_from_slice(&source[index]);
-                }
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
-                sessions.person_binned(person, &dense_values, reached, bins)?;
+                for source in dense {
+                    if let Some(shard) = &source[index] { bins.merge(shard); }
+                }
+                sessions.person_binned(person, mine, reached, bins)?;
             } else if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
@@ -1849,6 +1876,8 @@ fn main() -> io::Result<()> {
     // Biggest person buckets first, so a whale's is never the last one running.
     let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
     let weight = |part: u32| {
+        let (key, rank) = frequent.by_part[part as usize];
+        if key != 0 { return u64::MAX - rank as u64; }
         events
             .iter()
             .map(|buckets| buckets.chunks[part as usize] as u64)
