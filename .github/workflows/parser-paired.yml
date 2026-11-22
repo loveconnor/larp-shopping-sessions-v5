@@ -11,16 +11,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        host: [1, 2, 3, 4]
+        host: [1, 2]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the exact AMD crossover and Intel streaming images
+      - name: Build the exact profiled, scheduled and sixteen-lane release images
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in sorter:bf76822d984acc4fc2853a20017a84b3b59bbefb intel:2eb64984a86a458c75898012b38ca94ea5f16a43; do
+          for item in profile:c1f4dc0dc82197f71ea4bec36722688e2c7cf73f tuned:faf7a64332db78809a950daf53ca0326d906e420 combined:5085884a63d3e70c2a7bdd9702d058d1315dc5d2 wider:ae784b93b8e6f9606636c1aec8e9041efd810f74; do
             label=${item%%:*}
             sha=${item#*:}
             mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
@@ -45,7 +45,7 @@ jobs:
           python -m pip install --quiet duckdb==1.4.5
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
           executables=()
-          for label in sorter intel; do
+          for label in profile tuned combined wider; do
             executables+=("$RUNNER_TEMP/$label/shopping-sessions")
             if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
               executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19")
