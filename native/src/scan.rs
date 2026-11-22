@@ -216,6 +216,17 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
     }
 }
 
+/// Half masks have independent bit-removal chains and keep their natural order.
+#[inline(always)]
+unsafe fn split_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        let lo = bits as u32 as u64;
+        let hi = bits >> 32;
+        let nlo = flatten::<5>(lo, base, out);
+        nlo + flatten::<5>(hi, base + 32, out.add(nlo))
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
 unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
@@ -559,7 +570,7 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { split_positions(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
