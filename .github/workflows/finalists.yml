@@ -1,4 +1,4 @@
-name: Compare practice-trained and final-trained production images on identical test data
+name: Compare fresh and selectively updated execution profiles on identical test data
 on:
   push:
     branches: [bench/profile-crossover]
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 751623}
-          - {events: 60000000, format: current, seed: 751623}
-          - {events: 20000000, format: current, seed: 686693}
-          - {events: 60000000, format: current, seed: 686693}
+          - {events: 20000000, format: current, seed: 605179}
+          - {events: 60000000, format: current, seed: 605179}
+          - {events: 20000000, format: current, seed: 384733}
+          - {events: 60000000, format: current, seed: 384733}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: a057b4a6243282ef33ea848a5c33157f2a50aa81
-      PRACTICE: f659bef16a77471432c24d3afe018e6b8286626e
-      FINAL: 319878cc7d8b1d21a8a939f4afaccfa0438d1192
+      RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
+      FRESH: 00a45e46002b8bdf14541a625eff939370846e38
+      SURGICAL: a34fe7d0c0b8492d58c57c8732b8db8982e4c464
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,9 +31,9 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked practice final; do
-            sha=$FINAL
-            if [ "$label" = practice ]; then sha=$PRACTICE; fi
+          for label in ranked fresh surgical; do
+            sha=$SURGICAL
+            if [ "$label" = fresh ]; then sha=$FRESH; fi
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
             mkdir "$RUNNER_TEMP/$label-src"
@@ -63,7 +63,7 @@ jobs:
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
           cpus = sorted(os.sched_getaffinity(0))[:8]
           cpuset = ",".join(map(str, cpus))
-          labels = ["ranked", "practice", "final"]
+          labels = ["ranked", "fresh", "surgical"]
           samples = {label: [] for label in labels}
           print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
           scratch = root / "scratch"
@@ -101,7 +101,7 @@ jobs:
                   finally:
                       subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
           for table in ("user_daily", "campaign_daily"):
-              for other in ("practice","final"):
+              for other in ("fresh","surgical"):
                   a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-12/{table}/*.parquet')" for label in ("ranked",other)]
                   for lhs, rhs in ((a,b),(b,a)):
                       assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
@@ -109,7 +109,7 @@ jobs:
               m = statistics.median(samples[label])
               print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
-          for label in ("practice", "final"):
+          for label in ("fresh", "surgical"):
               ratios = [a/b for a,b in zip(samples[label], samples["ranked"])]
               ratios.sort()
               print(f"PAIRED {label} median {statistics.median(ratios):.4f}, middle eight [{ratios[2]:.4f}, {ratios[-3]:.4f}], faster {sum(r < 1 for r in ratios)}/{len(ratios)}",flush=True)
@@ -125,7 +125,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          for label in practice final; do
+          for label in fresh surgical; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
