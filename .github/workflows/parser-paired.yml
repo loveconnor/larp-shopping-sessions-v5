@@ -17,10 +17,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the exact streaming-merge release image
+      - name: Build the exact AMD crossover and Intel streaming images
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in sorter:bf5e73ec8064377d11ba8fcab23369d983df9efa; do
+          for item in sorter:bf76822d984acc4fc2853a20017a84b3b59bbefb intel:2eb64984a86a458c75898012b38ca94ea5f16a43; do
             label=${item%%:*}
             sha=${item#*:}
             mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
@@ -45,7 +45,7 @@ jobs:
           python -m pip install --quiet duckdb==1.4.5
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
           executables=()
-          for label in sorter; do
+          for label in sorter intel; do
             executables+=("$RUNNER_TEMP/$label/shopping-sessions")
             if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
               executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19")
