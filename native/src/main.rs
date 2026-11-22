@@ -1237,20 +1237,28 @@ impl Sessions<'_> {
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
-    fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
+    fn person<const ORGANIC: bool>(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
         let (mut low, mut high) = (0usize, 0usize);
         let mut at = 0;
         let mut current = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
+        let mut purchases = 0i64;
         while at < events.len() {
             let start = events[at] >> 32;
             let day = ((start + day_offset) / DAY as u64) as u32;
             if day != current {
                 if current != NONE {
+                    if ORGANIC {
+                        let totals = &mut self.totals[current as usize];
+                        totals[0] += i64::from(day_sessions);
+                        totals[1] += purchases;
+                        totals[2] += day_revenue as i64;
+                    }
                     self.row(person, current, day_sessions, day_events, day_revenue)?;
                 }
                 current = day;
+                purchases = 0;
                 (day_sessions, day_events, day_revenue) = (0, 0, 0);
             }
             let mut previous = start;
@@ -1280,14 +1288,24 @@ impl Sessions<'_> {
             day_events += (at - first) as u32;
             day_revenue += revenue;
 
-            (low, high) = self.credit(clicks, (low, high), start, day, revenue, purchased);
+            if ORGANIC {
+                purchases += i64::from(purchased);
+            } else {
+                (low, high) = self.credit(clicks, (low, high), start, day, revenue, purchased);
+            }
         }
         if current != NONE {
+            if ORGANIC {
+                let totals = &mut self.totals[current as usize];
+                totals[0] += i64::from(day_sessions);
+                totals[1] += purchases;
+                totals[2] += day_revenue as i64;
+            }
             self.row(person, current, day_sessions, day_events, day_revenue)?;
         }
-        for campaign in self.active.drain(..) {
+        if !ORGANIC { for campaign in self.active.drain(..) {
             self.reach[campaign as usize] = 0;
-        }
+        } }
         Ok(())
     }
 }
@@ -1567,7 +1585,11 @@ fn session_worker(
                 }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
-                sessions.person(person, mine, reached)?;
+                if reached.is_empty() {
+                    sessions.person::<true>(person, mine, reached)?;
+                } else {
+                    sessions.person::<false>(person, mine, reached)?;
+                }
             } else {
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
