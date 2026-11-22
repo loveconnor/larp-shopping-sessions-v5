@@ -645,11 +645,23 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     const LOOKUPS: usize = 16;
-    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    #[derive(Clone, Copy)]
+    struct Pending {
+        name: *const u8,
+        mixed: u64,
+        part: usize,
+        record: Parsed,
+    }
+    let mut batch = [std::mem::MaybeUninit::<Pending>::uninit(); LOOKUPS];
     let mut queued = 0;
-    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
-        for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+    let drain = |items: &[std::mem::MaybeUninit<Pending>], buckets: &mut Buckets<Parsed>| {
+        for item in items {
+            // Only initialized entries in the current batch are passed here.
+            let mut item = unsafe { item.assume_init() };
+            if !item.name.is_null() {
+                item.record.user = unsafe { keys::finish_long_user(item.name, item.mixed) } ^ copy;
+            }
+            buckets.push(item.part, item.record);
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -713,17 +725,25 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
-        if deferred {
-            lookups[queued] = (name,dest,mixed);
-            queued += 1;
-            if queued == LOOKUPS {
-                drain(&lookups);
-                queued = 0;
+        let part = (partition_hash >> id_shift) as usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let dest = out.buckets.next[part];
+            if dest as usize & (CHUNK_BYTES - 1) != Buckets::<Parsed>::FILL {
+                std::arch::asm!("prefetchw [{p}]", p = in(reg) dest, options(nostack, preserves_flags, readonly));
             }
         }
+        batch[queued].write(Pending {
+            name: if deferred { name } else { std::ptr::null() },
+            mixed, part, record,
+        });
+        queued += 1;
+        if queued == LOOKUPS {
+            drain(&batch, &mut out.buckets);
+            queued = 0;
+        }
     });
-    drain(&lookups[..queued]);
+    drain(&batch[..queued], &mut out.buckets);
 }
 
 struct ClickSource {
