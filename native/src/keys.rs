@@ -103,6 +103,17 @@ pub fn prepare_users(bytes: u64) {
     });
 }
 
+/// Called after both tables have finished writing and no name can be read again.
+pub fn release_user_pages(worker: usize, workers: usize) {
+    if let Some(slots) = USER_SLOTS.get() {
+        let step = slots.len().div_ceil(workers);
+        let first = (worker * step).min(slots.len());
+        let end = (first + step).min(slots.len());
+        let part = &slots[first..end];
+        crate::release(part.as_ptr(), part.len());
+    }
+}
+
 #[inline(always)]
 pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());

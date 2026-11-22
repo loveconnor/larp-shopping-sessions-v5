@@ -1883,7 +1883,12 @@ fn main() -> io::Result<()> {
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
-                parsed_events[thread].buckets.release();
+                let source = &parsed_events[thread];
+                source.buckets.release();
+                release(source.names.as_ptr(), source.names.len());
+                release(source.overflow_times.as_ptr(), source.overflow_times.len());
+                release(clicks[thread].names.as_ptr(), clicks[thread].names.len());
+                keys::release_user_pages(thread, threads);
                 events[thread].release();
                 clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
