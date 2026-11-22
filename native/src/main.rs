@@ -402,7 +402,19 @@ impl Links {
         let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            unsafe {
+                use std::arch::x86_64::*;
+                // The complete aligned group contains four keys followed by
+                // their four canonical values. Select a hit from the same load.
+                let all = _mm512_load_si512((group as *const AliasGroup).cast());
+                let found = _mm512_cmpeq_epi64_mask(all, _mm512_set1_epi64(key as i64)) & 15;
+                if found != 0 {
+                    let chosen = _mm512_maskz_compress_epi64(found << 4, all);
+                    return _mm_cvtsi128_si64(_mm512_castsi512_si128(chosen)) as u64;
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
             unsafe {
                 use std::arch::x86_64::*;
                 let keys = _mm256_load_si256(group.keys.as_ptr().cast());
