@@ -1399,6 +1399,7 @@ fn session_worker(
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
+    let histogram_min = tune("SS_HISTOGRAM_MIN", 512).clamp(2, 1 << 24) as usize;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1557,7 +1558,7 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
-            if mine.len() < 512 {
+            if mine.len() < histogram_min {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
