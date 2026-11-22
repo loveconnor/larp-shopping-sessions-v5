@@ -239,6 +239,7 @@ struct Touch {
 struct Dim {
     prefix: &'static [u8],
     dense: Vec<u32>,
+    short_campaigns: Vec<u32>,
     other: HashMap<Vec<u8>, u32>,
 }
 
@@ -247,6 +248,7 @@ impl Dim {
         Self {
             prefix,
             dense: Vec::new(),
+            short_campaigns: Vec::new(),
             other: HashMap::new(),
         }
     }
@@ -259,6 +261,38 @@ impl Dim {
                 self.dense.resize((number + 1).max(self.dense.len() * 2), 0);
             }
             self.dense[number] = value;
+        }
+    }
+
+    fn index_campaign(&mut self, number: usize, value: u32) {
+        if !(1..=9999).contains(&number) { return; }
+        let slot = (number / 1000) << 12 | ((number / 100) % 10) << 8
+            | ((number / 10) % 10) << 4 | number % 10;
+        if self.short_campaigns.len() <= slot { self.short_campaigns.resize(slot + 1, 0); }
+        self.short_campaigns[slot] = value;
+    }
+
+    #[inline(always)]
+    unsafe fn campaign(&self, p: *const u8, len: usize) -> u32 {
+        unsafe {
+            if (3..=6).contains(&len) {
+                let raw = u64::from_le(p.cast::<u64>().read_unaligned());
+                let digits = (raw >> 16) as u32;
+                let x = (digits ^ 0x3030_3030) << ((6 - len) * 8);
+                if raw as u16 == u16::from_le_bytes(*b"c_") && digits as u8 != b'0'
+                    && (x.wrapping_add(0x7676_7676) | x) & 0x8080_8080 == 0 {
+                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                    let slot = std::arch::x86_64::_pext_u32(x.swap_bytes(), 0x0f0f_0f0f);
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                    let slot = {
+                        let n = x.swap_bytes() & 0x0f0f_0f0f;
+                        let pairs = (n | n >> 4) & 0x00ff_00ff;
+                        (pairs | pairs >> 8) & 0xffff
+                    };
+                    return self.short_campaigns.get(slot as usize).copied().unwrap_or(0);
+                }
+            }
+            self.get(p, len)
         }
     }
 
@@ -831,7 +865,7 @@ fn parse_clicks(
         }
         let (id, user) = (id ^ copy, user ^ copy);
         let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
+        let campaign = shared.campaigns.campaign(p, n);
         let (p, n) = field(3);
         let at = ts::parse(p, n, dates);
         if campaign == 0 || at < earliest || at >= window_end {
@@ -1680,6 +1714,7 @@ fn main() -> io::Result<()> {
     dimension_rows(&data.join("campaigns.csv"), campaigns.prefix, |campaign, number, channel| {
         if !campaign.is_empty() {
             campaigns.insert(campaign, number, campaign_names.len() as u32);
+            campaigns.index_campaign(number, campaign_names.len() as u32);
             campaign_names.push(campaign.to_vec());
             campaign_channels.push(channel.to_vec());
         }
