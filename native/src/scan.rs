@@ -193,6 +193,25 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// Compress four independent groups of sixteen 32-bit source positions.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn word_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    use std::arch::x86_64::*;
+    unsafe {
+        let offsets = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let first = _mm512_add_epi32(_mm512_set1_epi32(base as i32), offsets);
+        let mut count = 0;
+        for group in 0..4 {
+            let selected = (bits >> (group * 16)) as u16;
+            let positions = _mm512_add_epi32(first, _mm512_set1_epi32(group * 16));
+            _mm512_mask_compressstoreu_epi32(out.add(count).cast(), selected, positions);
+            count += selected.count_ones() as usize;
+        }
+        count
+    }
+}
+
 /// Writes the position of every set bit of `bits`, plus `base`, at `out`,
 /// and returns how many. Up to `UNROLL` are written without a branch; `out`
 /// needs room for 64 + `UNROLL`.
@@ -559,7 +578,12 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    let positions = {
+                        #[cfg(target_feature = "avx512f")]
+                        { word_positions(sep, at, out.add(count)) }
+                        #[cfg(not(target_feature = "avx512f"))]
+                        if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) }
+                    };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
