@@ -1391,10 +1391,8 @@ fn session_worker(
     let mut table_ids: Vec<u32> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
-    let mut local: Vec<u32> = Vec::new();
     let mut values: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
-    let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
@@ -1419,7 +1417,6 @@ fn session_worker(
         table_ids.resize(capacity, 0);
         persons.clear();
         ends.clear();
-        local.clear();
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
@@ -1441,7 +1438,9 @@ fn session_worker(
                         slot = (slot + 1) & mask;
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
+                    // This partition belongs to one worker. Both scatter passes
+                    // can reuse its consumed identity slots for local ordinals.
+                    (*base.add(offset)).person = u64::from(id);
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
                         mask = capacity - 1;
@@ -1471,13 +1470,11 @@ fn session_worker(
             if values.len() < total {
                 values.resize(total, 0);
             }
-            let mut index = 0;
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
+                    let end = ends.get_unchecked_mut((*base.add(offset)).person as usize);
                     *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
                     *end += 1;
-                    index += 1;
                 }
             }
         }
@@ -1489,7 +1486,6 @@ fn session_worker(
         }
         click_ends.clear();
         click_ends.resize(persons.len(), 0);
-        click_local.clear();
         let mut kept = 0usize;
         unsafe {
             for &(base, count) in &click_chunks {
@@ -1506,7 +1502,7 @@ fn session_worker(
                         }
                         slot = (slot + 1) & mask;
                     };
-                    click_local.push(id);
+                    (*base.add(offset)).person = u64::from(id);
                     if id != NONE {
                         *click_ends.get_unchecked_mut(id as usize) += 1;
                         kept += 1;
@@ -1529,11 +1525,9 @@ fn session_worker(
                     },
                 );
             }
-            let mut index = 0;
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
-                    let id = *click_local.get_unchecked(index);
-                    index += 1;
+                    let id = (*base.add(offset)).person as u32;
                     if id != NONE {
                         let click = *base.add(offset);
                         let end = click_ends.get_unchecked_mut(id as usize);
