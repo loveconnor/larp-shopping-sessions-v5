@@ -218,6 +218,50 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+// Each entry gives the first four set bit positions in a 16-byte span.
+// The fallback handles dense malformed lines and unusually short fields.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static FIRST_FOUR: [u32; 65536] = {
+    let mut table = [0; 65536];
+    let mut mask = 0usize;
+    while mask < table.len() {
+        let mut bits = mask as u32;
+        let mut lane = 0;
+        while lane < 4 {
+            table[mask] |= bits.trailing_zeros() << (8 * lane);
+            bits &= bits.wrapping_sub(1);
+            lane += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
+#[inline(always)]
+unsafe fn sparse_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut used = 0usize;
+        for quarter in 0..4 {
+            let group = (bits >> (quarter * 16)) as u16;
+            let length = group.count_ones() as usize;
+            let start = base + quarter * 16;
+            if length <= 4 {
+                let packed = _mm_cvtsi32_si128(FIRST_FOUR[group as usize] as i32);
+                let offsets = _mm_add_epi32(_mm_cvtepu8_epi32(packed), _mm_set1_epi32(start as i32));
+                _mm_storeu_si128(out.add(used).cast(), offsets);
+            } else {
+                flatten::<4>(u64::from(group), start, out.add(used));
+            }
+            used += length;
+        }
+        used
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    unsafe { flatten::<7>(bits, base, out) }
+}
+
 /// Writes the position of every set bit of `bits`, plus `base`, at `out`,
 /// and returns how many. Up to `UNROLL` are written without a branch; `out`
 /// needs room for 64 + `UNROLL`.
@@ -593,9 +637,9 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<7>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { sparse_positions(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
-                    let positions = flatten::<7>(sep, at, out.add(count));
+                    let positions = sparse_positions(sep, at, out.add(count));
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
