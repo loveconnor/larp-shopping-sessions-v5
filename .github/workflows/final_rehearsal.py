@@ -11,7 +11,7 @@ import duckdb
 
 root = Path(os.environ["RUNNER_TEMP"])
 seeds = list(map(int, os.environ["SEED_LIST"].split(",")))
-labels = ("ranked", "candidate", "sorter", "combined", "control")
+labels = ("ranked", "candidate", "sorter", "control")
 medians = {label: [] for label in labels}
 cpus = sorted(os.sched_getaffinity(0))[:8]
 cpuset = ",".join(map(str, cpus))
@@ -37,9 +37,11 @@ def elapsed(label, output, scratch):
     finally:
         subprocess.run(["docker","rm","-f",container], check=True, stdout=subprocess.DEVNULL)
 
-for seed in seeds:
+for index, seed in enumerate(seeds):
+    events = 20_000_000 if index == 0 else 60_000_000
+    print("DATASET", seed, events, flush=True)
     subprocess.run([root/"generator/target/release/generate", "--seed",str(seed),
-                    "--events","60000000","--clicks","15000000","--threads",str(len(cpus)),
+                    "--events",str(events),"--clicks",str(events // 4),"--threads",str(len(cpus)),
                     "--output",root/"data"],check=True)
     samples = {label: [] for label in labels}
     # Every label takes each position twice in ten randomized rounds.

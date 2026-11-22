@@ -1,4 +1,4 @@
-name: Compare the current release, two AMD-specific changes, and their combination
+name: Compare three AMD sorters on independent practice and final workloads
 on:
   push:
     branches: [bench/family19-sort-comparison]
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["354179,608391,816793", "965263,713993,316817", "435281,698671,865713", "739473,590623,971491", "547531,977107,694543", "763973,302143,812681"]
+        seed_list: ["395424,233335,301443", "630951,801413,567422", "739147,225071,323378", "853936,522406,717085", "401401,597184,402457", "943270,215674,283849"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
-      RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 846a15a7bd3eda7a2a04581f25b48087093b42ea
+      RANKED: 1426671a3250e5dcb5342c29ea6238942350685f
+      CANDIDATE: 7e8f59da6626659f317f8ae7878a3b201dbd61f0
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,15 +38,14 @@ jobs:
           selected=$("$probe/selector")
           echo "Actual selector chose $selected"
           echo "SELECTED=$selected" >> "$GITHUB_ENV"
-      - name: Build the four release images and verify every fallback executable
+      - name: Build the three release images and verify every fallback executable
         if: env.SELECTED == 'p19'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked candidate sorter combined; do
+          for label in ranked candidate sorter; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = sorter ]; then sha=1426671a3250e5dcb5342c29ea6238942350685f; fi
-            if [ "$label" = combined ]; then sha=225f705d906a98cafac0117242ab8c80d7838659; fi
+            if [ "$label" = sorter ]; then sha=bf5e73ec8064377d11ba8fcab23369d983df9efa; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -57,7 +56,7 @@ jobs:
           done
           lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
           for engine in base v3 v4 n4 wide; do
-            for label in candidate sorter combined; do
+            for label in candidate sorter; do
               cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/$label/shopping-sessions.$engine"
             done
           done
