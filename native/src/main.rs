@@ -35,8 +35,8 @@ const BLOCK: u64 = 1 << 19;
 const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
-const ID_BITS: u32 = 10;
-const PERSON_BITS: u32 = 10;
+const ID_BITS: u32 = 12;
+const PERSON_BITS: u32 = 11;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
@@ -1420,7 +1420,7 @@ fn main() -> io::Result<()> {
     }
 
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
-    let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
+    let partition_bits = input_bytes.div_ceil(1 << 18).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
