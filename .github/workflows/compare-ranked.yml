@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: 6dbb332c47b671249e712dd91232ade3b09da160
+      CANDIDATE: 10884ff04e6f85a3222a5f511c98b68a94c9b85c
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +27,7 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
+          grep -qw avx512bw /proc/cpuinfo
           for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
@@ -35,7 +36,8 @@ jobs:
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
             cid=$(docker create "$label")
-            docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
       - name: Generate fresh data
@@ -46,7 +48,7 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 934701 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 407251 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -76,7 +78,7 @@ jobs:
                       env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
                                  SCRATCH_DIR=str(scratch), NCPU=str(budget))
                       start = time.perf_counter()
-                      subprocess.run([str(root / label)], env=env, check=True)
+                      subprocess.run([str(root / label / "shopping-sessions")], env=env, check=True)
                       seconds = time.perf_counter() - start
                       print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
                       if round_number:
@@ -107,11 +109,11 @@ jobs:
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
-              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
               python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
             done
             rm -rf verify-out
             mkdir -p verify-out
-            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
             python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
           done
