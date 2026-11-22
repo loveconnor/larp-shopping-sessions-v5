@@ -1077,7 +1077,9 @@ struct Sessions<'a> {
     thread: usize,
     totals: Vec<Totals>,
     pending_sessions: Vec<(u32, u32, u64, bool)>,
-    day_ends: Vec<usize>,
+    first_session: Vec<usize>,
+    mask_words: Vec<u64>,
+    winners: Vec<Option<Touch>>,
     covered_until: Vec<usize>,
     coverage_bits: Vec<u64>,
     covered_campaigns: Vec<usize>,
@@ -1175,53 +1177,84 @@ impl Sessions<'_> {
         self.pending_sessions.clear();
     }
 
-    // In timestamp order both ends of a click's reachable session interval
-    // move forward. Merge each campaign's intervals by remembering its last
-    // covered session and add only the new suffix to the affected days.
-    fn credit_ranges(&mut self, clicks: &[Touch]) {
+    fn credit_long_bits(&mut self, clicks: &[Touch], sources: &[ClickSource]) {
         let sessions = &self.pending_sessions;
-        let days = self.shared.days;
         let n = sessions.len();
-        self.day_ends.resize(n, n);
-        let mut day_end = n;
-        for i in (0..n).rev() {
-            if i + 1 < n && sessions[i].1 != sessions[i + 1].1 { day_end = i + 1; }
-            self.day_ends[i] = day_end;
+        let words = n.div_ceil(64);
+        // Consecutive session starts are more than SESSION_GAP apart. A bin
+        // narrower than the gap needs at most one exact boundary comparison.
+        let bins = (sessions[n-1].0 >> BIN_SHIFT) as usize + 1;
+        self.first_session.resize(bins, n);
+        let mut slot = n;
+        for bin in (0..bins).rev() {
+            while slot > 0 && (sessions[slot-1].0 >> BIN_SHIFT) as usize == bin { slot -= 1; }
+            self.first_session[bin] = slot;
         }
-        let mut low = 0;
-        let mut high = 0;
-        let mut latest: Option<&Touch> = None;
-        let credit = |totals: &mut [Totals], (start, day, revenue, purchased): (u32,u32,u64,bool), latest: Option<&Touch>| {
-            let winner = latest.filter(|c| c.ts >= start).map_or(0, |c| c.campaign as usize);
-            let row = &mut totals[winner * days + day as usize];
-            row[0] += 1;
-            row[1] += i64::from(purchased);
-            row[2] += revenue as i64;
+        let boundary = |time: u32, inclusive: bool| {
+            let i = self.first_session.get((time >> BIN_SHIFT) as usize).copied().unwrap_or(n);
+            i + usize::from(i < n && (sessions[i].0 < time || inclusive && sessions[i].0 == time))
         };
-        for click in clicks {
-            while low < n && u64::from(sessions[low].0) + (WEEK as u64) < u64::from(click.ts) {
-                credit(&mut self.totals, sessions[low], latest);
-                low += 1;
-            }
-            // Equal-time clicks arrive in bytewise ID order, so keep the first.
-            if latest.is_none_or(|last| last.ts != click.ts) { latest = Some(click); }
-            while high < n && sessions[high].0 <= click.ts { high += 1; }
+        self.winners.clear();
+        self.winners.resize(n, None);
+        let prefer = |next: Touch, old: Option<Touch>| old.is_none_or(|c| next.ts > c.ts ||
+            (next.ts == c.ts && click_order(next.id, c.id, sources, self.shared.defer_long_events).is_lt()));
+        for &click in clicks {
+            let lo = boundary(click.ts.saturating_sub(WEEK as u32), false);
+            let hi = boundary(click.ts, true);
+            if lo == hi { continue; }
             let campaign = click.campaign as usize;
-            let previous = self.covered_until[campaign];
-            let mut from = previous.max(low);
-            if from < high {
-                if previous == 0 { self.covered_campaigns.push(campaign); }
-                self.covered_until[campaign] = high;
-                while from < high {
-                    let end = self.day_ends[from].min(high);
-                    self.totals[campaign * days + sessions[from].1 as usize][3] += (end - from) as i64;
-                    from = end;
+            let mut row = self.covered_until[campaign];
+            if row == 0 {
+                self.covered_campaigns.push(campaign);
+                row = self.covered_campaigns.len();
+                self.covered_until[campaign] = row;
+                self.mask_words.resize(row * words, 0);
+            }
+            let bits = &mut self.mask_words[(row-1)*words..row*words];
+            let first = lo/64;
+            let last = (hi-1)/64;
+            let left = u64::MAX << (lo%64);
+            let right = u64::MAX >> (63-(hi-1)%64);
+            if first == last {
+                bits[first] |= left & right;
+            } else {
+                bits[first] |= left;
+                bits[first+1..last].fill(u64::MAX);
+                bits[last] |= right;
+            }
+            if prefer(click, self.winners[lo]) { self.winners[lo] = Some(click); }
+        }
+        let days = self.shared.days;
+        let mut latest = None;
+        let mut from = 0;
+        for (i, &(start, day, revenue, purchased)) in sessions.iter().enumerate() {
+            if let Some(click) = self.winners[i] {
+                if prefer(click, latest) { latest = Some(click); }
+            }
+            let winner = latest.filter(|c| c.ts >= start).map_or(0, |c| c.campaign as usize);
+            let totals = &mut self.totals[winner * days + day as usize];
+            totals[0] += 1;
+            totals[1] += i64::from(purchased);
+            totals[2] += revenue as i64;
+            if i+1 == n || sessions[i+1].1 != day {
+                let first = from/64;
+                let last = i/64;
+                let left = u64::MAX << (from%64);
+                let right = u64::MAX >> (63-i%64);
+                // A day has at most 48 session starts, hence at most two words.
+                debug_assert!(last <= first+1);
+                for (row, &campaign) in self.covered_campaigns.iter().enumerate() {
+                    let bits = &self.mask_words[row*words..(row+1)*words];
+                    let count = if first == last { (bits[first] & left & right).count_ones() }
+                        else { (bits[first] & left).count_ones() + (bits[last] & right).count_ones() };
+                    self.totals[campaign*days + day as usize][3] += i64::from(count);
                 }
+                from = i+1;
             }
         }
-        for &session in &sessions[low..] { credit(&mut self.totals, session, latest); }
         for campaign in self.covered_campaigns.drain(..) { self.covered_until[campaign] = 0; }
         self.pending_sessions.clear();
+        self.mask_words.clear();
     }
 
     #[inline(always)]
@@ -1485,7 +1518,9 @@ fn session_worker(
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
         pending_sessions: Vec::new(),
-        day_ends: Vec::new(),
+        first_session: Vec::new(),
+        mask_words: Vec::new(),
+        winners: Vec::new(),
         covered_until: vec![0; campaigns],
         coverage_bits: vec![0; campaigns],
         covered_campaigns: Vec::new(),
@@ -1687,8 +1722,7 @@ fn session_worker(
                 if sessions.pending_sessions.len() <= 64 {
                     sessions.credit_bits(reached, clicks);
                 } else {
-                    sort_clicks(reached);
-                    sessions.credit_ranges(reached);
+                    sessions.credit_long_bits(reached, clicks);
                 }
             }
             from = to;
