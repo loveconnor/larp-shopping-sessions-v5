@@ -1,7 +1,7 @@
 name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/cascade-paired]
+    branches: [bench/v3-time-lanes]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 745231, engine: n4}
-          - {events: 60000000, format: current, seed: 745231, engine: n4}
-          - {events: 20000000, format: current, seed: 272339, engine: n4}
-          - {events: 60000000, format: current, seed: 272339, engine: n4}
+          - {events: 20000000, format: current, seed: 319993, engine: v3}
+          - {events: 60000000, format: current, seed: 319993, engine: v3}
+          - {events: 20000000, format: current, seed: 854033, engine: v3}
+          - {events: 60000000, format: current, seed: 854033, engine: v3}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: bb2bd3e3a843fed7819d2d58066d0ce3b5d4f130
+      CANDIDATE: 7dc89590be73fd32ef6b7ac1ca748f4f8d6259de
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,7 +34,6 @@ jobs:
           for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label"  = n4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -60,8 +59,8 @@ jobs:
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          if os.environ["ENGINE"] == "n4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
-              print("Host has no v4 engine. Skipping this comparison.", flush=True)
+          if os.environ["ENGINE"] == "v3" and "avx2" not in pathlib.Path("/proc/cpuinfo").read_text():
+              print("Host has no v3 engine. Skipping this comparison.", flush=True)
               raise SystemExit(0)
           cpus = sorted(os.sched_getaffinity(0))[:8]
           cpuset = ",".join(map(str, cpus))
@@ -82,7 +81,7 @@ jobs:
                       "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
                       "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
                       "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
-                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label, "/app/shopping-sessions." + os.environ["ENGINE"]]
+                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", "--entrypoint", "/app/shopping-sessions." + os.environ["ENGINE"], label]
                   cid = subprocess.check_output(args, text=True).strip()
                   try:
                       subprocess.run(["docker", "start", "-a", cid], check=True)
@@ -115,7 +114,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
+          if [ "$ENGINE"  = v3 ] && ! grep -qw avx2 /proc/cpuinfo; then exit 0; fi
           for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
