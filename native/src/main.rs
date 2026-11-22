@@ -292,8 +292,9 @@ struct Links {
 }
 
 impl Links {
-    fn build(pairs: &[(u64, u64)]) -> Self {
-        let capacity = (pairs.len() * 3).next_power_of_two().max(16);
+    fn build(parts: Vec<Vec<(u64, u64)>>) -> Self {
+        let pair_count: usize = parts.iter().map(Vec::len).sum();
+        let capacity = (pair_count * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
         let mut slots = vec![[0u64; 2]; capacity];
@@ -315,29 +316,31 @@ impl Links {
 
         // Number the IDs as they appear; each pass below prefetches what the
         // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
-                prefetch(&slots[home(c)]);
-                prefetch(&slots[home(d)]);
+        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pair_count);
+        for pairs in parts {
+            for (at, &(a, b)) in pairs.iter().enumerate() {
+                if let Some(&(c, d)) = pairs.get(at + 8) {
+                    prefetch(&slots[home(c)]);
+                    prefetch(&slots[home(d)]);
+                }
+                let mut index = [0u32; 2];
+                for (side, key) in [a, b].into_iter().enumerate() {
+                    let mut slot = home(key);
+                    index[side] = loop {
+                        let entry = &mut slots[slot];
+                        if entry[0] == key {
+                            break entry[1] as u32;
+                        }
+                        if entry[0] == 0 {
+                            *entry = [key, names.len() as u64];
+                            names.push(key);
+                            break (names.len() - 1) as u32;
+                        }
+                        slot = (slot + 1) & mask;
+                    };
+                }
+                numbered.push(index);
             }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-            }
-            numbered.push(index);
         }
         // Join. The smaller number is the root, so no cycle can form.
         let mut aliases = 0usize;
@@ -889,9 +892,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         (parts.len() == threads).then(|| std::mem::take(&mut *parts))
     };
     if let Some(parts) = ready {
-        let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-        for mut shard in parts { pairs.append(&mut shard); }
-        let links = Links::build(&pairs);
+        let links = Links::build(parts);
         let _ = shared.links.set(links);
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
     }
