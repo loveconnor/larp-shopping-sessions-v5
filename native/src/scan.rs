@@ -508,7 +508,10 @@ impl Block {
             let mut at = line;
             // 1 while a field that opened with a quote in an earlier chunk has
             // its closing separator still to come.
-            let mut carry = 0u64;
+            #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+            let mut carry=u64::from(*buf.add(line as usize)==b'"');
+            #[cfg(not(all(target_arch="x86_64",target_feature="bmi2")))]
+            let mut carry=0u64;
             while at < end {
                 if seps.capacity() < kept + WINDOW * 64 + 128 {
                     // The separators kept from the last window move with the buffer.
@@ -536,6 +539,21 @@ impl Block {
                         quote &= valid;
                     }
                     let before = *p.sub(1);
+                    #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+                    {
+                        use std::arch::x86_64::{_pext_u64,_bzhi_u64};
+                        let after=*p.add(64);
+                        let prev=(sep<<1)|u64::from(before==b',' || before==b'\n');
+                        let next=(sep>>1)|(u64::from(after==b',' || after==b'\n')<<63);
+                        let opens=_pext_u64((quote>>1)|(u64::from(after==b'"')<<63),sep);
+                        let closes=_pext_u64((quote<<1)|u64::from(before==b'"'),sep);
+                        let width=sep.count_ones();
+                        let expected=(opens<<1)|carry;
+                        let mismatch=_bzhi_u64(expected^closes,width);
+                        if (quote & !(prev^next)) | mismatch != 0 {bad.push(at);}
+                        carry=if width==64 {opens>>63} else {(expected>>width)&1};
+                    }
+                    #[cfg(not(all(target_arch="x86_64",target_feature="bmi2")))]
                     // A quote just before the chunk can close a field at its first byte.
                     if (quote | carry) != 0 || before == b'"' {
                         let after = *p.add(64);
