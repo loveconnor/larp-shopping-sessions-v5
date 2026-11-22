@@ -267,8 +267,14 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
         return flatten::<10>(bits, base, out);
     }
     let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
-    let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
-    _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
+    let low=_mm512_castsi512_si128(packed);
+    let bias=_mm256_set1_epi32(base as i32);
+    let first=_mm256_cvtepu8_epi32(low);
+    _mm256_storeu_si256(out.cast(),_mm256_add_epi32(bias,first));
+    if n>8 {
+        let second=_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(low));
+        _mm256_storeu_si256(out.add(8).cast(),_mm256_add_epi32(bias,second));
+    }
     n
 }
 
