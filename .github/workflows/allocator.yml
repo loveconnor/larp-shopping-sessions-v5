@@ -1,0 +1,100 @@
+name: Measure parser allocation policy
+on:
+  push:
+    branches: [bench/parser-allocator]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {events: 20000000, format: current, seed: 906709}
+          - {events: 60000000, format: current, seed: 906709}
+          - {events: 20000000, format: current, seed: 906733}
+          - {events: 60000000, format: current, seed: 906733}
+    env:
+      SEED: ${{ matrix.seed }}
+      FORMAT: ${{ matrix.format }}
+      EVENTS: ${{ matrix.events }}
+      RANKED: 35615c84d81833d6cdb668f8a2bdb1fefc720978
+      CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check CPU and build the two submission images
+        run: |
+          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
+          for label in ranked; do
+            sha=$CANDIDATE
+            if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            mkdir "$RUNNER_TEMP/$label-src"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
+            docker rm "$cid"
+          done
+      - name: Generate fresh data
+        run: |
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/generator.zip"
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
+            --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+          python -m pip install --quiet duckdb==1.4.5
+      - name: Measure phase parameters in native restricted Linux processes
+        shell: python
+        run: |
+          import itertools, json, os, pathlib, random, shutil, statistics, subprocess, time
+          import duckdb
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          scratch = root / "scratch"
+          out = root / "out"
+          for d in (scratch,out):
+              d.mkdir()
+              d.chmod(0o777)
+          cid = subprocess.check_output(["docker","run","-d","--runtime","runc","--memory","12g","--memory-swap","12g","--network","none","--read-only","--cap-drop","ALL","--user","1000:1000","--tmpfs","/tmp:rw,size=64m","-e","NCPU=8","-e","DATA_DIR=/data","-e","OUTPUT_DIR=/output","-e","SCRATCH_DIR=/scratch","-v",f"{root}/data:/data:ro","-v",f"{out}:/output","-v",f"{scratch}:/scratch","ranked","sleep","1800"],text=True).strip()
+          def run(env):
+              subprocess.run(["docker","exec",cid,"rm","-rf","/output/campaign_daily","/output/user_daily"],check=True)
+              extra = [arg for k,v in env.items() for arg in ("-e",f"{k}={v}")]
+              started=time.monotonic()
+              x=subprocess.run(["docker","exec",*extra,cid,"/app/shopping-sessions"],capture_output=True,text=True,check=True)
+              return time.monotonic()-started
+          run({})
+          ref = root / "ref"
+          shutil.copytree(out,ref)
+          base="background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto"
+          candidates=[{}]
+          for arenas, oversize, retain in itertools.product((1,2,8), (0,8388608), ("true","false")):
+              candidates.append({"MALLOC_CONF":f"abort_conf:true,{base},narenas:{arenas},oversize_threshold:{oversize},retain:{retain}"})
+          for extra in ("tcache:false", "tcache_max:65536", "lg_extent_max_active_fit:3", "lg_extent_max_active_fit:10"):
+              candidates.append({"MALLOC_CONF":f"abort_conf:true,{base},narenas:2,{extra}"})
+          rng=random.Random(int(os.environ["SEED"]))
+          samples=[[] for _ in candidates]
+          def stage(ids,rounds):
+              for _ in range(rounds):
+                  rng.shuffle(ids)
+                  for ix in ids: samples[ix].append(run(candidates[ix]))
+          stage(list(range(len(candidates))),3)
+          idx=sorted(range(len(samples)),key=lambda ix:statistics.median(samples[ix]))[:5]
+          if 0 not in idx: idx.append(0)
+          stage(idx,5)
+          for ix in sorted(range(len(samples)),key=lambda ix:statistics.median(samples[ix])):
+              print("TUNE",json.dumps(candidates[ix]),len(samples[ix]),round(statistics.median(samples[ix])/statistics.median(samples[0]),4),flush=True)
+          winner=min(idx,key=lambda ix:statistics.median(samples[ix]))
+          run(candidates[winner])
+          for t in ("user_daily","campaign_daily"):
+              a,b=[f"SELECT * FROM read_parquet('{d}/{t}/*.parquet')" for d in (out,ref)]
+              for x,y in ((a,b),(b,a)):
+                  assert duckdb.sql(f"SELECT count(*) FROM ({x} EXCEPT ALL {y})").fetchone()[0]==0
+          subprocess.run(["docker","rm","-f",cid],check=True)
