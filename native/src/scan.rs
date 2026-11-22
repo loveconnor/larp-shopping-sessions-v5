@@ -66,20 +66,13 @@ impl Source {
         }
     }
 
-    /// Unmaps the pages of `[start, end)` now, from whichever thread calls. Left
-    /// mapped, the kernel would unmap the whole file on one thread at exit,
-    /// inside the timed run.
-    pub fn release(&self, start: u64, end: u64) {
+    /// Discard the read-only input PTEs once every block has been decoded.
+    /// The mapping remains valid and the kernel retains the file cache.
+    pub fn release_read_pages(&self) {
         #[cfg(target_os = "linux")]
         if !self.map.is_null() {
-            let from = (self.map as usize + start as usize + 4095) & !4095;
-            let to = (self.map as usize + end as usize) & !4095;
-            if to > from {
-                unsafe { madvise(from as *mut _, to - from, 4) };
-            }
+            unsafe { madvise(self.map.cast_mut().cast(), self.size as usize, 4) };
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = (start, end);
     }
 }
 

@@ -33,8 +33,6 @@ const SESSION_GAP: u64 = 1_800_000;
 const BLOCK: u64 = 1 << 19;
 /// Bytes of a links file read at a time.
 const LINK_BLOCK: u64 = 1 << 19;
-/// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
-const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
 const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -521,6 +519,7 @@ struct Shared {
     campaign_names: Vec<Vec<u8>>,
     campaign_channels: Vec<Vec<u8>>,
     files: Vec<Source>,
+    pending_reads: Vec<AtomicUsize>,
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
@@ -909,6 +908,11 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+        }
+        if let Some(pending) = shared.pending_reads.get(work.file) {
+            if pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                shared.files[work.file].release_read_pages();
+            }
         }
     }
     Ok((events, clicks))
@@ -1610,7 +1614,9 @@ fn main() -> io::Result<()> {
     // every input page on one thread.
     let release_pages = large || (cfg!(target_os = "linux") && map_by_default && map);
     let give_back = tune("SS_RELEASE", u64::from(release_pages)) != 0;
+    let mut pending_reads = Vec::new();
     for (file, source) in files.iter_mut().enumerate() {
+        let first = work.len();
         if map {
             source.map_input();
         }
@@ -1621,6 +1627,9 @@ fn main() -> io::Result<()> {
                 work.push(Work { events: file < event_files, copy: copy << 56, file, start, end });
                 start = end;
             }
+        }
+        if cfg!(target_os = "linux") && map && give_back {
+            pending_reads.push(AtomicUsize::new(work.len() - first));
         }
     }
 
@@ -1644,6 +1653,7 @@ fn main() -> io::Result<()> {
         campaign_names,
         campaign_channels,
         files,
+        pending_reads,
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
@@ -1775,30 +1785,15 @@ fn main() -> io::Result<()> {
 
     // Nothing reads any of this any more. Give it back from every thread at
     // once: left to the kernel, it is freed on one thread at exit, on the clock.
-    let mut segments = Vec::new();
-    for (file, source) in shared.files.iter().enumerate() {
-        let mut start = 0;
-        while start < source.size {
-            segments.push((file, start, (start + SEGMENT).min(source.size)));
-            start += SEGMENT;
-        }
-    }
-    if !give_back {
-        segments.clear();
-    }
-    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
-            let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (events, clicks) = (&events, &clicks);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
                 clicks[thread].buckets.release();
-                while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    shared.files[file].release(start, end);
-                }
             });
         }
         if let Some(links) = shared.links.get().filter(|_| give_back) {
