@@ -11,17 +11,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["757011,139942,767479", "313416,777780,345921", "827553,791182,323465", "503995,615041,429240", "914187,298329,581963", "703309,802149,888755"]
+        seed_list: ["985636,735281,225964", "820235,215942,476660", "810461,521645,170773", "179201,376467,789476", "617541,345549,196798", "476141,820073,321554"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: bf5e73ec8064377d11ba8fcab23369d983df9efa
-      CANDIDATE: b18503da2698072437865118356eae0cb72e7efd
+      CANDIDATE: ae784b93b8e6f9606636c1aec8e9041efd810f74
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Check CPU and build the two submission images
+      - name: Identify compatible native hosts using the production selector
+        run: |
+          lscpu | grep -E '^Model name:|^CPU family:|^Model:|^Vendor ID:'
+          probe="$RUNNER_TEMP/selector-probe"
+          mkdir "$probe"
+          git show "${CANDIDATE}:native/platform/select-engine.c" > "$probe/selector.c"
+          cc -Os -static "$probe/selector.c" -o "$probe/selector"
+          for engine in base v3 v4 n4 wide p19; do
+            cat > "$probe/selector.$engine" <<'EOF'
+          #!/bin/sh
+          echo "${0##*.}"
+          EOF
+            chmod +x "$probe/selector.$engine"
+          done
+          selected=$("$probe/selector")
+          echo "Actual selector chose $selected"
+          echo "SELECTED=$selected" >> "$GITHUB_ENV"
+      - name: Build both release images on compatible hosts
+        if: env.SELECTED == 'p19'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           for label in ranked candidate; do
@@ -40,19 +58,10 @@ jobs:
           for engine in base v3 v4 n4 wide; do
             cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/candidate/shopping-sessions.$engine"
           done
-          probe="$RUNNER_TEMP/selector-probe"
-          mkdir "$probe"
-          cp "$RUNNER_TEMP/candidate/shopping-sessions" "$probe/selector"
-          for engine in base v3 v4 n4 wide p19; do
-            cat > "$probe/selector.$engine" <<'EOF'
-          #!/bin/sh
-          echo "${0##*.}"
-          EOF
-            chmod +x "$probe/selector.$engine"
-          done
-          selected=$("$probe/selector")
-          echo "Actual selector chose $selected"
-          echo "SELECTED=$selected" >> "$GITHUB_ENV"
+          cd "$RUNNER_TEMP/candidate-src/native"
+          patch -p2 < platform/wide.patch
+          patch -p2 < platform/register-merge.patch
+          docker run --rm -v "$PWD:/src" -w /src -e RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+avx512vbmi2" rust:1.90-slim-bookworm cargo test --locked --release merged_histories_match_unsigned_sort
           docker tag ranked control
       - name: Generate fresh data
         if: env.SELECTED == 'p19'
