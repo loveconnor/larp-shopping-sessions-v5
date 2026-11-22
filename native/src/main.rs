@@ -1183,8 +1183,7 @@ fn session_worker(
     let mut table_keys: Vec<u64> = Vec::new();
     let mut table_ids: Vec<u32> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
-    let mut ends: Vec<u32> = Vec::new();
-    let mut local: Vec<u32> = Vec::new();
+    let mut runs: Vec<(usize,usize,usize)> = Vec::new();
     let mut values: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
@@ -1209,8 +1208,9 @@ fn session_worker(
         table_ids.clear();
         table_ids.resize(capacity, 0);
         persons.clear();
-        ends.clear();
-        local.clear();
+        runs.clear();
+        values.clear();
+        values.reserve(total);
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
@@ -1226,13 +1226,22 @@ fn session_worker(
                             *table_keys.get_unchecked_mut(slot) = person;
                             *table_ids.get_unchecked_mut(slot) = id;
                             persons.push(person);
-                            ends.push(0);
+                            runs.push((values.len(), 0, 16));
+                            values.resize(values.len() + 16, 0);
                             break id;
                         }
                         slot = (slot + 1) & mask;
                     };
-                    *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
+                    let (base_index, len, limit) = runs.get_unchecked_mut(id as usize);
+                    if *len == *limit {
+                        let next = values.len();
+                        *limit *= 2;
+                        values.resize(next + *limit, 0);
+                        values.copy_within(*base_index..*base_index + *len, next);
+                        *base_index = next;
+                    }
+                    *values.get_unchecked_mut(*base_index + *len) = (*base.add(offset)).value;
+                    *len += 1;
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
                         mask = capacity - 1;
@@ -1249,26 +1258,6 @@ fn session_worker(
                             table_ids[slot] = id as u32;
                         }
                     }
-                }
-            }
-            // `ends` holds counts; make it each person's first slot, then fill,
-            // which leaves it at each person's end.
-            let mut sum = 0u32;
-            for end in ends.iter_mut() {
-                let count = *end;
-                *end = sum;
-                sum += count;
-            }
-            if values.len() < total {
-                values.resize(total, 0);
-            }
-            let mut index = 0;
-            for &(base, count) in &event_chunks {
-                for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
-                    *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
-                    *end += 1;
-                    index += 1;
                 }
             }
         }
@@ -1339,11 +1328,11 @@ fn session_worker(
             }
         }
 
-        let (mut from, mut click_from) = (0usize, 0usize);
+        let mut click_from = 0usize;
         for (id, &person) in persons.iter().enumerate() {
-            let to = ends[id] as usize;
+            let (from, len, _) = runs[id];
             let click_to = click_ends[id] as usize;
-            let mine = &mut values[from..to];
+            let mine = &mut values[from..from + len];
             if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
             } else {
@@ -1354,7 +1343,6 @@ fn session_worker(
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
             sessions.person(person, mine, reached)?;
-            from = to;
             click_from = click_to;
         }
     }
