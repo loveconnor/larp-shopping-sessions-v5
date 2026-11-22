@@ -277,18 +277,12 @@ impl Dim {
     }
 }
 
-#[repr(C, align(64))]
-#[derive(Clone, Default)]
-struct AliasGroup {
-    keys: [u64; 4],
-    values: [u64; 4],
-}
-
-/// Only aliases need an entry. A missing key is already its canonical name.
+/// Only noncanonical names occupy a row. The directory gives the exact
+/// range sharing each hash prefix, including the empty ranges.
 struct Links {
-    slots: Vec<AliasGroup>,
-    shift: u32,
-    empty: bool,
+    slots: Vec<[u64;2]>,
+    offsets: Vec<u32>,
+    shift:u32,
 }
 
 impl Links {
@@ -366,57 +360,45 @@ impl Links {
         }
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
-        let mut groups = vec![AliasGroup::default(); count];
-        huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
-            if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
+        let mut offsets=vec![0u32;count+1];
+        let mut entries=Vec::with_capacity(aliases);
+        for [key,id] in slots {
+            if key==0 { continue; }
+            let person=names[id as usize];
+            if key!=person {
+                let group=(key.wrapping_mul(MIX)>>shift) as usize;
+                offsets[group+1]+=1;
+                entries.push([key,person]);
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        for i in 1..offsets.len() { offsets[i]+=offsets[i-1]; }
+        let mut cursor=offsets.clone();
+        let mut rows=vec![[0;2];entries.len()];
+        huge(rows.as_ptr(),rows.len());
+        for row in entries {
+            let group=(row[0].wrapping_mul(MIX)>>shift) as usize;
+            rows[cursor[group] as usize]=row;
+            cursor[group]+=1;
+        }
+        Self{slots:rows,offsets,shift}
     }
 
     #[inline(always)]
-    fn prefetch(&self, key: u64) {
-        if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
-        }
+    fn prefetch(&self,key:u64) {
+        let group=(key.wrapping_mul(MIX)>>self.shift) as usize;
+        let begin=self.offsets[group] as usize;
+        if let Some(row)=self.slots.get(begin) { prefetch(row); }
     }
 
     #[inline(always)]
-    fn person(&self, key: u64) -> u64 {
-        if self.empty {
-            return key;
+    fn person(&self,key:u64)->u64 {
+        let group=(key.wrapping_mul(MIX)>>self.shift) as usize;
+        let start=self.offsets[group] as usize;
+        let end=self.offsets[group+1] as usize;
+        for &[name,person] in unsafe { self.slots.get_unchecked(start..end) } {
+            if name==key {return person;}
         }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
-        loop {
-            let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use std::arch::x86_64::*;
-                let keys = _mm256_load_si256(group.keys.as_ptr().cast());
-                let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
-            }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
-            }
-            if group.keys[3] == 0 { return key; }
-            slot = (slot + 1) & mask;
-        }
+        key
     }
 }
 
