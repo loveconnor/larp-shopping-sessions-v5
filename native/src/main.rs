@@ -35,7 +35,7 @@ const BLOCK: u64 = 1 << 19;
 const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
-const ID_BITS: u32 = 10;
+const ID_BITS: u32 = 6;
 const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
@@ -828,7 +828,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
-    let mut table: Vec<u32> = Vec::new();
+    // The parser scatters wide records to a small number of streams. The
+    // second radix pass moves only tags and compact chunk offsets.
+    let mut groups: [Vec<(u32,u32)>;64] = std::array::from_fn(|_| Vec::new());
+    let mut table: Vec<(u32,u32)> = Vec::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -844,49 +847,53 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
-        let capacity = (total * 2).next_power_of_two();
-        let mask = capacity - 1;
-        table.clear();
-        table.resize(capacity, NONE);
+        for group in &mut groups { group.clear(); }
         unsafe {
-            for (index, &(base, count)) in chunks.iter().enumerate() {
+            for (index,&(base,count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
-                    let record = base.add(offset);
-                    let id = (*record).id;
+                    let id = (*base.add(offset)).id;
+                    let key = if shared.defer_long_events && id & LONG_EVENT == LONG_EVENT {
+                        (id >> 32) & EVENT_FINGERPRINT
+                    } else { id };
+                    let hash = key.wrapping_mul(MIX);
+                    let subgroup = ((hash >> 48) & 63) as usize;
+                    let tag = (hash ^ (hash >> 32)) as u32;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
-                    let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    groups[subgroup].push((tag,entry));
+                }
+            }
+            let read = |entry:u32| {
+                chunks.get_unchecked((entry >> OFFSET_BITS) as usize).0.add((entry & ((1 << OFFSET_BITS)-1)) as usize)
+            };
+            for group in &groups {
+                if group.is_empty() { continue; }
+                let capacity = (group.len()*2).next_power_of_two();
+                table.clear();
+                table.resize(capacity,(0,NONE));
+                for &(tag,entry) in group {
+                    let mut slot = tag as usize & (capacity-1);
                     loop {
-                        let seen = *table.get_unchecked(slot);
+                        let (seen_tag,seen) = *table.get_unchecked(slot);
                         if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
+                            *table.get_unchecked_mut(slot) = (tag,entry);
                             break;
                         }
-                        let other = chunks
-                            .get_unchecked((seen >> OFFSET_BITS) as usize)
-                            .0
-                            .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
-                        let other_id = (*other).id;
-                        let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
-                        } else {
-                            id == other_id
-                        };
-                        if equal {
-                            if (*record).ingest < (*other).ingest {
-                                (*other).ts = DEAD;
-                                *table.get_unchecked_mut(slot) = entry;
-                            } else {
-                                (*record).ts = DEAD;
+                        if seen_tag == tag {
+                            let (record,other) = (read(entry),read(seen));
+                            let (id,other_id) = ((*record).id,(*other).id);
+                            let equal = if shared.defer_long_events && id & LONG_EVENT == LONG_EVENT {
+                                id >> 32 == other_id >> 32 && sources[owners[(entry>>OFFSET_BITS) as usize]].names[id as u32 as usize]
+                                      == sources[owners[(seen>>OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                            } else { id == other_id };
+                            if equal {
+                                if (*record).ingest < (*other).ingest {
+                                    (*other).ts = DEAD;
+                                    *table.get_unchecked_mut(slot) = (tag,entry);
+                                } else { (*record).ts = DEAD; }
+                                break;
                             }
-                            break;
                         }
-                        slot = (slot + 1) & mask;
+                        slot = (slot+1) & (capacity-1);
                     }
                 }
             }
