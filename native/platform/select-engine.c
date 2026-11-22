@@ -8,8 +8,9 @@ static unsigned cpu_family(unsigned signature) {
     return base == 15 ? base + ((signature >> 20) & 255) : base;
 }
 
-static int use_family19_profile(void) {
+static int use_streaming_merge(void) {
     unsigned signature, ebx, ecx, edx;
+    if (__builtin_cpu_is("intel")) return 1;
     return __builtin_cpu_is("amd") && __get_cpuid(1, &signature, &ebx, &ecx, &edx)
         && cpu_family(signature) == 0x19;
 }
@@ -22,7 +23,7 @@ int main(int argc, char **argv) {
     if (__builtin_cpu_supports("x86-64-v4")) {
         engine = ".n4";
         if (__builtin_cpu_supports("avx512vbmi2")) {
-            engine = use_family19_profile() ? ".p19" : ".wide";
+            engine = use_streaming_merge() ? ".p19" : ".wide";
         }
     } else if (__builtin_cpu_supports("x86-64-v3")) {
         engine = ".v3";
