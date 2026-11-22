@@ -275,6 +275,7 @@ impl Dim {
 
 /// user ID -> person, for every ID that a link names.
 struct Links {
+    fixed_names: Vec<u64>,
     slots: Vec<[u64; 2]>,
     shift: u32,
     empty: bool,
@@ -351,12 +352,15 @@ impl Links {
         for (id, &up) in parent.iter().enumerate() {
             names[id] = names[up as usize];
         }
+        let mut fixed_names = vec![0; keys::user_capacity()];
         for entry in &mut slots {
             if entry[0] != 0 {
                 entry[1] = names[entry[1] as usize];
+                if let Some(slot) = keys::user_slot(entry[0]) { fixed_names[slot] = entry[1]; }
             }
         }
         Self {
+            fixed_names,
             slots,
             shift,
             empty: pairs.is_empty(),
@@ -365,13 +369,19 @@ impl Links {
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty {
+        if let Some(slot) = keys::user_slot(key) {
+            prefetch(&self.fixed_names[slot]);
+        } else if !self.empty {
             prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
+        if let Some(slot) = keys::user_slot(key) {
+            let person = self.fixed_names[slot];
+            return if person == 0 { key } else { person };
+        }
         if self.empty {
             return key;
         }

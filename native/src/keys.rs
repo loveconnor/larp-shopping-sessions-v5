@@ -89,6 +89,14 @@ struct UserSlot {
 unsafe impl Sync for UserSlot {}
 static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::new();
 
+#[inline(always)]
+pub fn user_slot(key: u64) -> Option<usize> {
+    let tag = INTERNED | FIXED_USER;
+    ((key & tag) == tag).then_some((key & !tag) as usize)
+}
+
+pub fn user_capacity() -> usize { USER_SLOTS.get().map_or(0, |slots| slots.len()) }
+
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
         let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
