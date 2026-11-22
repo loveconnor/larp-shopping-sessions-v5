@@ -1236,6 +1236,80 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    /// Try assembling a short history from at most eight disjoint sessions.
+    /// If an intermediate prefix needs more, the caller sorts the original rows.
+    fn try_short_components(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<bool> {
+        #[derive(Default, Clone, Copy)]
+        struct Span { first: u32, last: u32, count: u32, revenue: u64 }
+        let mut spans = [Span::default(); 8];
+        let mut used = 0;
+        let mut purchases = [0u64; 64];
+        let mut bought = 0;
+        for &value in events {
+            let ts = (value >> 32) as u32;
+            let price = value & 0xff_ffff;
+            let low = ts.saturating_sub(SESSION_GAP as u32);
+            let high = ts.saturating_add(SESSION_GAP as u32);
+            let mut slot = 0;
+            while slot < used && spans[slot].last < low { slot += 1; }
+            if slot == used || spans[slot].first > high {
+                if used == spans.len() { return Ok(false); }
+                spans.copy_within(slot..used, slot + 1);
+                spans[slot] = Span { first: ts, last: ts, count: 1, revenue: price };
+                used += 1;
+            } else {
+                let span = &mut spans[slot];
+                span.first = span.first.min(ts);
+                span.last = span.last.max(ts);
+                span.count += 1;
+                span.revenue += price;
+                if slot + 1 < used && spans[slot + 1].first <= high {
+                    let next = spans[slot + 1];
+                    spans[slot].last = spans[slot].last.max(next.last);
+                    spans[slot].count += next.count;
+                    spans[slot].revenue += next.revenue;
+                    spans.copy_within(slot + 2..used, slot + 1);
+                    used -= 1;
+                }
+            }
+            if price != 0 {
+                purchases[bought] = value;
+                bought += 1;
+            }
+        }
+        let day_offset = self.shared.day_offset;
+        let day_of = |time: u32| ((day_offset + u64::from(time)) / DAY as u64) as u32;
+        let mut from = 0;
+        let mut cursor = (0, 0);
+        while from < used {
+            let day = day_of(spans[from].first);
+            let mut until = from;
+            let mut count = 0;
+            let mut revenue = 0;
+            while until < used && day_of(spans[until].first) == day {
+                let span = spans[until];
+                cursor = self.credit(clicks, cursor, u64::from(span.first), day, span.revenue, span.revenue != 0);
+                count += span.count;
+                revenue += span.revenue;
+                until += 1;
+            }
+            let first = spans[from].first;
+            let last = spans[until - 1].last;
+            for &purchase in &purchases[..bought] {
+                let at = (purchase >> 32) as u32;
+                if at >= first && at <= last {
+                    let category = ((purchase >> 24) & 255) as usize;
+                    if self.sums[category] == 0 { self.touched.push(category as u8); }
+                    self.sums[category] += purchase & 0xff_ffff;
+                }
+            }
+            self.row(person, day, (until-from) as u32, count, revenue)?;
+            from = until;
+        }
+        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        Ok(true)
+    }
+
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
@@ -1556,6 +1630,11 @@ fn session_worker(
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+            }
+            if (8..=64).contains(&mine.len()) && sessions.try_short_components(person, mine, reached)? {
+                from = to;
+                click_from = click_to;
+                continue;
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
