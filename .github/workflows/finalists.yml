@@ -1,7 +1,7 @@
 name: Compare the current release, two AMD-specific changes, and their combination
 on:
   push:
-    branches: [bench/family19-sort-comparison]
+    branches: [bench/stream-profile-schedule]
 permissions:
   contents: read
 jobs:
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["354179,608391,816793", "965263,713993,316817", "435281,698671,865713", "739473,590623,971491", "547531,977107,694543", "763973,302143,812681"]
+        seed_list: ["346590,298636,626778", "850484,671218,339842", "919705,199465,220123", "426182,824944,138033", "688075,232616,786424", "244079,460341,139490"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
-      RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 846a15a7bd3eda7a2a04581f25b48087093b42ea
+      RANKED: bf5e73ec8064377d11ba8fcab23369d983df9efa
+      CANDIDATE: c1f4dc0dc82197f71ea4bec36722688e2c7cf73f
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,8 +45,8 @@ jobs:
           for label in ranked candidate sorter combined; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = sorter ]; then sha=1426671a3250e5dcb5342c29ea6238942350685f; fi
-            if [ "$label" = combined ]; then sha=225f705d906a98cafac0117242ab8c80d7838659; fi
+            if [ "$label" = sorter ]; then sha=faf7a64332db78809a950daf53ca0326d906e420; fi
+            if [ "$label" = combined ]; then sha=5085884a63d3e70c2a7bdd9702d058d1315dc5d2; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
