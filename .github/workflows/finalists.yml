@@ -1,7 +1,7 @@
 name: Compare two matched-profile builds of dominant-partition grouping on identical test data
 on:
   push:
-    branches: [bench/profile-crossover]
+    branches: [bench/busy-attribution-crossover]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 509297}
-          - {events: 60000000, format: current, seed: 509297}
-          - {events: 20000000, format: current, seed: 154897}
-          - {events: 60000000, format: current, seed: 154897}
+          - {events: 20000000, format: current, seed: 638997}
+          - {events: 60000000, format: current, seed: 638997}
+          - {events: 20000000, format: current, seed: 727881}
+          - {events: 60000000, format: current, seed: 727881}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      FRESH: a8aa5e48f718f678d48053d8cd7fb48b9f925b77
-      SURGICAL: c7447c5df76c5d97a596fc954e59bc2597597950
+      FRESH: d3e2c2f5874e5b37e4d3f0dc874d07a58305315a
+      SURGICAL: 97ff6611d502f2b6d6410d13375450c6410a690c
     steps:
       - uses: actions/checkout@v4
         with:
