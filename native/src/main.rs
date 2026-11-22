@@ -655,30 +655,42 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let (id, partition_hash) = if n == 33 && shared.defer_long_events {
-            let bytes = &*p.cast::<[u8; 33]>();
-            let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
-            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
-        } else {
-            let id = keys::pack(p, n);
-            if id == 0 {
-                return;
-            }
+        let (name,name_len) = field(1);
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let pair = if n == 9 && name_len == 9 { keys::pair_nine(p,name) } else { None };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        let pair: Option<(u64,u64)> = None;
+        let (id,partition_hash,deferred,mixed,user) = if let Some((id,user)) = pair {
             let id = id ^ copy;
-            (id, id.wrapping_mul(MIX))
+            (id,id.wrapping_mul(MIX),false,0,user ^ copy)
+        } else {
+    
+            let (id, partition_hash) = if n == 33 && shared.defer_long_events {
+                let bytes = &*p.cast::<[u8; 33]>();
+                let fingerprint = event_fingerprint(bytes);
+                let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
+                out.names.push(*bytes);
+                (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+            } else {
+                let id = keys::pack(p, n);
+                if id == 0 {
+                    return;
+                }
+                let id = id ^ copy;
+                (id, id.wrapping_mul(MIX))
+            };
+    
+            let deferred = name_len == 33 && shared.defer_long_events;
+            let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
+            let user = if deferred { 1 } else { keys::pack_user(name,name_len) };
+            let user = if user == 0 { 0 } else { user ^ copy };
+            (id, partition_hash, deferred, mixed, user)
         };
         let (p, n) = field(3);
         let ingest = ts::ingest(p, n, dates);
         if ingest == ts::BAD {
             return;
         }
-        let (name,n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
-        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
-        let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
