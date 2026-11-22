@@ -1124,11 +1124,24 @@ impl Sessions<'_> {
     }
 
     #[inline(always)]
-    fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
+    fn credit<const SMALL:bool>(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
         let (mut low, mut high) = cursor;
         let days = self.shared.days;
         let mut credited = 0usize;
-        if !clicks.is_empty() {
+        if SMALL {
+            let mut prior=None;
+            for click in clicks {
+                if u64::from(click.ts).wrapping_sub(start)<=WEEK as u64 {
+                    let campaign=click.campaign as usize;
+                    if prior.is_none_or(|(_,c)| c!=campaign) {
+                        self.totals[campaign*days+day as usize][3]+=1;
+                    }
+                    // Equal timestamps are ordered by their exact click IDs.
+                    if prior.is_none_or(|(t,_)|t!=click.ts) {credited=campaign;}
+                    prior=Some((click.ts,campaign));
+                }
+            }
+        } else if !clicks.is_empty() {
             // A click's `ts` counts from 7 days before the events' zero, so
             // the clicks in reach are those with start <= ts <= start + 7 days.
             let limit = start + WEEK as u64;
@@ -1202,7 +1215,7 @@ impl Sessions<'_> {
                 let bin = std::mem::take(&mut scratch.bins[index]);
                 if current_day == NONE || u64::from(bin.first - last) > SESSION_GAP {
                     if current_day != NONE {
-                        cursor = self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
+                        cursor = self.credit::<false>(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
                     }
                     start = bin.first;
                     revenue = 0;
@@ -1230,14 +1243,14 @@ impl Sessions<'_> {
                 }
             }
         }
-        self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
+        self.credit::<false>(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
         for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
         Ok(())
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
-    fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
+    fn person<const SMALL:bool>(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
         let (mut low, mut high) = (0usize, 0usize);
         let mut at = 0;
@@ -1280,7 +1293,7 @@ impl Sessions<'_> {
             day_events += (at - first) as u32;
             day_revenue += revenue;
 
-            (low, high) = self.credit(clicks, (low, high), start, day, revenue, purchased);
+            (low, high) = self.credit::<SMALL>(clicks, (low, high), start, day, revenue, purchased);
         }
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
@@ -1567,7 +1580,8 @@ fn session_worker(
                 }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
-                sessions.person(person, mine, reached)?;
+                if reached.len()<=2 {sessions.person::<true>(person,mine,reached)?;}
+                else {sessions.person::<false>(person,mine,reached)?;}
             } else {
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
