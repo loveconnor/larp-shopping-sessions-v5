@@ -597,18 +597,34 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
         while start < size {
             let end = (start + LINK_BLOCK).min(size);
             block.load(&source, start, end)?;
-            block.raw_lines::<2>(|buf, start, seps| unsafe {
-                let (p, n) = scan::field(buf, start, seps, 0);
-                let a = keys::pack_user(p, n);
-                let (p, n) = scan::field(buf, start, seps, 1);
-                let b = keys::pack_user(p, n);
-                if a != 0 && b != 0 && a != b {
-                    pairs.push((a, b));
+            let mut queued = Vec::with_capacity(32);
+            let drain = |queued: &mut Vec<(*const u8, u64, usize, bool)>, pairs: &mut Vec<(u64,u64)>| {
+                for (name, hash, row, right) in queued.drain(..) {
+                    let user = unsafe { keys::finish_long_user(name, hash) };
+                    if right { pairs[row].1 = user; } else { pairs[row].0 = user; }
                 }
+            };
+            block.raw_lines::<2>(|buf, start, seps| unsafe {
+                let (left, nl) = scan::field(buf, start, seps, 0);
+                let (right, nr) = scan::field(buf, start, seps, 1);
+                if nl == 0 || nr == 0 { return; }
+                let row = pairs.len();
+                let mut user = |p,n,is_right| {
+                    if n == 33 && shared.defer_long_events {
+                        queued.push((p, keys::prepare_long_user(p), row, is_right));
+                        1
+                    } else { keys::pack_user(p,n) }
+                };
+                let a = user(left,nl,false);
+                let b = user(right,nr,true);
+                pairs.push((a,b));
+                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
             });
+            drain(&mut queued, &mut pairs);
             start = end;
         }
     }
+    pairs.retain(|&(a,b)| a != 0 && b != 0 && a != b);
     Ok(Links::build(&pairs))
 }
 
@@ -790,6 +806,12 @@ fn parse_clicks(
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
+    let mut queued = Vec::with_capacity(16);
+    let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
+        for (name, hash, index) in queued.drain(..) {
+            pending[index].user = unsafe { keys::finish_long_user(name,hash) };
+        }
+    };
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -800,8 +822,10 @@ fn parse_clicks(
         } else {
             keys::pack(p, n)
         };
-        let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let (name, n) = field(1);
+        let deferred = n == 33 && shared.defer_long_events;
+        let hash = if deferred { keys::prepare_long_user(name) } else { 0 };
+        let user = if deferred { 1 } else { keys::pack_user(name,n) };
         if id == 0 || user == 0 {
             return;
         }
@@ -813,13 +837,19 @@ fn parse_clicks(
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
+        let index = pending.len();
         pending.push(RawClick {
             user,
             id,
             ts: (at - earliest) as u32,
             campaign,
         });
+        if deferred {
+            queued.push((name, hash, index));
+            if queued.len() == 16 { drain(&mut queued,pending); }
+        }
     });
+    drain(&mut queued,pending);
     let links = loop {
         match shared.links.get() {
             Some(links) => break links,
