@@ -236,20 +236,44 @@ unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
 unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     use std::arch::x86_64::*;
-    const OFFSETS: [u8; 64] = {
-        let mut a = [0; 64];
-        let mut i = 0;
-        while i < 64 { a[i] = i as u8; i += 1; }
-        a
-    };
-    let n = bits.count_ones() as usize;
-    if n > 16 {
-        return flatten::<10>(bits, base, out);
+    #[cfg(target_feature = "bmi2")]
+    {
+        let count = bits.count_ones() as usize;
+        if count > 16 {
+            return flatten::<10>(bits, base, out);
+        }
+        // For each set bit, extract the six binary digits of its position.
+        // All planes depend only on the input mask and can execute in parallel.
+        let p0 = _pext_u64(0xaaaa_aaaa_aaaa_aaaa, bits) as u16;
+        let p1 = _pext_u64(0xcccc_cccc_cccc_cccc, bits) as u16;
+        let p2 = _pext_u64(0xf0f0_f0f0_f0f0_f0f0, bits) as u16;
+        let p3 = _pext_u64(0xff00_ff00_ff00_ff00, bits) as u16;
+        let p4 = _pext_u64(0xffff_0000_ffff_0000, bits) as u16;
+        let p5 = _pext_u64(0xffff_ffff_0000_0000, bits) as u16;
+        let lo = _mm512_or_si512(_mm512_maskz_set1_epi32(p0,1), _mm512_maskz_set1_epi32(p1,2));
+        let mid = _mm512_or_si512(_mm512_maskz_set1_epi32(p2,4), _mm512_maskz_set1_epi32(p3,8));
+        let hi = _mm512_or_si512(_mm512_maskz_set1_epi32(p4,16), _mm512_maskz_set1_epi32(p5,32));
+        let positions = _mm512_or_si512(lo,_mm512_or_si512(mid,hi));
+        _mm512_storeu_si512(out.cast(),_mm512_add_epi32(_mm512_set1_epi32(base as i32),positions));
+        count
     }
-    let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
-    let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
-    _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
-    n
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        const OFFSETS: [u8; 64] = {
+            let mut a = [0; 64];
+            let mut i = 0;
+            while i < 64 { a[i] = i as u8; i += 1; }
+            a
+        };
+        let n = bits.count_ones() as usize;
+        if n > 16 {
+            return flatten::<10>(bits, base, out);
+        }
+        let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
+        let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
+        _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
+        n
+    }
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
