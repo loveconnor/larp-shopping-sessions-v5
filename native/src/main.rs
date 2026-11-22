@@ -627,9 +627,69 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+/// Keep the full identity of long event IDs. Canonical hex needs just 16
+/// bytes. Other spellings retain their original bytes in a separate pool.
+#[derive(Default)]
+struct EventNames {
+    hex: Vec<[u8; 16]>,
+    raw: Vec<[u8; 33]>,
+}
+
+impl EventNames {
+    const RAW: u32 = 1 << 31;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    fn decode(bytes: &[u8; 33]) -> Option<[u8; 16]> {
+        use std::arch::x86_64::*;
+        if bytes[0] != b'e' { return None; }
+        unsafe {
+            let ascii = _mm256_loadu_si256(bytes.as_ptr().add(1).cast());
+            let digit = _mm256_sub_epi8(ascii, _mm256_set1_epi8(b'0' as i8));
+            let letter = _mm256_sub_epi8(ascii, _mm256_set1_epi8(b'a' as i8));
+            let non_digit = _mm256_subs_epu8(digit, _mm256_set1_epi8(9));
+            let non_letter = _mm256_subs_epu8(letter, _mm256_set1_epi8(5));
+            let invalid = _mm256_min_epu8(non_digit, non_letter);
+            if _mm256_testz_si256(invalid, invalid) == 0 { return None; }
+            let nibbles = _mm256_min_epu8(digit, _mm256_add_epi8(letter, _mm256_set1_epi8(10)));
+            let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+            let packed = _mm_packus_epi16(_mm256_castsi256_si128(pairs), _mm256_extracti128_si256::<1>(pairs));
+            Some(std::mem::transmute::<__m128i, [u8; 16]>(packed))
+        }
+    }
+
+    #[inline(always)]
+    fn store(&mut self, bytes: &[u8; 33]) -> (u64, u32) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if let Some(name) = Self::decode(bytes) {
+            let at = self.hex.len();
+            assert!(at < Self::RAW as usize);
+            let low = u64::from_le_bytes(name[..8].try_into().unwrap());
+            let high = u64::from_le_bytes(name[8..].try_into().unwrap());
+            let mixed = (low ^ high.rotate_left(27)).wrapping_mul(MIX);
+            self.hex.push(name);
+            return (mixed >> 34, at as u32);
+        }
+        let at = self.raw.len();
+        assert!(at < Self::RAW as usize);
+        self.raw.push(*bytes);
+        (event_fingerprint(bytes), at as u32 | Self::RAW)
+    }
+
+    #[inline(always)]
+    fn equal(&self, left: u32, other: &Self, right: u32) -> bool {
+        if (left ^ right) & Self::RAW != 0 { return false; }
+        if left & Self::RAW == 0 {
+            self.hex[left as usize] == other.hex[right as usize]
+        } else {
+            self.raw[(left ^ Self::RAW) as usize] == other.raw[(right ^ Self::RAW) as usize]
+        }
+    }
+}
+
 struct EventSource {
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: EventNames,
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -644,9 +704,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
-            let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let (fingerprint, index) = out.names.store(bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -799,7 +857,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: EventNames::default() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -868,8 +926,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             // Equal fingerprints select candidates. Only the full bytes
                             // decide whether these two records are duplicates.
                             id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                                && sources[owners[index]].names.equal(
+                                    id as u32, &sources[owners[(seen >> OFFSET_BITS) as usize]].names, other_id as u32,
+                                )
                         } else {
                             id == other_id
                         };
