@@ -1360,6 +1360,37 @@ fn default_threads() -> usize {
     }
 }
 
+/// Keep each numbered worker on a consistent allowed CPU across stage barriers.
+#[cfg(target_os="linux")]
+fn pin_worker(worker:usize) {
+    unsafe extern "C" {
+        fn sched_getaffinity(pid:i32, size:usize, set:*mut u8)->i32;
+        fn sched_setaffinity(pid:i32, size:usize, set:*const u8)->i32;
+    }
+    static CPUS: std::sync::OnceLock<Vec<usize>>=std::sync::OnceLock::new();
+    let cpus=CPUS.get_or_init(||{
+        let mut mask=[0u8;128];
+        if unsafe{sched_getaffinity(0,mask.len(),mask.as_mut_ptr())}!=0{return vec![];}
+        let mut cpus=Vec::new(); let mut siblings=Vec::new(); let mut groups=std::collections::HashSet::new();
+        for i in 0..mask.len()*8 {
+            if mask[i/8]&(1<<(i%8))==0{continue;}
+            let path=format!("/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list");
+            match std::fs::read_to_string(path) {
+                Ok(key) if groups.contains(&key)=>siblings.push(i),
+                Ok(key)=>{groups.insert(key);cpus.push(i);}
+                Err(_)=>cpus.push(i)
+            }
+        }
+        cpus.extend(siblings);cpus
+    });
+    if cpus.is_empty(){return;}
+    let cpu=cpus[worker%cpus.len()];
+    let mut mask=[0u8;128];mask[cpu/8]=1<<(cpu%8);
+    unsafe{sched_setaffinity(0,mask.len(),mask.as_ptr());}
+}
+#[cfg(not(target_os="linux"))]
+fn pin_worker(_:usize) {}
+
 fn main() -> io::Result<()> {
     let began = Instant::now();
     if std::env::var_os("SS_DIAG").is_some() && std::env::var_os("SS_CHILD").is_none() {
@@ -1508,7 +1539,7 @@ fn main() -> io::Result<()> {
 
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
+            .map(|thread| scope.spawn(move || {pin_worker(thread);parse_worker(shared, thread)}))
             .collect();
         handles
             .into_iter()
@@ -1521,7 +1552,7 @@ fn main() -> io::Result<()> {
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|thread| {let (parsed,next)=(&parsed_events,&next); scope.spawn(move || {pin_worker(thread);dedup_worker(shared,parsed,next)})})
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
@@ -1543,7 +1574,7 @@ fn main() -> io::Result<()> {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
                 let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
+                scope.spawn(move || {pin_worker(thread);session_worker(shared, events, clicks, order, next, thread)})
             })
             .collect();
         handles
