@@ -36,6 +36,7 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 pub struct Dates {
     month: [u64; 100],
     midnight: [i64; 100],
+    day_key: [i64; 100],
 }
 
 impl Dates {
@@ -43,6 +44,7 @@ impl Dates {
         Self {
             month: [0; 100],
             midnight: [0; 100],
+            day_key: [0; 100],
         }
     }
 }
@@ -99,6 +101,7 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
             dates.month[slot] = raw;
             let midnight = days * 86_400;
             dates.midnight[slot] = midnight;
+            dates.day_key[slot] = days << 32;
             midnight
         };
         midnight + hour * 3_600 + minute * 60 + second
@@ -148,6 +151,7 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
             dates.month[slot] = raw;
             let midnight = days * 86_400;
             dates.midnight[slot] = midnight;
+            dates.day_key[slot] = days << 32;
             midnight
         };
         midnight + second
@@ -220,6 +224,50 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
         }
         (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
     }
+}
+
+// Within a civil day, packed decimal clocks order exactly as their
+// times. Leave ten low bits for milliseconds from non-F1 input forms.
+fn order_millis(ms: i64) -> i64 {
+    const DAY: i64 = 86_400_000;
+    let days = ms.div_euclid(DAY);
+    // All four-digit calendar years fit in the middle interval. Numeric
+    // timestamps accepted by digits_slow are bounded to about 10^18.
+    if days >= 4_000_000 { return ms + (1 << 55); }
+    if days < -4_000_000 { return ms - (1 << 55); }
+    let within = ms.rem_euclid(DAY);
+    let sec = within / 1000;
+    let bcd = |pair: i64| (pair / 10) * 16 + pair % 10;
+    let clock = (bcd(sec / 3600) << 16) | (bcd((sec / 60) % 60) << 8) | bcd(sec % 60);
+    (days << 32) | (clock << 10) | (within % 1000)
+}
+
+/// Return the exact ingestion order and whether this event met its deadline.
+#[inline(always)]
+pub unsafe fn ingest_order(p: *const u8, n: usize, at: i64, dates: &mut Dates) -> Option<(i64, bool)> {
+    const DAY: i64 = 86_400_000;
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    if n == 20 && *p.add(19) == b'Z' {
+        let day_chars = load32(p.add(8)) & 0xffffff;
+        let a = day_chars & 15;
+        let b = (day_chars >> 8) & 15;
+        let slot = (a * 10 + b) as usize;
+        let raw = load64(p);
+        if day_chars & 0xfff0f0 == 0x543030 && a < 10 && b < 10
+            && dates.month[slot] == raw && raw != 0 {
+            let text = load64(p.add(11));
+            let v = text ^ u64::from_le_bytes(*b"00:00:00");
+            let clock = std::arch::x86_64::_pext_u64(text.swap_bytes(), 0x0f0f_000f_0f00_0f0f);
+            if (v.wrapping_add(0x7676_7f76_767f_7676) | v) & HIGH == 0 &&
+                clock >> 16 <= 0x23 && clock & 0x00ff00 <= 0x005900 && clock & 0xff <= 0x59 {
+                let midnight = dates.midnight[slot] * 1000;
+                let timely = at >= midnight || (at >= midnight - DAY && ingest(p,n,dates) <= at + DAY);
+                return Some((dates.day_key[slot] | ((clock as i64) << 10), timely));
+            }
+        }
+    }
+    let value = parse(p,n,dates);
+    (value != BAD).then(|| (order_millis(value), at != BAD && value <= at + DAY))
 }
 
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.

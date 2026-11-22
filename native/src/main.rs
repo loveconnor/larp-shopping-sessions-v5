@@ -630,16 +630,13 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
+        let (p, n) = field(2);
+        let at = ts::parse(p, n, dates);
         let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
-        if ingest == ts::BAD {
-            return;
-        }
+        let Some((ingest, timely)) = ts::ingest_order(p, n, at, dates) else { return };
         let (p, n) = field(1);
         let user = keys::pack_user(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
-        let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -651,7 +648,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             && field(5).1 > 0
             && at >= window_start
             && at < window_end
-            && ingest - at <= DAY;
+            && timely;
         let mut payload = 0;
         if purchase && valid {
             let (p, n) = field(6);
