@@ -41,7 +41,8 @@ pub struct Dates {
 impl Dates {
     pub fn new() -> Self {
         Self {
-            month: [0; 100],
+            // No valid UTF-8 field can contain 0xff. NUL bytes are legal in CSV.
+            month: [u64::MAX; 100],
             midnight: [0; 100],
         }
     }
@@ -403,6 +404,7 @@ mod tests {
         );
         for bad in [
             "",
+            "\0\0\0\0\0\0\0\003T23:58:10Z",
             "2026-10-03T23:58:10.000Z",
             "2026-10-03T23:58:10z",
             "2026-10-03t23:58:10Z",
