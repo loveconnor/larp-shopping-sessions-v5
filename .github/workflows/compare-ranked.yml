@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 862079}
-          - {events: 60000000, format: current, seed: 862079}
-          - {events: 20000000, format: current, seed: 862099}
-          - {events: 60000000, format: current, seed: 862099}
+          - {events: 20000000, format: current, seed: 865213}
+          - {events: 60000000, format: current, seed: 865213}
+          - {events: 20000000, format: current, seed: 865231}
+          - {events: 60000000, format: current, seed: 865231}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 22a11e6d0bfff5f8779fa0fdbe8ef0f5c169e2e8
-      CANDIDATE: 29c7f4a14e71ae54d674d01f5f6ada871e011d75
+      CANDIDATE: 3b74f4fbfa088ae4eceaf976e9b63f8e6d2a9db2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,7 +67,7 @@ jobs:
           scratch = root / "scratch"
           scratch.mkdir(mode=0o777)
           scratch.chmod(0o777)
-          for round_number in range(6):
+          for round_number in range(8):
               for label in labels[::1 if round_number % 2 == 0 else -1]:
                   output = root / f"{label}-out-{round_number}"
                   output.mkdir()
@@ -93,7 +93,7 @@ jobs:
                   finally:
                       subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
           for table in ("user_daily", "campaign_daily"):
-              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-5/{table}/*.parquet')" for label in labels]
+              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-7/{table}/*.parquet')" for label in labels]
               for lhs, rhs in ((a,b),(b,a)):
                   assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
           for label in labels:
