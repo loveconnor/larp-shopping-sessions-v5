@@ -632,16 +632,27 @@ struct EventSource {
     names: Vec<[u8; 33]>,
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+const EVENT_BATCH: usize = 32;
+
+#[derive(Clone, Copy, Default)]
+struct EventRow {
+    start: u32,
+    seps: [u32; 7],
+}
+
+fn decode_event_batch(shared: &Shared, buf: *const u8, rows: &[EventRow], copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
-        let field = |at: usize| scan::field(buf, start, seps, at);
-        let (p, n) = field(0);
+    let blank = Parsed { id: 0, user: 0, ingest: ts::BAD, ts: DEAD, payload: 0 };
+    let mut records = [blank; EVENT_BATCH];
+    let mut partitions = [usize::MAX; EVENT_BATCH];
+    for (i, row) in rows.iter().enumerate() {
+        let (p, n) = unsafe { scan::field(buf, row.start, &row.seps, 0) };
+        unsafe {
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
@@ -651,19 +662,30 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
-                return;
+                continue;
             }
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
-        let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
-        if ingest == ts::BAD {
-            return;
+        records[i].id = id;
+        partitions[i] = (partition_hash >> id_shift) as usize;
         }
-        let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
-        let user = if user == 0 { 0 } else { user ^ copy };
+    }
+    for (row, record) in rows.iter().zip(&mut records) {
+        unsafe {
+            let (p, n) = scan::field(buf, row.start, &row.seps, 3);
+            record.ingest = ts::ingest(p, n, dates);
+            let (p, n) = scan::field(buf, row.start, &row.seps, 1);
+            let user = keys::pack_user(p, n);
+            record.user = if user == 0 { 0 } else { user ^ copy };
+        }
+    }
+    for (row, record) in rows.iter().zip(&mut records) {
+        unsafe {
+        let field = |at| scan::field(buf, row.start, &row.seps, at);
+        let user = record.user;
+        let ingest = record.ingest;
+        if ingest == ts::BAD { continue; }
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -691,15 +713,34 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
-        let record = Parsed {
-            id,
-            user,
-            ingest,
-            ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
-        };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        record.ts = if valid { (at - window_start) as u32 } else { DEAD };
+        record.payload = payload;
+        }
+    }
+    for i in 0..rows.len() {
+        let record = records[i];
+        if partitions[i] != usize::MAX && record.ingest != ts::BAD {
+            out.buckets.push(partitions[i], record);
+        }
+    }
+}
+
+fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    let mut rows = [EventRow::default(); EVENT_BATCH];
+    let mut count = 0;
+    let mut data = std::ptr::null();
+    block.raw_lines::<7>(|buf, start, seps| {
+        data = buf;
+        rows[count] = EventRow { start, seps: *seps };
+        count += 1;
+        if count == EVENT_BATCH {
+            decode_event_batch(shared, data, &rows, copy, dates, out);
+            count = 0;
+        }
     });
+    if count != 0 {
+        decode_event_batch(shared, data, &rows[..count], copy, dates, out);
+    }
 }
 
 struct ClickSource {
