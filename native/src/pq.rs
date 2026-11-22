@@ -2,11 +2,11 @@
 //! bytes written to the output disk are the expensive part of a scored run:
 //! integers are DELTA_BINARY_PACKED, a key that repeats on consecutive rows is
 //! a dictionary with run-length indices, and an optional category is a
-//! dictionary with bit-packed indices. The whole file is written in one call.
+//! dictionary with bit-packed indices. Completed row groups are written in order.
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -48,7 +48,8 @@ struct GroupMeta {
 }
 
 pub struct Writer {
-    path: PathBuf,
+    file: File,
+    written: u64,
     columns: Vec<Column>,
     dictionary: Vec<u8>,
     dictionary_len: usize,
@@ -258,7 +259,8 @@ impl Writer {
             plain.extend_from_slice(value);
         }
         Ok(Self {
-            path: path.to_path_buf(),
+            file: File::create(path)?,
+            written: 0,
             columns: columns
                 .iter()
                 .map(|&(name, kind)| Column {
@@ -326,11 +328,15 @@ impl Writer {
     }
 
     #[inline(always)]
-    pub fn end_row(&mut self) {
+    pub fn end_row(&mut self) -> io::Result<()> {
         self.rows += 1;
         if self.rows >= self.group_rows {
             self.flush();
+            self.file.write_all(&self.out)?;
+            self.written += self.out.len() as u64;
+            self.out.clear();
         }
+        Ok(())
     }
 
     /// A page: its header, then `body`. `dictionary` pages hold `values` PLAIN values.
@@ -365,7 +371,7 @@ impl Writer {
         let mut chunks = Vec::with_capacity(self.columns.len());
         let mut body = Vec::new();
         for column in &mut self.columns {
-            let offset = self.out.len() as u64;
+            let offset = self.written + self.out.len() as u64;
             let mut data_offset = offset;
             body.clear();
             match column.kind {
@@ -374,7 +380,7 @@ impl Writer {
                 }
                 Kind::Keyed => {
                     Self::page(&mut self.out, &column.bytes, column.runs.len(), true, 0);
-                    data_offset = self.out.len() as u64;
+                    data_offset = self.written + self.out.len() as u64;
                     // RLE_DICTIONARY: the index width, then one run per distinct value.
                     let bits = width(column.runs.len() as u64 - 1).max(1);
                     let wide = bits.div_ceil(8) as usize;
@@ -387,7 +393,7 @@ impl Writer {
                 }
                 Kind::Category => {
                     Self::page(&mut self.out, &self.dictionary, self.dictionary_len, true, 0);
-                    data_offset = self.out.len() as u64;
+                    data_offset = self.written + self.out.len() as u64;
                     // Definition levels: one bit-packed run of width 1.
                     let groups = rows.div_ceil(8);
                     let mut levels = Vec::new();
@@ -419,7 +425,7 @@ impl Writer {
             chunks.push(ChunkMeta {
                 offset,
                 data_offset,
-                size: self.out.len() as u64 - offset,
+                size: self.written + self.out.len() as u64 - offset,
             });
             column.bytes.clear();
             column.runs.clear();
@@ -510,7 +516,7 @@ impl Writer {
         self.out.extend_from_slice(&meta.out);
         self.out.extend_from_slice(&length.to_le_bytes());
         self.out.extend_from_slice(b"PAR1");
-        File::create(&self.path)?.write_all(&self.out)
+        self.file.write_all(&self.out)
     }
 }
 

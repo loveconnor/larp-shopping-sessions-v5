@@ -1119,7 +1119,7 @@ impl Sessions<'_> {
         }
         self.touched.clear();
         writer.category(5, top.map(|category| category as u8));
-        writer.end_row();
+        writer.end_row()?;
         Ok(())
     }
 
@@ -1840,7 +1840,7 @@ fn main() -> io::Result<()> {
             writer.int(4, sum[1]);
             writer.int(5, sum[2]);
             writer.int(6, sum[3]);
-            writer.end_row();
+            writer.end_row()?;
         }
     }
     writer.finish()?;
