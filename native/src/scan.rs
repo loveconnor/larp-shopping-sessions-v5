@@ -241,6 +241,29 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
     }
 }
 
+/// Writes the position of every set bit of `bits`, plus `base`, at `out`,
+/// and returns how many. Up to `UNROLL` are written without a branch; `out`
+/// needs room for 64 + `UNROLL`.
+#[inline(always)]
+unsafe fn flatten_short<const UNROLL: usize>(mut bits: u64, base: u16, out: *mut u16) -> usize {
+    unsafe {
+        let count = bits.count_ones() as usize;
+        for at in 0..UNROLL {
+            *out.add(at) = base.wrapping_add(bits.trailing_zeros() as u16);
+            bits &= bits.wrapping_sub(1);
+        }
+        if count > UNROLL {
+            let mut at = UNROLL;
+            while bits != 0 {
+                *out.add(at) = base.wrapping_add(bits.trailing_zeros() as u16);
+                bits &= bits.wrapping_sub(1);
+                at += 1;
+            }
+        }
+        count
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
 unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
@@ -254,7 +277,7 @@ unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
-unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+unsafe fn wide_positions(bits: u64, base: u16, out: *mut u16) -> usize {
     use std::arch::x86_64::*;
     const OFFSETS: [u8; 64] = {
         let mut a = [0; 64];
@@ -263,12 +286,12 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
         a
     };
     let n = bits.count_ones() as usize;
-    if n > 16 {
-        return flatten::<10>(bits, base, out);
+    if n > 32 {
+        return flatten_short::<10>(bits, base, out);
     }
     let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
-    let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
-    _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
+    let positions = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(packed));
+    _mm512_storeu_si512(out.cast(), _mm512_add_epi16(_mm512_set1_epi16(base as i16), positions));
     n
 }
 
@@ -533,7 +556,7 @@ impl Block {
                 return;
             }
             let end = end as u32;
-            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            let mut seps: Vec<u16> = Vec::with_capacity(WINDOW * 64 + 256);
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
             let mut bad: Vec<u32> = Vec::new();
@@ -545,6 +568,24 @@ impl Block {
             // its closing separator still to come.
             let mut carry = 0u64;
             while at < end {
+                let origin = line;
+                let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
+                // Very long records still use the full-width line parser.
+                // Restart at the following row with no quotes or separators carried.
+                if stop_at - origin >= u32::from(u16::MAX) {
+                    let rest = std::slice::from_raw_parts(buf.add(origin as usize), (end - origin) as usize);
+                    let Some(length) = rest.iter().position(|&b| b == b'\n') else { break; };
+                    if let Some(found) = Self::split_line::<N>(buf, origin as usize) {
+                        visit(buf, origin, &found);
+                    }
+                    line = origin + length as u32 + 1;
+                    at = line;
+                    kept = 0;
+                    carry = 0;
+                    bad.clear();
+                    bad_at = 0;
+                    continue;
+                }
                 if seps.capacity() < kept + WINDOW * 64 + 128 {
                     // The separators kept from the last window move with the buffer.
                     seps.set_len(kept);
@@ -554,7 +595,6 @@ impl Block {
                 let mut lines = 0usize;
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
-                let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
                 while at < stop_at {
                     let p = buf.add(at as usize);
                     fetch(p.wrapping_add(READ_AHEAD));
@@ -593,16 +633,16 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<7>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, (at-origin) as u16, out.add(count)) } else { flatten_short::<7>(sep, (at-origin) as u16, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
-                    let positions = flatten::<7>(sep, at, out.add(count));
+                    let positions = flatten_short::<7>(sep, (at-origin) as u16, out.add(count));
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
                 }
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
-                    *out.add(count + extra) = u32::MAX;
+                    *out.add(count + extra) = u16::MAX;
                 }
                 bad.push(u32::MAX - 64);
                 let mut sep_at = 0usize;
@@ -613,12 +653,14 @@ impl Block {
                         bad_at += 1;
                     }
                     let clean = *bad.get_unchecked(bad_at) > stop;
-                    if *out.add(sep_at + N - 1) == stop && clean {
-                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                    let relative_stop = (stop - origin) as u16;
+                    if *out.add(sep_at + N - 1) == relative_stop && clean {
+                        let found: [u32; N] = std::array::from_fn(|i| origin + u32::from(*out.add(sep_at + i)));
+                        visit(buf, start, &found);
                         sep_at += N;
                         continue;
                     }
-                    while *out.add(sep_at) < stop {
+                    while *out.add(sep_at) < relative_stop {
                         sep_at += 1;
                     }
                     sep_at += 1;
@@ -631,7 +673,9 @@ impl Block {
                 bad.pop();
                 // Separators of the line still open move to the front.
                 kept = count - sep_at;
-                std::ptr::copy(out.add(sep_at), out, kept);
+                for i in 0..kept {
+                    *out.add(i) = *out.add(sep_at + i) - (line - origin) as u16;
+                }
             }
         }
     }
@@ -796,6 +840,21 @@ mod tests {
         let previous_capacity = block.buf.capacity();
         block.reserve(previous_capacity + EXTRA);
         assert_eq!(&block.buf[PAD..PAD + 4], b"row,");
+    }
+
+    #[test]
+    fn long_rows_reset_relative_separator_positions() {
+        for length in [61439, 61440, 65534, 65535, 65536, 65537, 131071, 262177] {
+            for repeated in [b'x', b',', b'"'] {
+                let mut data = b"header\na,b,c,d\nwrong,arity\n".to_vec();
+                data.extend_from_slice(b"id,\"");
+                data.extend(std::iter::repeat_n(repeated, length));
+                data.extend_from_slice(b"\",c,d\nx,y,z,w\n\",broken,z,w\na,b,c,d");
+                for own in [4095, length - 2, length + 26, data.len()] {
+                    check::<4>(&data, own);
+                }
+            }
+        }
     }
 
     #[test]
