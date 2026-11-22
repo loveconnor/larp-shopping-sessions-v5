@@ -26,7 +26,7 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
         for level in base v3 v4 n4 wide; do \
             cpu=x86-64-$level; profile=v5; features=; build_features=; \
             case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; n4) profile=n4; cpu=x86-64-v4; build_features="--features narrow-v4" ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
-            RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
+            RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cllvm-args=--align-all-nofallthru-blocks=4 -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release $build_features --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
         done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
