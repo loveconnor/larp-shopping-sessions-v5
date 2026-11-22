@@ -1,6 +1,6 @@
-//! A small Parquet writer, uncompressed but with compact encodings, because
+//! A small Parquet writer with compact encodings, because
 //! bytes written to the output disk are the expensive part of a scored run:
-//! integers are DELTA_BINARY_PACKED, a key that repeats on consecutive rows is
+//! dates and counts are DELTA_BINARY_PACKED, 64-bit totals use LZ4-compressed PLAIN pages, a key that repeats on consecutive rows is
 //! a dictionary with run-length indices, and an optional category is a
 //! dictionary with bit-packed indices. The whole file is written in one call.
 
@@ -40,6 +40,7 @@ struct ChunkMeta {
     offset: u64,
     data_offset: u64,
     size: u64,
+    raw_size: u64,
 }
 
 struct GroupMeta {
@@ -174,6 +175,54 @@ fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) 
         }
         out.extend_from_slice(&packed.to_le_bytes()[..BITS]);
     }
+}
+
+/// Encode PLAIN i64s as an LZ4 block. Consecutive zeros become one match,
+/// while all other values stay together in literal ranges.
+fn plain_i64_page(out: &mut Vec<u8>, values: &[i64]) {
+    fn extended(out: &mut Vec<u8>, length: usize) {
+        if length >= 15 {
+            let extra = length - 15;
+            out.resize(out.len() + extra / 255, 255);
+            out.push((extra % 255) as u8);
+        }
+    }
+    #[cfg(target_endian = "little")]
+    let bytes = unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    };
+    #[cfg(target_endian = "big")]
+    let storage: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    #[cfg(target_endian = "big")]
+    let bytes = &storage[..];
+
+    let mut literal_start = 0;
+    let mut i = 0;
+    while i + 1 < values.len() {
+        if values[i] != 0 || values[i + 1] != 0 {
+            i += 1;
+            continue;
+        }
+        let begin = i * 8;
+        i += 2;
+        while i < values.len() && values[i] == 0 { i += 1; }
+        // One literal zero seeds the copy. A well-formed LZ4 block ends
+        // with five literal bytes and its last match starts at least 12 bytes before EOF.
+        let match_start = begin + 1;
+        let match_end = (i * 8).min(bytes.len() - 5);
+        let literal_len = match_start - literal_start;
+        let code = match_end - match_start - 4;
+        out.push(((literal_len.min(15) << 4) | code.min(15)) as u8);
+        extended(out, literal_len);
+        out.extend_from_slice(&bytes[literal_start..match_start]);
+        out.extend_from_slice(&[1, 0]);
+        extended(out, code);
+        literal_start = match_end;
+    }
+    let tail = &bytes[literal_start..];
+    out.push((tail.len().min(15) << 4) as u8);
+    extended(out, tail.len());
+    out.extend_from_slice(tail);
 }
 
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
@@ -335,9 +384,13 @@ impl Writer {
 
     /// A page: its header, then `body`. `dictionary` pages hold `values` PLAIN values.
     fn page(out: &mut Vec<u8>, body: &[u8], values: usize, dictionary: bool, encoding: i32) {
+        Self::encoded_page(out, body, body.len(), values, dictionary, encoding);
+    }
+
+    fn encoded_page(out: &mut Vec<u8>, body: &[u8], raw_size: usize, values: usize, dictionary: bool, encoding: i32) {
         let mut header = Thrift::new();
         header.i32(1, if dictionary { 2 } else { 0 });
-        header.i32(2, body.len() as i32);
+        header.i32(2, raw_size as i32);
         header.i32(3, body.len() as i32);
         if dictionary {
             header.begin(7);
@@ -411,15 +464,24 @@ impl Writer {
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
-                Kind::Date | Kind::Int32 | Kind::Int64 => {
+                Kind::Int64 => {
+                    plain_i64_page(&mut body, &column.ints);
+                    Self::encoded_page(&mut self.out, &body, rows * 8, rows, false, 0);
+                }
+                Kind::Date | Kind::Int32 => {
                     delta_binary_packed(&mut body, &column.ints);
                     Self::page(&mut self.out, &body, rows, false, 5);
                 }
             }
+            let size = self.out.len() as u64 - offset;
+            let raw_size = if matches!(column.kind, Kind::Int64) {
+                size - body.len() as u64 + (rows * 8) as u64
+            } else { size };
             chunks.push(ChunkMeta {
                 offset,
                 data_offset,
-                size: self.out.len() as u64 - offset,
+                size,
+                raw_size,
             });
             column.bytes.clear();
             column.runs.clear();
@@ -476,7 +538,7 @@ impl Writer {
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
                     Kind::Date | Kind::Int32 => (1, &[5]),
-                    Kind::Int64 => (2, &[5]),
+                    Kind::Int64 => (2, &[0]),
                 };
                 meta.begin(0);
                 meta.i64(2, chunk.offset as i64);
@@ -489,9 +551,9 @@ impl Writer {
                 meta.list(3, 8, 1);
                 varint(&mut meta.out, column.name.len() as u64);
                 meta.out.extend_from_slice(column.name.as_bytes());
-                meta.i32(4, 0);
+                meta.i32(4, if matches!(column.kind, Kind::Int64) { 7 } else { 0 });
                 meta.i64(5, group.rows as i64);
-                meta.i64(6, chunk.size as i64);
+                meta.i64(6, chunk.raw_size as i64);
                 meta.i64(7, chunk.size as i64);
                 meta.i64(9, chunk.data_offset as i64);
                 if chunk.data_offset != chunk.offset {
@@ -500,7 +562,7 @@ impl Writer {
                 meta.end();
                 meta.end();
             }
-            meta.i64(2, group.chunks.iter().map(|chunk| chunk.size as i64).sum());
+            meta.i64(2, group.chunks.iter().map(|chunk| chunk.raw_size as i64).sum());
             meta.i64(3, group.rows as i64);
             meta.end();
         }
