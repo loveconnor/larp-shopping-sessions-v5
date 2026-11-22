@@ -98,7 +98,7 @@ pub fn prepare_users(bytes: u64) {
         unsafe {
             let slots = std::alloc::alloc_zeroed(layout).cast::<UserSlot>();
             if slots.is_null() { std::alloc::handle_alloc_error(layout); }
-            crate::huge(slots.cast(), layout.size());
+            crate::huge(slots, size);
             Box::from_raw(std::ptr::slice_from_raw_parts_mut(slots, size))
         }
     });
