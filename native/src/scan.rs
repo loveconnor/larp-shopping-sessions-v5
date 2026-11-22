@@ -499,6 +499,7 @@ impl Block {
             }
             let end = end as u32;
             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            let mut newline_masks = [0u64; WINDOW];
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
             let mut bad: Vec<u32> = Vec::new();
@@ -516,7 +517,9 @@ impl Block {
                     seps.reserve(WINDOW * 64 + 128);
                 }
                 let mut count = kept;
+                let window_start = at;
                 let mut lines = 0usize;
+                let mut blocks = 0;
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
                 let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
@@ -568,8 +571,37 @@ impl Block {
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
+                    lines += newline.count_ones() as usize;
+                    newline_masks[blocks] = newline;
+                    blocks += 1;
                     at += 64;
+                }
+                // If all expected terminators are newlines, and their number
+                // equals the actual newline count, no row can have an extra
+                // or missing separator. An unfinished last line stays buffered.
+                if bad_at == bad.len() && lines <= count / N {
+                    let mut mismatch = 0u8;
+                    for i in 0..lines {
+                        let stop = *out.add((i + 1) * N - 1);
+                        mismatch |= *buf.add(stop as usize) ^ b'\n';
+                    }
+                    if mismatch == 0 {
+                        for i in 0..lines {
+                            let row = &*out.add(i * N).cast::<[u32; N]>();
+                            visit(buf, line, row);
+                            line = row[N - 1] + 1;
+                        }
+                        let consumed = lines * N;
+                        kept = count - consumed;
+                        std::ptr::copy(out.add(consumed), out, kept);
+                        continue;
+                    }
+                }
+                // Irregular windows recover each real row ending from the
+                // saved masks, including malformed rows across window edges.
+                lines = 0;
+                for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
+                    lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
                 }
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
