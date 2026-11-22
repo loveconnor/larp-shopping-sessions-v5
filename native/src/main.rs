@@ -408,13 +408,21 @@ impl Links {
                 let keys = _mm256_load_si256(group.keys.as_ptr().cast());
                 let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
                 let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
+                if found != 0 || group.keys[3] == 0 {
+                    // A miss selects the query itself. Its harmless dummy load
+                    // stays in this cache line and keeps both outcomes in one path.
+                    let lane = ((found as u32 | 16).trailing_zeros() & 3) as usize;
+                    let value = *group.values.get_unchecked(lane);
+                    return if found == 0 { key } else { value };
+                }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
+            {
+                if let Some(lane) = group.keys.iter().position(|&k| k == key) {
+                    return group.values[lane];
+                }
+                if group.keys[3] == 0 { return key; }
             }
-            if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
         }
     }
