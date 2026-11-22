@@ -652,8 +652,13 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
-        let field = |at: usize| scan::field(buf, start, seps, at);
+    block.event_lines(|buf, start, seps, quotes| unsafe {
+        let field = |at:usize| {
+            if quotes==128 {return scan::field(buf,start,seps,at);}
+            let begin=if at==0 {start} else {seps[at-1]+1};
+            let q=u32::from((quotes>>at)&1);
+            (buf.add((begin+q) as usize),(seps[at]-begin-2*q) as usize)
+        };
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();

@@ -607,6 +607,77 @@ impl Block {
         }
     }
 
+    #[inline(always)]
+    pub fn event_lines(&self, mut visit:impl FnMut(*const u8,u32,&[u32;7],u8)) {
+        #[cfg(not(all(target_arch="x86_64",target_feature="avx512vbmi2",target_feature="avx512bw")))]
+        { self.raw_lines::<7>(|buf,start,seps| visit(buf,start,seps,128)); }
+        #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi2",target_feature="avx512bw"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let buf=self.base;
+            let head=std::slice::from_raw_parts(buf,self.end.min(self.own_end));
+            let Some(first)=head.iter().position(|&c| c==b'\n') else{return;};
+            let mut start=first+1;
+            let mut at=start;
+            let offsets:[u8;64]=std::array::from_fn(|i|i as u8);
+            let pos=_mm512_loadu_si512(offsets.as_ptr().cast());
+            let highpos=_mm512_add_epi8(pos,_mm512_set1_epi8(64));
+            while at<self.end {
+                let mut lines=[0u32;1024];
+                let mut nline=0;
+                let end=self.end.min(at+1024);
+                while at<end {
+                    let v=_mm512_loadu_si512(buf.add(at).cast());
+                    let mut nl=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(b'\n' as i8));
+                    if end-at<64 {nl=_bzhi_u64(nl,(end-at) as u32);}
+                    while nl!=0 {
+                        *lines.get_unchecked_mut(nline)=(at+nl.trailing_zeros() as usize) as u32;
+                        nline+=1;nl &= nl-1;
+                    }
+                    at+=64;
+                }
+                for &line in &lines[..nline] {
+                    let last=line as usize;
+                    let length=last-start+1;
+                    let row=buf.add(start);
+                    if length>128 {
+                        if let Some(seps)=Self::split_line::<7>(buf,start){visit(buf,start as u32,&seps,128);}
+                        start=last+1;continue;
+                    }
+                    let a=_mm512_loadu_si512(row.cast());
+                    let b=_mm512_loadu_si512(row.add(64).cast());
+                    let classify=|v,len:usize| {
+                        let valid=if len>=64 {u64::MAX} else {(1u64<<len)-1};
+                        let comma=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(b',' as i8));
+                        let quote=_mm512_cmpeq_epi8_mask(v,_mm512_set1_epi8(b'"' as i8));
+                        (comma&valid,quote&valid)
+                    };
+                    let (mut sl,ql)=classify(a,length);
+                    let (mut sh,qh)=classify(b,length.saturating_sub(64));
+                    if length<=64 {sl |= 1<<(length-1);} else {sh |= 1<<(length-65);}
+                    let low=sl.count_ones();
+                    if low+sh.count_ones()==7 {
+                        let open_l=(sl<<1)|1;
+                        let open_h=(sh<<1)|(sl>>63);
+                        let close_l=(sl>>1)|(sh<<63);
+                        let close_h=sh>>1;
+                        let bad=(ql & !(open_l^close_l))|(qh & !(open_h^close_h));
+                        let starts=(ql&1)|((_pext_u64((ql>>1)|(qh<<63),sl)|(_pext_u64(qh>>1,sh)<<low))<<1);
+                        let stops=_pext_u64(ql<<1,sl)|(_pext_u64((qh<<1)|(ql>>63),sh)<<low);
+                        if bad==0 && starts==stops {
+                            let mut packed=[0u8;8];
+                            _mm512_mask_compressstoreu_epi8(packed.as_mut_ptr().cast(),sl,pos);
+                            _mm512_mask_compressstoreu_epi8(packed.as_mut_ptr().add(low as usize).cast(),sh,highpos);
+                            let seps=std::array::from_fn(|i|u32::from(packed[i]));
+                            visit(row,0,&seps,starts as u8);
+                        }
+                    }
+                    start=last+1;
+                }
+            }
+        }
+    }
+
     /// `raw_lines`, with every field's bounds worked out and unquoted.
     #[inline(always)]
     pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
