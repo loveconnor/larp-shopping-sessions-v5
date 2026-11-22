@@ -1297,19 +1297,26 @@ impl Sessions<'_> {
 unsafe fn sort_short_times(values: &mut [u64]) {
     use std::arch::x86_64::*;
     #[inline(always)]
-    unsafe fn step<const SELECT: u8>(v: __m512i, order: __m512i) -> __m512i {
-        let other = _mm512_permutexvar_epi64(order,v);
-        _mm512_mask_max_epu64(_mm512_min_epu64(v,other),SELECT,v,other)
+    unsafe fn order<const SELECT: u8>(v: __m512i, other: __m512i) -> __m512i {
+        _mm512_mask_max_epu64(_mm512_min_epu64(v, other), SELECT, v, other)
     }
-    let swap1 = _mm512_setr_epi64(1,0,3,2,5,4,7,6);
-    let swap2 = _mm512_setr_epi64(2,3,0,1,6,7,4,5);
-    let swap4 = _mm512_setr_epi64(4,5,6,7,0,1,2,3);
-    let reverse = _mm512_setr_epi64(7,6,5,4,3,2,1,0);
-    let finish = |v| step::<0xaa>(step::<0xcc>(step::<0xf0>(v,swap4),swap2),swap1);
-    let sort = |v| finish(step::<0x5a>(step::<0x3c>(step::<0x66>(v,swap1),swap2),swap1));
-    let pair = |a,b| {
-        let br = _mm512_permutexvar_epi64(reverse,b);
-        (finish(_mm512_min_epu64(a,br)), finish(_mm512_max_epu64(a,br)))
+    let swap1 = |v| _mm512_permutex_epi64::<0xb1>(v);
+    let swap2 = |v| _mm512_permutex_epi64::<0x4e>(v);
+    let swap4 = |v| _mm512_shuffle_i64x2::<0x4e>(v, v);
+    let reverse = |v| _mm512_permutexvar_epi64(_mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0), v);
+    let finish = |v| {
+        let v = order::<0xf0>(v, swap4(v));
+        let v = order::<0xcc>(v, swap2(v));
+        order::<0xaa>(v, swap1(v))
+    };
+    let sort = |v| {
+        let v = order::<0x66>(v, swap1(v));
+        let v = order::<0x3c>(v, swap2(v));
+        finish(order::<0x5a>(v, swap1(v)))
+    };
+    let pair = |a, b| {
+        let br = reverse(b);
+        (finish(_mm512_min_epu64(a, br)), finish(_mm512_max_epu64(a, br)))
     };
     let n = values.len();
     let mask = |i:usize| (0xffu16 >> (8-n.saturating_sub(i).min(8))) as u8;
@@ -1321,8 +1328,8 @@ unsafe fn sort_short_times(values: &mut [u64]) {
     let (a,b) = pair(a,read(8));
     if values.len() <= 16 { write(0,a); write(8,b); return; }
     let (c,d) = pair(read(16),read(24));
-    let c = _mm512_permutexvar_epi64(reverse,c);
-    let d = _mm512_permutexvar_epi64(reverse,d);
+    let c = reverse(c);
+    let d = reverse(d);
     let (al,ah) = (_mm512_min_epu64(a,d),_mm512_max_epu64(a,d));
     let (bl,bh) = (_mm512_min_epu64(b,c),_mm512_max_epu64(b,c));
     write(0,finish(_mm512_min_epu64(al,bl)));
