@@ -30,7 +30,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: u64 = 1_800_000;
 /// Bytes of CSV a thread takes at a time.
-const BLOCK: u64 = 1 << 19;
+const BLOCK: u64 = 1 << 17;
 /// Bytes of a links file read at a time.
 const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
