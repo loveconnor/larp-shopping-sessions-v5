@@ -1,7 +1,7 @@
-name: Measure parser allocation policy
+name: Measure session histogram threshold and partition granularity
 on:
   push:
-    branches: [bench/parser-allocator]
+    branches: [bench/session-thresholds]
 permissions:
   contents: read
 jobs:
@@ -12,15 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 906709}
-          - {events: 60000000, format: current, seed: 906709}
-          - {events: 20000000, format: current, seed: 906733}
-          - {events: 60000000, format: current, seed: 906733}
+          - {events: 20000000, format: current, seed: 931573}
+          - {events: 60000000, format: current, seed: 931573}
+          - {events: 20000000, format: current, seed: 751547}
+          - {events: 60000000, format: current, seed: 751547}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 35615c84d81833d6cdb668f8a2bdb1fefc720978
+      RANKED: aa914d88d76e4d589ef0f17f0bd9f1b71380bf4a
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -73,12 +73,9 @@ jobs:
           run({})
           ref = root / "ref"
           shutil.copytree(out,ref)
-          base="background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto"
-          candidates=[{}]
-          for arenas, oversize, retain in itertools.product((1,2,8), (0,8388608), ("true","false")):
-              candidates.append({"MALLOC_CONF":f"abort_conf:true,{base},narenas:{arenas},oversize_threshold:{oversize},retain:{retain}"})
-          for extra in ("tcache:false", "tcache_max:65536", "lg_extent_max_active_fit:3", "lg_extent_max_active_fit:10"):
-              candidates.append({"MALLOC_CONF":f"abort_conf:true,{base},narenas:2,{extra}"})
+          candidates = [{}]
+          candidates += [{"SS_HISTOGRAM_MIN": str(n)} for n in (32, 64, 96, 128, 192, 256, 384, 768, 1024, 1536, 2048, 4096, 8192, 32768)]
+          candidates += [{"SS_PERSON_BITS": str(n)} for n in (7, 8, 9, 10, 11, 12)]
           rng=random.Random(int(os.environ["SEED"]))
           samples=[[] for _ in candidates]
           def stage(ids,rounds):
@@ -88,7 +85,7 @@ jobs:
           stage(list(range(len(candidates))),3)
           idx=sorted(range(len(samples)),key=lambda ix:statistics.median(samples[ix]))[:5]
           if 0 not in idx: idx.append(0)
-          stage(idx,5)
+          stage(idx,7)
           for ix in sorted(range(len(samples)),key=lambda ix:statistics.median(samples[ix])):
               print("TUNE",json.dumps(candidates[ix]),len(samples[ix]),round(statistics.median(samples[ix])/statistics.median(samples[0]),4),flush=True)
           winner=min(idx,key=lambda ix:statistics.median(samples[ix]))
