@@ -268,7 +268,12 @@ impl Writer {
                     runs: Vec::new(),
                     last_key: 0,
                     present: Vec::new(),
-                    ints: Vec::new(),
+                    // Numeric columns have exactly one value per row. The
+                    // shared row index advances after all columns were written.
+                    ints: match kind {
+                        Kind::Int32 | Kind::Date | Kind::Int64 => vec![0; group_rows.max(1)],
+                        _ => Vec::new(),
+                    },
                 })
                 .collect(),
             dictionary: plain,
@@ -322,7 +327,7 @@ impl Writer {
 
     #[inline(always)]
     pub fn int(&mut self, column: usize, value: i64) {
-        self.columns[column].ints.push(value);
+        self.columns[column].ints[self.rows] = value;
     }
 
     #[inline(always)]
@@ -412,7 +417,7 @@ impl Writer {
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
                 Kind::Date | Kind::Int32 | Kind::Int64 => {
-                    delta_binary_packed(&mut body, &column.ints);
+                    delta_binary_packed(&mut body, &column.ints[..rows]);
                     Self::page(&mut self.out, &body, rows, false, 5);
                 }
             }
@@ -424,7 +429,6 @@ impl Writer {
             column.bytes.clear();
             column.runs.clear();
             column.present.clear();
-            column.ints.clear();
         }
         self.groups.push(GroupMeta {
             rows: rows as u64,
