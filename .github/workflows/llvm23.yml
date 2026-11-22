@@ -8,7 +8,7 @@ jobs:
   profile:
     strategy:
       matrix:
-        seed: [385699, 385741, 385813]
+        seed: [385817, 385819, 385831, 385837]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,13 +17,14 @@ jobs:
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
+          grep -qw avx512bw /proc/cpuinfo || exit 0
           cd "$RUNNER_TEMP"
           curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
           rows=20000000
-          if [ ${{ matrix.seed }} = 385813 ]; then rows=60000000; fi
+          if [ ${{ matrix.seed }} -ge 385830 ]; then rows=60000000; fi
           generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
           mkdir "$RUNNER_TEMP/profile"
           docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.100-slim-bookworm sh -ec '
@@ -32,7 +33,7 @@ jobs:
             apt-get update -qq && apt-get install -yq --no-install-recommends patch
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
-            for level in v3 v4 n4 wide; do
+            for level in v4 n4 wide; do
               cpu=x86-64-$level
               feature=
               build_features=
