@@ -282,9 +282,10 @@ struct AliasGroup {
 
 /// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
+    present: Vec<u64>,
+    bit_shift: u32,
     slots: Vec<AliasGroup>,
     shift: u32,
-    empty: bool,
 }
 
 impl Links {
@@ -362,13 +363,21 @@ impl Links {
         }
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
+        // Only aliases can change a key. A clear bit proves the lookup is
+        // the identity; set bits still require a full key comparison.
+        let bits = (aliases * 8).next_power_of_two().max(64);
+        let bit_shift = 64 - bits.trailing_zeros();
+        let mut present = vec![0u64; bits / 64];
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
             if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
+            let hash = key.wrapping_mul(MIX);
+            let bit = (hash >> bit_shift) as usize;
+            present[bit >> 6] |= 1u64 << (bit & 63);
+            let mut at = (hash >> shift) as usize;
             loop {
                 let group = &mut groups[at];
                 if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
@@ -379,23 +388,25 @@ impl Links {
                 at = (at + 1) & (count - 1);
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        Self { slots: groups, shift, present, bit_shift }
     }
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
+        let hash = key.wrapping_mul(MIX);
+        let bit = (hash >> self.bit_shift) as usize;
+        if self.present[bit >> 6] & (1u64 << (bit & 63)) != 0 {
+            prefetch(unsafe { self.slots.get_unchecked((hash >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
-        if self.empty {
-            return key;
-        }
+        let hash = key.wrapping_mul(MIX);
+        let bit = (hash >> self.bit_shift) as usize;
+        if self.present[bit >> 6] & (1u64 << (bit & 63)) == 0 { return key; }
         let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+        let mut slot = (hash >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
