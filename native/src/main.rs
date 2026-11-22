@@ -723,11 +723,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
-        let (name,n) = field(1);
-        let deferred = n == 33 && shared.defer_long_events;
-        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
-        let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -736,8 +731,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
-        let mut valid = user != 0
-            && (purchase || other)
+        let (name,name_len)=field(1);
+        let mut valid = name_len!=0 && (purchase || other)
             && field(5).1 > 0
             && at >= window_start
             && at < window_end
@@ -755,6 +750,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
+        let deferred=valid && name_len==33 && shared.defer_long_events;
+        let mixed=if deferred {keys::prepare_long_user(name)} else {0};
+        let user=if !valid {0} else if deferred {1} else {keys::pack_user(name,name_len)^copy};
+        valid &= user!=0;
         let record = Parsed {
             id,
             user,
