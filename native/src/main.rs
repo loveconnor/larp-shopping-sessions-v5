@@ -83,6 +83,9 @@ unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 impl<T: Copy> Buckets<T> {
     /// Bytes of a chunk that hold records.
     const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    /// Leave the unused bytes before the records, so a full chunk ends
+    /// exactly on an aligned boundary.
+    const LEADING: usize = CHUNK_BYTES - Self::FILL;
     /// Records per chunk.
     const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
     const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
@@ -91,7 +94,7 @@ impl<T: Copy> Buckets<T> {
         let () = Self::FITS;
         Self {
             // A position that reads as a full chunk, so the first push grows.
-            next: vec![Self::FILL as *mut T; parts],
+            next: vec![std::ptr::null_mut(); parts],
             head: vec![NONE; parts],
             chunks: vec![0; parts],
             slabs: Vec::new(),
@@ -107,7 +110,7 @@ impl<T: Copy> Buckets<T> {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
-            if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
+            if at as usize & (CHUNK_BYTES - 1) == 0 {
                 at = self.grow(part);
             }
             // Each worker owns its chunks. Bring the next destination line
@@ -151,6 +154,7 @@ impl<T: Copy> Buckets<T> {
                 base
             }
         };
+        let base = unsafe { base.byte_add(Self::LEADING) };
         let chunk = self.bases.len() as u32;
         self.bases.push(base);
         self.previous.push(self.head[part]);
@@ -183,6 +187,59 @@ impl<T: Copy> Buckets<T> {
             out.push((self.bases[chunk as usize], Self::CAPACITY));
         }
     }
+}
+
+#[test]
+fn end_aligned_chunks_visit_each_live_row_once() {
+    fn check<const WORDS: usize>() {
+        let mut buckets = Buckets::<[u32; WORDS]>::new(7);
+        let n = 4 * Buckets::<[u32; WORDS]>::CAPACITY + 1;
+        let mut expected = vec![Vec::new(); 7];
+        let mut addresses = Vec::new();
+        for i in 0..n {
+            for part in [0, 2, 5] {
+                let value = (i * 7 + part) as u32;
+                addresses.push((buckets.push(part, [value; WORDS]), value));
+                expected[part].push(value);
+            }
+        }
+        for (ptr, value) in addresses {
+            unsafe { assert_eq!((*ptr)[0], value); (*ptr)[WORDS - 1] = !value; }
+        }
+        for (part, wanted) in expected.into_iter().enumerate() {
+            let mut chunks = Vec::new();
+            buckets.chunks(part, &mut chunks);
+            let mut values = Vec::new();
+            for (base, count) in chunks.into_iter().rev() {
+                for row in unsafe { std::slice::from_raw_parts(base, count) } {
+                    assert_eq!(row[WORDS - 1], !row[0]);
+                    values.push(row[0]);
+                }
+            }
+            assert_eq!(values, wanted);
+        }
+    }
+    check::<4>(); check::<6>(); check::<7>(); check::<8>();
+}
+
+#[test]
+fn donated_chunks_keep_their_physical_boundary_across_row_widths() {
+    type Source = Buckets<[u32; 7]>;
+    type Destination = Buckets<[u64; 2]>;
+    let mut src = Source::new(1);
+    let first = src.push(0, [0; 7]);
+    let memory = unsafe { first.cast::<u8>().sub(Source::LEADING) };
+    let mut dst = Destination::new(1);
+    dst.donate(memory);
+    for i in 0..Destination::CAPACITY {
+        let ptr = dst.push(0, [i as u64; 2]);
+        assert_eq!(ptr as usize, memory as usize + Destination::LEADING + i * 16);
+    }
+    let next = dst.push(0, [99; 2]);
+    assert_ne!(next as usize & !(CHUNK_BYTES - 1), memory as usize);
+    let mut chunks = Vec::new();
+    dst.chunks(0, &mut chunks);
+    assert_eq!((chunks[0].1, chunks[1].1), (1, Destination::CAPACITY));
 }
 
 // ---------------------------------------------------------------- records
@@ -1011,7 +1068,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
+                out.donate(base.cast::<u8>().sub(Buckets::<Parsed>::LEADING));
             }
         }
     }
