@@ -402,6 +402,22 @@ impl Links {
         let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
+            #[cfg(all(target_arch="x86_64", target_feature="avx512vl", target_feature="avx512f"))]
+            unsafe {
+                use std::arch::x86_64::*;
+                let query = _mm256_set1_epi64x(key as i64);
+                let found = _mm256_cmpeq_epi64_mask(_mm256_load_si256(group.keys.as_ptr().cast()), query);
+                // Compress a matching value into lane zero. The masked merge
+                // leaves the original name there when this group has no match.
+                let complete = found | u8::from(group.keys[3] == 0);
+                if complete != 0 {
+                    let values = _mm256_load_si256(group.values.as_ptr().cast());
+                    let chosen = _mm256_mask_compress_epi64(query,found,values);
+                    return _mm_cvtsi128_si64(_mm256_castsi256_si128(chosen)) as u64;
+                }
+            }
+            #[cfg(not(all(target_arch="x86_64", target_feature="avx512vl", target_feature="avx512f")))]
+            {
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             unsafe {
                 use std::arch::x86_64::*;
@@ -415,6 +431,7 @@ impl Links {
                 return group.values[lane];
             }
             if group.keys[3] == 0 { return key; }
+            }
             slot = (slot + 1) & mask;
         }
     }
