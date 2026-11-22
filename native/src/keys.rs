@@ -163,6 +163,52 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
     unsafe { pack(p, n) }
 }
 
+// One-based slots identify people during grouping. The input key is stored
+// whole, so collisions are resolved before any two people's data can meet.
+struct Ordinals {
+    words: Vec<std::sync::atomic::AtomicU64>,
+    shift: u32,
+    spill_start: usize,
+    spill: Mutex<(std::collections::HashMap<u64,u32>, Vec<u64>)>,
+}
+static PEOPLE: std::sync::OnceLock<Ordinals> = std::sync::OnceLock::new();
+pub fn prepare_people(bytes:u64) {
+    let n=bytes.div_ceil(1024).clamp(256,1<<24).next_power_of_two() as usize;
+    let words=(0..n).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let long=USER_SLOTS.get().map_or(0,|s|s.len());
+    let _=PEOPLE.set(Ordinals {words,shift:64-n.trailing_zeros(),spill_start:n+long+1,spill:Mutex::default()});
+}
+#[inline(always)]
+pub fn ordinal(key:u64)->u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if key==0{return 0;}
+    let dict=PEOPLE.get().unwrap();
+    let n=dict.words.len();
+    if key & (INTERNED|FIXED_USER)==INTERNED|FIXED_USER && USER_SLOTS.get().is_some() {
+        return n as u64+1+(key & !(INTERNED|FIXED_USER));
+    }
+    let mut i=(key.wrapping_mul(0x9e3779b97f4a7c15)>>dict.shift) as usize;
+    for _ in 0..16 {
+        let slot=&dict.words[i];
+        let mut seen=slot.load(Relaxed);
+        if seen==0 {seen=match slot.compare_exchange(0,key,Relaxed,Relaxed){Ok(_)=>key,Err(k)=>k};}
+        if seen==key{return (i+1) as u64;}
+        i=(i+1)&(n-1);
+    }
+    let mut spill=dict.spill.lock().unwrap();
+    if let Some(&id)=spill.0.get(&key){return id as u64;}
+    let id=u32::try_from(dict.spill_start+spill.1.len()).expect("too many distinct users");
+    spill.1.push(key);spill.0.insert(key,id);id as u64
+}
+#[inline(always)]
+pub fn original(id:u64)->u64 {
+    let dict=PEOPLE.get().unwrap();
+    let i=id as usize-1;
+    if let Some(slot)=dict.words.get(i){return slot.load(std::sync::atomic::Ordering::Relaxed);}
+    if (id as usize)<dict.spill_start {return INTERNED|FIXED_USER|(i-dict.words.len()) as u64;}
+    dict.spill.lock().unwrap().1[id as usize-dict.spill_start]
+}
+
 fn name(key: u64) -> &'static [u8] {
     if key & FIXED_USER != 0 {
         let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];

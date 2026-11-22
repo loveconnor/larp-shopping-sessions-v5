@@ -278,146 +278,45 @@ impl Dim {
     }
 }
 
-#[repr(C, align(64))]
-#[derive(Clone, Default)]
-struct AliasGroup {
-    keys: [u64; 4],
-    values: [u64; 4],
-}
-
-/// Only aliases need an entry. A missing key is already its canonical name.
-struct Links {
-    slots: Vec<AliasGroup>,
-    shift: u32,
-    empty: bool,
-}
-
+struct Links { slots: Vec<u32> }
 impl Links {
-    fn build(pairs: &[(u64, u64)]) -> Self {
-        let capacity = (pairs.len() * 3).next_power_of_two().max(16);
-        let mask = capacity - 1;
-        let shift = 64 - capacity.trailing_zeros();
-        let mut slots = vec![[0u64; 2]; capacity];
-        huge(slots.as_ptr(), capacity);
-        let mut names: Vec<u64> = Vec::new();
-        let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
-
-        fn find(parent: &mut [u32], mut at: u32) -> u32 {
+    fn build(pairs:&[(u64,u64)])->Self {
+        let n=pairs.iter().map(|&(a,b)| a.max(b) as usize + 1).max().unwrap_or(0);
+        let mut parents=vec![0u32;n];
+        let mut best=vec![0u32;n];
+        fn root(parents:&mut [u32], mut x:u32)->u32 {
             loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
-                }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
+                let next=parents[x as usize];
+                if next==0{return x;}
+                let above=parents[next as usize];
+                if above==0{return next;}
+                parents[x as usize]=above;
+                x=above;
             }
         }
-
-        // Number the IDs as they appear; each pass below prefetches what the
-        // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
-                prefetch(&slots[home(c)]);
-                prefetch(&slots[home(d)]);
-            }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-            }
-            numbered.push(index);
+        for &(a,b) in pairs {
+            let a=root(&mut parents,a as u32);
+            let b=root(&mut parents,b as u32);
+            if a==b{continue;}
+            let (parent,child)=(a.min(b),a.max(b));
+            let a=if best[parent as usize]==0{parent}else{best[parent as usize]};
+            let b=if best[child as usize]==0{child}else{best[child as usize]};
+            best[parent as usize]=if keys::compare(keys::original(a as u64),keys::original(b as u64))==Order::Greater{b}else{a};
+            parents[child as usize]=parent;
         }
-        // Join. The smaller number is the root, so no cycle can form.
-        let mut aliases = 0usize;
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-        for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
-                prefetch(&parent[c as usize]);
-                prefetch(&parent[d as usize]);
-            }
-            let a = find(&mut parent, a);
-            let b = find(&mut parent, b);
-            if a != b {
-                aliases += 1;
-                let root = a.min(b) as usize;
-                let child = a.max(b) as usize;
-                parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
-                }
-            }
+        for id in 1..n {
+            let p=parents[id] as usize;
+            if p!=0{best[id]=best[p];}
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
-        }
-        let count = aliases.div_ceil(2).next_power_of_two().max(2);
-        let shift = 64 - count.trailing_zeros();
-        let mut groups = vec![AliasGroup::default(); count];
-        huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
-            if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
-            }
-        }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        Self{slots:best}
     }
-
     #[inline(always)]
-    fn prefetch(&self, key: u64) {
-        if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
-        }
+    fn prefetch(&self,key:u64) {
+        if let Some(c)=self.slots.get(key as usize){prefetch(c);}
     }
-
     #[inline(always)]
-    fn person(&self, key: u64) -> u64 {
-        if self.empty {
-            return key;
-        }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
-        loop {
-            let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use std::arch::x86_64::*;
-                let keys = _mm256_load_si256(group.keys.as_ptr().cast());
-                let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
-            }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
-            }
-            if group.keys[3] == 0 { return key; }
-            slot = (slot + 1) & mask;
-        }
+    fn person(&self,key:u64)->u64 {
+        match self.slots.get(key as usize){Some(&c) if c!=0=>c as u64,_=>key}
     }
 }
 
@@ -599,7 +498,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
                 let (p, n) = scan::field(buf, start, seps, 1);
                 let b = keys::pack_user(p, n);
                 if a != 0 && b != 0 && a != b {
-                    pairs.push((a, b));
+                    pairs.push((keys::ordinal(a), keys::ordinal(b)));
                 }
             });
             start = end;
@@ -610,7 +509,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
 
 #[inline(always)]
 fn person_part(person: u64, bits: u32) -> usize {
-    (person.wrapping_mul(MIX) >> (64 - bits)) as usize
+    person as usize & ((1 << bits) - 1)
 }
 
 const LONG_EVENT: u64 = 3 << 62;
@@ -649,7 +548,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+            unsafe { (*dest).user = keys::ordinal(keys::finish_long_user(name,mixed)); }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -678,7 +577,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let deferred = n == 33 && shared.defer_long_events;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
+        let user = if deferred || user == 0 { user } else { keys::ordinal(user ^ copy) };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -772,7 +671,7 @@ fn parse_clicks(
         if id == 0 || user == 0 {
             return;
         }
-        let (id, user) = (id ^ copy, user ^ copy);
+        let (id, user) = (id ^ copy, keys::ordinal(user ^ copy));
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
@@ -976,6 +875,7 @@ impl Sessions<'_> {
             )?);
         }
         let writer = self.writer.as_mut().unwrap();
+        let person = keys::original(person);
         writer.keyed(0, person, |name| keys::unpack(person, name));
         writer.int(1, shared.first_day + day as i64);
         writer.int(2, sessions as i64);
@@ -1150,7 +1050,6 @@ fn session_worker(
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
-    let mut table_keys: Vec<u64> = Vec::new();
     let mut table_ids: Vec<u32> = Vec::new();
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
@@ -1172,12 +1071,7 @@ fn session_worker(
         }
 
         // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
-        let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        table_ids.fill(NONE);
         persons.clear();
         ends.clear();
         local.clear();
@@ -1185,40 +1079,16 @@ fn session_worker(
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            let id = persons.len() as u32;
-                            *table_keys.get_unchecked_mut(slot) = person;
-                            *table_ids.get_unchecked_mut(slot) = id;
-                            persons.push(person);
-                            ends.push(0);
-                            break id;
-                        }
-                        slot = (slot + 1) & mask;
-                    };
-                    *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
+                    let slot = (person >> shared.person_bits) as usize;
+                    if slot>=table_ids.len(){table_ids.resize(slot+1,NONE);}
+                    let cell=table_ids.get_unchecked_mut(slot);
+                    if *cell==NONE {
+                        *cell=persons.len() as u32;
+                        persons.push(person);
+                        ends.push(0);
                     }
+                    *ends.get_unchecked_mut(*cell as usize)+=1;
+                    local.push(*cell);
                 }
             }
             // `ends` holds counts; make it each person's first slot, then fill,
@@ -1256,17 +1126,7 @@ fn session_worker(
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            break NONE;
-                        }
-                        slot = (slot + 1) & mask;
-                    };
+                    let id=table_ids.get((person >> shared.person_bits) as usize).copied().unwrap_or(NONE);
                     click_local.push(id);
                     if id != NONE {
                         *click_ends.get_unchecked_mut(id as usize) += 1;
@@ -1475,6 +1335,7 @@ fn main() -> io::Result<()> {
 
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
+    keys::prepare_people(input_bytes);
     let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
