@@ -333,12 +333,11 @@ impl Writer {
         }
     }
 
-    /// A page: its header, then `body`. `dictionary` pages hold `values` PLAIN values.
-    fn page(out: &mut Vec<u8>, body: &[u8], values: usize, dictionary: bool, encoding: i32) {
+    fn page_header(bytes: usize, values: usize, dictionary: bool, encoding: i32) -> Vec<u8> {
         let mut header = Thrift::new();
         header.i32(1, if dictionary { 2 } else { 0 });
-        header.i32(2, body.len() as i32);
-        header.i32(3, body.len() as i32);
+        header.i32(2, bytes as i32);
+        header.i32(3, bytes as i32);
         if dictionary {
             header.begin(7);
             header.i32(1, values as i32);
@@ -353,8 +352,33 @@ impl Writer {
             header.end();
         }
         header.out.push(0);
-        out.extend_from_slice(&header.out);
+        header.out
+    }
+
+    fn page(out: &mut Vec<u8>, body: &[u8], values: usize, dictionary: bool, encoding: i32) {
+        out.extend_from_slice(&Self::page_header(body.len(), values, dictionary, encoding));
         out.extend_from_slice(body);
+    }
+
+    fn delta_page(out: &mut Vec<u8>, values: &[i64]) {
+        let start = out.len();
+        // Each length is a zigzag varint in this canonical Thrift header.
+        // Estimate its width from the row count, then correct for the actual
+        // encoded byte count when it crosses a varint boundary.
+        let varint_bytes = |n: usize| width((n as u64) * 2).div_ceil(7).max(1) as usize;
+        let reserved = 14 + 2 * varint_bytes(values.len() * 2) + varint_bytes(values.len());
+        let body = start + reserved;
+        out.resize(body, 0);
+        delta_binary_packed(out, values);
+        let bytes = out.len() - body;
+        let header = Self::page_header(bytes, values.len(), false, 5);
+        let target = start + header.len();
+        if target != body {
+            if target > body { out.resize(target + bytes, 0); }
+            out.copy_within(body..body + bytes, target);
+            out.truncate(target + bytes);
+        }
+        out[start..target].copy_from_slice(&header);
     }
 
     fn flush(&mut self) {
@@ -412,8 +436,7 @@ impl Writer {
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
                 Kind::Date | Kind::Int32 | Kind::Int64 => {
-                    delta_binary_packed(&mut body, &column.ints);
-                    Self::page(&mut self.out, &body, rows, false, 5);
+                    Self::delta_page(&mut self.out, &column.ints);
                 }
             }
             chunks.push(ChunkMeta {
@@ -563,6 +586,26 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[test]
+    fn direct_delta_pages_match_staged_headers_and_payloads() {
+        for count in [0, 1, 31, 32, 63, 64, 127, 128, 129, 4095, 4096, 8191, 8192, 16384] {
+            for config in 0..3 {
+                let values: Vec<_> = (0..count as i64).map(|i| match config {
+                    0 => i,
+                    1 => (i % 137) * 93817,
+                    _ => i.wrapping_mul(0x5329ac6e820731a1).rotate_right((i % 64) as u32),
+                }).collect();
+                let mut body = Vec::new();
+                delta_binary_packed(&mut body, &values);
+                let mut expected = vec![77; 13];
+                let mut direct = expected.clone();
+                Writer::page(&mut expected, &body, count, false, 5);
+                Writer::delta_page(&mut direct, &values);
+                assert_eq!(expected, direct, "count={count} config={config}");
+            }
+        }
     }
 
     #[test]
