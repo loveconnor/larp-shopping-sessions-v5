@@ -270,7 +270,7 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
     // The next mask starts immediately after these positions. Limit the
     // store to the actual delimiter count to avoid overlapping its cache lines.
-    let live = _bzhi_u32(0xffff, n as u32) as u16;
+    let live = (0xffffu32 >> (16 - n)) as u16;
     _mm512_mask_storeu_epi32(out.cast(), live, _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
     n
 }
