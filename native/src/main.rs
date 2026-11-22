@@ -1420,7 +1420,11 @@ fn session_worker(
         persons.clear();
         ends.clear();
         local.clear();
+        local.reserve(total);
         unsafe {
+            // The chunks contain exactly total events. Assign an index for every
+            // record before exposing the initialized indices to the scatter pass.
+            let mut index_out = local.as_mut_ptr();
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
@@ -1441,7 +1445,8 @@ fn session_worker(
                         slot = (slot + 1) & mask;
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
+                    index_out.write(id);
+                    index_out = index_out.add(1);
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
                         mask = capacity - 1;
@@ -1460,6 +1465,7 @@ fn session_worker(
                     }
                 }
             }
+            local.set_len(total);
             // `ends` holds counts; make it each person's first slot, then fill,
             // which leaves it at each person's end.
             let mut sum = 0u32;
