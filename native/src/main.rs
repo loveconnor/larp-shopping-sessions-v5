@@ -1332,37 +1332,86 @@ unsafe fn sort_short_times(values: &mut [u64]) {
 }
 
 #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
-fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+fn sort_medium_times(values: &mut [u64], depth: usize) {
     use std::arch::x86_64::*;
-    let n=values.len();
-    if n<=32 {
-        if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
+    let n = values.len();
+    if n <= 32 {
+        if n >= 5 { unsafe { sort_short_times(values) } } else { values.sort_unstable(); }
         return;
     }
-    if depth==0 { values.sort_unstable(); return; }
-    let (a,b,c)=(values[0],values[n/2],values[n-1]);
-    let pivot=a.min(b).max(a.max(b).min(c));
-    let (mut lo,mut hi)=(0,n);
+    if depth == 0 { values.sort_unstable(); return; }
+    let (a, b, c) = (values[0], values[n / 2], values[n - 1]);
+    let pivot = a.min(b).max(a.max(b).min(c));
+    let (mut low, mut high) = (0usize, n);
     unsafe {
-        let bound=_mm512_set1_epi64(pivot as i64);
-        for i in (0..n).step_by(8) {
-            let count=(n-i).min(8);
-            let valid=(0xffu16>>(8-count)) as u8;
-            let v=_mm512_maskz_loadu_epi64(valid,values.as_ptr().add(i).cast());
-            let below=_mm512_cmplt_epu64_mask(v,bound)&valid;
-            let small=below.count_ones() as usize;
-            hi-=count-small;
-            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(lo).cast(),below,v);
-            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(hi).cast(),valid & !below,v);
-            lo+=small;
+        let ptr = values.as_mut_ptr();
+        let bound = _mm512_set1_epi64(pivot as i64);
+        let mut held = _mm512_loadu_si512(ptr.cast());
+        let (mut first, mut end) = (8usize, n);
+        while end - first >= 8 {
+            let below = _mm512_cmplt_epu64_mask(held, bound);
+            let small = below.count_ones() as usize;
+            // Eight input slots are held in a register. Read the next vector
+            // from the side that needs more space before writing either end.
+            let next = if first - low < small {
+                let vector = _mm512_loadu_si512(ptr.add(first).cast());
+                first += 8;
+                vector
+            } else {
+                end -= 8;
+                _mm512_loadu_si512(ptr.add(end).cast())
+            };
+            high -= 8 - small;
+            _mm512_mask_compressstoreu_epi64(ptr.add(low).cast(), below, held);
+            _mm512_mask_compressstoreu_epi64(ptr.add(high).cast(), !below, held);
+            low += small;
+            held = next;
+        }
+        let tail_count = end - first;
+        let tail_mask = ((1u16 << tail_count) - 1) as u8;
+        let tail = _mm512_maskz_loadu_epi64(tail_mask, ptr.add(first).cast());
+        for (vector, valid) in [(held, 255u8), (tail, tail_mask)] {
+            let below = _mm512_cmplt_epu64_mask(vector, bound) & valid;
+            let above = valid & !below;
+            high -= above.count_ones() as usize;
+            _mm512_mask_compressstoreu_epi64(ptr.add(low).cast(), below, vector);
+            _mm512_mask_compressstoreu_epi64(ptr.add(high).cast(), above, vector);
+            low += below.count_ones() as usize;
         }
     }
-    if lo==0 || lo==n { values.sort_unstable(); return; }
-    values.copy_from_slice(&tmp[..n]);
-    let (left,right)=values.split_at_mut(lo);
-    let (l,r)=tmp.split_at_mut(lo);
-    sort_medium_times(left,l,depth-1);
-    sort_medium_times(right,r,depth-1);
+    debug_assert_eq!(low, high);
+    if low == 0 || low == n { values.sort_unstable(); return; }
+    let (left, right) = values.split_at_mut(low);
+    sort_medium_times(left, depth - 1);
+    sort_medium_times(right, depth - 1);
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
+#[test]
+fn medium_partition_matches_unsigned_sort() {
+    let mut seed = 0x71b13d05a289ef43u64;
+    for n in 0..=520 {
+        for mode in 0..8 {
+            let mut guarded = vec![u64::MAX - 3; n + 2];
+            let values = &mut guarded[1..=n];
+            for (i, value) in values.iter_mut().enumerate() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *value = match mode {
+                    0 => seed, 1 => seed & 3, 2 => u64::MAX,
+                    3 => i as u64, 4 => (n - i) as u64,
+                    5 => (i % 2) as u64 * u64::MAX,
+                    6 => (i.abs_diff(n / 2)) as u64, _ => seed.rotate_left(i as u32),
+                };
+            }
+            let mut reference = values.to_vec();
+            reference.sort_unstable();
+            sort_medium_times(values, 12);
+            assert_eq!(values, reference, "length={n} mode={mode}");
+            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
+        }
+    }
 }
 
 fn session_worker(
@@ -1396,8 +1445,6 @@ fn session_worker(
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
@@ -1562,8 +1609,7 @@ fn session_worker(
                 if mine.len() <= 32 {
                     if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
                 } else {
-                    if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
-                    sort_medium_times(mine,&mut scratch[..mine.len()],12);
+                    sort_medium_times(mine,12);
                 }
                 #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
                 mine.sort_unstable();
