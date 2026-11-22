@@ -711,7 +711,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
-            let id = keys::pack(p, n);
+            let id = if shared.defer_long_events {keys::event_key(p,n)} else {keys::pack(p,n)};
             if id == 0 {
                 return;
             }

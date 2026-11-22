@@ -68,6 +68,19 @@ fn intern(value: &[u8]) -> u64 {
     intern_name(value).0
 }
 
+/// Event IDs need equality only. An eight-byte suffix can serve directly
+/// as a key whenever its top bit leaves room for the interner namespace.
+#[inline(always)]
+pub unsafe fn event_key(p:*const u8,len:usize) -> u64 {
+    unsafe {
+        if len==9 && *p==b'e' {
+            let suffix=u64::from_le(p.add(1).cast::<u64>().read_unaligned());
+            if suffix!=0 && suffix & INTERNED == 0 {return suffix;}
+        }
+        if len==0 {0} else {intern(std::slice::from_raw_parts(p,len))}
+    }
+}
+
 fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     let hash = hash_bytes(value);
     let shard = (hash >> 56) as usize;
