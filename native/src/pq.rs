@@ -164,6 +164,18 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
     }
 }
 
+// Eight values at a fixed bit width always end on a byte boundary.
+#[inline(always)]
+fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) {
+    for group in values.chunks_exact(8) {
+        let mut packed = 0u128;
+        for (index, &delta) in group.iter().enumerate() {
+            packed |= u128::from(delta.wrapping_sub(least) as u64) << (index * BITS);
+        }
+        out.extend_from_slice(&packed.to_le_bytes()[..BITS]);
+    }
+}
+
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
 /// miniblock packed at the width its largest delta above the block's minimum needs.
 fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
@@ -196,6 +208,29 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
         for mini in 0..minis {
             // A short last miniblock is padded with zeros to its full 32 values.
             let from = mini * MINI;
+            if widths[mini] == 0 { continue; }
+            if from + MINI <= count {
+                let group = &deltas[from..from + MINI];
+                match widths[mini] {
+                    1 => { pack_eight::<1>(out, group, least); continue; }
+                    2 => { pack_eight::<2>(out, group, least); continue; }
+                    3 => { pack_eight::<3>(out, group, least); continue; }
+                    4 => { pack_eight::<4>(out, group, least); continue; }
+                    5 => { pack_eight::<5>(out, group, least); continue; }
+                    6 => { pack_eight::<6>(out, group, least); continue; }
+                    7 => { pack_eight::<7>(out, group, least); continue; }
+                    8 => { pack_eight::<8>(out, group, least); continue; }
+                    9 => { pack_eight::<9>(out, group, least); continue; }
+                    10 => { pack_eight::<10>(out, group, least); continue; }
+                    11 => { pack_eight::<11>(out, group, least); continue; }
+                    12 => { pack_eight::<12>(out, group, least); continue; }
+                    13 => { pack_eight::<13>(out, group, least); continue; }
+                    14 => { pack_eight::<14>(out, group, least); continue; }
+                    15 => { pack_eight::<15>(out, group, least); continue; }
+                    16 => { pack_eight::<16>(out, group, least); continue; }
+                    _ => {}
+                }
+            }
             let packed = (from..from + MINI).map(|slot| {
                 if slot < count {
                     deltas[slot].wrapping_sub(least) as u64
