@@ -1634,6 +1634,11 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(default_threads)
         .min(MAX_THREADS);
 
+    let worker_count = |name| tune(name, threads as u64).clamp(1, MAX_THREADS as u64) as usize;
+    let parser_threads = worker_count("SS_PARSER_WORKERS");
+    let dedup_threads = worker_count("SS_DEDUP_WORKERS");
+    let session_threads = worker_count("SS_SESSION_WORKERS");
+
     let manifest = fs::read_to_string(data.join("manifest.json"))?;
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");
@@ -1756,8 +1761,8 @@ fn main() -> io::Result<()> {
 
     let shards = &LinkShards::default();
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
+        let handles: Vec<_> = (0..parser_threads)
+            .map(|thread| scope.spawn(move || parse_worker(shared, thread, parser_threads, shards)))
             .collect();
         handles
             .into_iter()
@@ -1769,7 +1774,7 @@ fn main() -> io::Result<()> {
 
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
+        let handles: Vec<_> = (0..dedup_threads)
             .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
@@ -1789,7 +1794,7 @@ fn main() -> io::Result<()> {
     let order = &order;
     let next = AtomicUsize::new(0);
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
+        let handles: Vec<_> = (0..session_threads)
             .map(|thread| {
                 let (events, clicks, next) = (&events, &clicks, &next);
                 scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
@@ -1883,9 +1888,15 @@ fn main() -> io::Result<()> {
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
-                parsed_events[thread].buckets.release();
-                events[thread].release();
-                clicks[thread].buckets.release();
+                for source in parsed_events.iter().skip(thread).step_by(threads) {
+                    source.buckets.release();
+                }
+                for source in events.iter().skip(thread).step_by(threads) {
+                    source.release();
+                }
+                for source in clicks.iter().skip(thread).step_by(threads) {
+                    source.buckets.release();
+                }
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
