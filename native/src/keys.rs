@@ -79,10 +79,52 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
 // The tag and complete name share a cache line. A slot transitions once
 // from empty to writing to published, so readers can reuse it without a lock.
 const FIXED_USER: u64 = 1 << 61;
-#[repr(C, align(64))]
+#[repr(C,align(32))]
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
-    name: std::cell::UnsafeCell<[u8; 33]>,
+    spelling: std::cell::UnsafeCell<*const [u8;33]>,
+    packed: std::cell::UnsafeCell<[u8;16]>,
+}
+
+thread_local! {
+    static USER_NAMES: std::cell::RefCell<&'static mut [[u8;33]]> = const { std::cell::RefCell::new(&mut []) };
+}
+
+fn retain_user(name:&[u8;33]) -> &'static [u8;33] {
+    USER_NAMES.with_borrow_mut(|free| {
+        if free.is_empty() {*free=Box::leak(vec![[0;33];1024].into_boxed_slice());}
+        let (next,rest)=std::mem::take(free).split_first_mut().unwrap();
+        *free=rest;
+        *next=*name;
+        &*next
+    })
+}
+
+/// Canonical lower-case hexadecimal has exactly one spelling per packed
+/// value. All other 33-byte names use the ordinary exact interner.
+#[inline(always)]
+fn packed_user(bytes:&[u8;33]) -> Option<[u8;16]> {
+    if bytes[0]!=b'u' {return None;}
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let text=_mm256_loadu_si256(bytes.as_ptr().add(1).cast());
+        let digit=_mm256_sub_epi8(text,_mm256_set1_epi8(48));
+        let letter=_mm256_sub_epi8(text,_mm256_set1_epi8(97));
+        let invalid=_mm256_min_epu8(_mm256_subs_epu8(digit,_mm256_set1_epi8(9)),_mm256_subs_epu8(letter,_mm256_set1_epi8(5)));
+        if _mm256_testz_si256(invalid,invalid)==0 {return None;}
+        let nibbles=_mm256_min_epu8(digit,_mm256_add_epi8(letter,_mm256_set1_epi8(10)));
+        let pairs=_mm256_maddubs_epi16(nibbles,_mm256_set1_epi16(0x0110));
+        let dense=_mm_packus_epi16(_mm256_castsi256_si128(pairs),_mm256_extracti128_si256::<1>(pairs));
+        Some(std::mem::transmute::<__m128i,[u8;16]>(dense))
+    }
+    #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
+    {
+        let nibble=|v:u8| match v { b'0'..=b'9'=>Some(v-b'0'),b'a'..=b'f'=>Some(v-b'a'+10),_=>None };
+        let mut out=[0;16];
+        for (v,pair) in out.iter_mut().zip(bytes[1..].chunks_exact(2)) {*v=(nibble(pair[0])?<<4)|nibble(pair[1])?;}
+        Some(out)
+    }
 }
 // Only the thread that claims an empty slot writes its name. All reads use
 // acquire publication or a key obtained from an already published slot.
@@ -130,6 +172,7 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
 unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
+    let Some(packed)=packed_user(bytes) else {return intern(bytes);};
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
@@ -139,7 +182,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
         if tag == 0 {
             match slot.tag.compare_exchange(0, 1, Relaxed, Acquire) {
                 Ok(_) => {
-                    unsafe { slot.name.get().write(*bytes); }
+                    unsafe { slot.spelling.get().write(retain_user(bytes)); slot.packed.get().write(packed); }
                     slot.tag.store(hash, Release);
                     return INTERNED | FIXED_USER | at as u64;
                 }
@@ -150,7 +193,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
             std::hint::spin_loop();
             tag = slot.tag.load(Acquire);
         }
-        if tag == hash && unsafe { *slot.name.get() == *bytes } {
+        if tag == hash && unsafe { *slot.packed.get() == packed } {
             return INTERNED | FIXED_USER | at as u64;
         }
         at = (at + 1) & mask;
@@ -171,7 +214,7 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
 fn name(key: u64) -> &'static [u8] {
     if key & FIXED_USER != 0 {
         let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];
-        return unsafe { &*slot.name.get() };
+        return unsafe { &**slot.spelling.get() };
     }
     let shard = (key & 255) as usize;
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
