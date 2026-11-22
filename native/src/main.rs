@@ -655,6 +655,14 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+// An odd multiplication permutes each power-of-two key domain bijectively.
+ // The upper thirty payload bits then serve both partitioning and probing.
+#[inline(always)]
+fn mixed_event_key(key:u64) -> u64 {
+    if key & keys::INTERNED == 0 {key.wrapping_mul(MIX) & !keys::INTERNED}
+    else {(key.wrapping_mul(MIX) & !LONG_EVENT) | keys::INTERNED}
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
@@ -709,14 +717,19 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let fingerprint = event_fingerprint(bytes);
             let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
             out.names.push(*bytes);
-            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint << 34)
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
                 return;
             }
-            let id = id ^ copy;
-            (id, id.wrapping_mul(MIX))
+            if shared.defer_long_events {
+                let key=mixed_event_key(id);
+                (key,key<<2)
+            } else {
+                let key=id^copy;
+                (key,key.wrapping_mul(MIX))
+            }
         };
         let (p, n) = field(3);
         let ingest = ts::ingest(p, n, dates);
@@ -951,8 +964,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let local_hash=if shared.defer_long_events {id>>32} else {id.wrapping_mul(MIX)>>24};
+                    let mut slot=local_hash as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
