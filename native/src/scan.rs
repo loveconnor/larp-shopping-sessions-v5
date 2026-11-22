@@ -505,7 +505,10 @@ impl Block {
             let mut bad_at = 0usize;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
-            let mut at = line;
+            // Start on the containing cache line when it is inside this block.
+            // Only the suffix following the header/partial row belongs to us.
+            let misalignment=((buf as usize + line as usize) & 63) as u32;
+            let mut at=if line>=misalignment {line-misalignment} else {line};
             // 1 while a field that opened with a quote in an earlier chunk has
             // its closing separator still to come.
             let mut carry = 0u64;
@@ -535,7 +538,16 @@ impl Block {
                         newline &= valid;
                         quote &= valid;
                     }
-                    let before = *p.sub(1);
+                    let mut virtual_sep=0;
+                    if at<line {
+                        let first=line-at;
+                        let keep=u64::MAX<<first;
+                        virtual_sep=1<<(first-1);
+                        sep=(sep & keep)|virtual_sep;
+                        newline&=keep;
+                        quote&=keep;
+                    }
+                    let before=if at==0 {b'\n'} else {*p.sub(1)};
                     // A quote just before the chunk can close a field at its first byte.
                     if (quote | carry) != 0 || before == b'"' {
                         let after = *p.add(64);
@@ -563,6 +575,7 @@ impl Block {
                             bad.push(at);
                         }
                     }
+                    sep &= !virtual_sep;
                     #[cfg(target_arch = "x86_64")]
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
