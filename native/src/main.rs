@@ -781,12 +781,19 @@ struct ClickSource {
     worker: usize,
 }
 
+const BORROWED_SPAN:u64=1<<61;
+const SPAN_ADDRESS:u64=(1<<48)-1;
+
 fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp::Ordering {
     if !local || (a & LONG_EVENT != LONG_EVENT && b & LONG_EVENT != LONG_EVENT) {
         return keys::compare(a, b);
     }
     fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
         if key & LONG_EVENT == LONG_EVENT {
+            if key & BORROWED_SPAN != 0 {
+                let n=((key & !(LONG_EVENT|BORROWED_SPAN))>>48) as usize;
+                return unsafe {std::slice::from_raw_parts((key&SPAN_ADDRESS) as *const u8,n)};
+            }
             &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
         } else {
             keys::bytes(key, scratch)
@@ -798,6 +805,7 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
+    mapped: bool,
     copy: u64,
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
@@ -815,7 +823,10 @@ fn parse_clicks(
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let id = if n == 33 && shared.defer_long_events {
+        if n==0 {return;}
+        let id = if mapped && shared.defer_long_events && (p as u64)<=SPAN_ADDRESS && n<8192 {
+            LONG_EVENT | BORROWED_SPAN | ((n as u64)<<48) | p as u64
+        } else if n == 33 && shared.defer_long_events {
             let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
             out.names.push(*p.cast::<[u8; 33]>());
             LONG_EVENT | (out.worker as u64) << 32 | index as u64
@@ -908,7 +919,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, block.uses_map(&shared.files[work.file],work.start), work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
     Ok((events, clicks))

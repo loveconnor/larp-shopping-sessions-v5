@@ -387,6 +387,10 @@ impl Block {
         }
     }
 
+    pub fn uses_map(&self, source:&Source,start:u64) -> bool {
+        !source.map.is_null() && self.base == source.map.wrapping_add(start as usize)
+    }
+
     pub fn load(&mut self, source: &Source, start: u64, end: u64) -> io::Result<()> {
         let own = (end - start) as usize;
         self.own_end = own;
