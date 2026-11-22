@@ -1,19 +1,19 @@
-name: Collect host-specific Shopping Sessions compiler profiles
+name: Train the AVX-512 parser without VBMI2
 on:
   push:
-    branches: [bench/parser-training]
+    branches: [bench/cascade-training]
 permissions:
   contents: read
 jobs:
   profile:
     strategy:
       matrix:
-        seed: [284239, 284311, 284377]
+        seed: [784169, 784271, 784373]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+          ref: 9d406d44d87201463951f690f8ee8ad5dedf096b
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
@@ -23,7 +23,7 @@ jobs:
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
           rows=20000000
-          if [ ${{ matrix.seed }} = 284377 ]; then rows=60000000; fi
+          if [ ${{ matrix.seed }} = 784373 ]; then rows=60000000; fi
           generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
           mkdir "$RUNNER_TEMP/profile"
           docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
@@ -32,7 +32,7 @@ jobs:
             apt-get update -qq && apt-get install -yq --no-install-recommends patch
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
-            for level in v3 v4 wide; do
+            for level in v4; do
               cpu=x86-64-$level
               feature=
               if [ "$level" != v3 ]; then
@@ -45,7 +45,7 @@ jobs:
                 feature="-C target-feature=+avx512vbmi2"
               fi
               mkdir /work/profile/$level
-              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --release --locked --target x86_64-unknown-linux-gnu
+              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --features narrow-v4 --release --locked --target x86_64-unknown-linux-gnu
               NCPU=8 DATA_DIR=/work/train OUTPUT_DIR=/work/out-$level target/x86_64-unknown-linux-gnu/release/shopping-sessions
               "$merger" merge --sparse /work/profile/$level/*.profraw -o /work/profile/$level.profdata
             done
