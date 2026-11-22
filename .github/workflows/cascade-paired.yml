@@ -123,8 +123,7 @@ jobs:
               print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
-        if: steps.native.outputs.supported == 'true'
-        if: matrix.events == 20000000 && matrix.format == 'current'
+        if: steps.native.outputs.supported == 'true' && matrix.events == 20000000 && matrix.format == 'current'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
