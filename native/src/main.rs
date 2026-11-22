@@ -523,7 +523,7 @@ struct Shared {
     files: Vec<Source>,
     work: Vec<Work>,
     next: AtomicUsize,
-    link_files: Vec<PathBuf>,
+    link_files: Vec<Vec<PathBuf>>,
     id_bits: u32,
     defer_long_events: bool,
     person_bits: u32,
@@ -557,6 +557,24 @@ fn csv_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Give each file to one reader, placing large files first on the reader
+/// with the fewest assigned bytes. No reader coordinates while parsing.
+fn distribute_link_files(folder: &Path, workers: usize) -> io::Result<Vec<Vec<PathBuf>>> {
+    let mut files = Vec::new();
+    for path in csv_files(folder)? {
+        files.push((path.metadata()?.len(), path));
+    }
+    files.sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
+    let mut loads = vec![0u64; workers];
+    let mut assigned = vec![Vec::new(); workers];
+    for (size, path) in files {
+        let worker = (0..workers).min_by_key(|&i| loads[i]).unwrap();
+        loads[worker] += size;
+        assigned[worker].push(path);
+    }
+    Ok(assigned)
+}
+
 /// Visit the fields in the padded CSV block while it is still alive.
 fn dimension_rows(path: &Path, prefix: &[u8], mut visit: impl FnMut(&[u8], usize, &[u8])) -> io::Result<()> {
     let source = Source::open(path, false)?;
@@ -588,9 +606,9 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize) -> io::Result<Vec<(u64, u64)>> {
+fn read_links(shared: &Shared, block: &mut Block, worker: usize) -> io::Result<Vec<(u64, u64)>> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for path in shared.link_files.iter().skip(worker).step_by(threads) {
+    for path in &shared.link_files[worker] {
         let source = Source::open(path, true)?;
         let size = source.size;
         let mut start = 0;
@@ -879,7 +897,7 @@ type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
 fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
     let began = Instant::now();
-    let own = read_links(shared, &mut block, worker, threads).unwrap_or_else(|error| {
+    let own = read_links(shared, &mut block, worker).unwrap_or_else(|error| {
         eprintln!("links: {error}");
         std::process::exit(1);
     });
@@ -1736,7 +1754,7 @@ fn main() -> io::Result<()> {
         files,
         work,
         next: AtomicUsize::new(0),
-        link_files: csv_files(&data.join("links"))?,
+        link_files: distribute_link_files(&data.join("links"), threads)?,
         defer_long_events: copies == 1,
         id_bits: tune("SS_ID_BITS", id_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", person_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
