@@ -54,7 +54,7 @@ const CHUNK_BYTES: usize = 8192;
 /// Chunks per slab.
 const SLAB: usize = 1 << 13;
 /// The dedup table packs a record's offset in its chunk into this many bits.
-const OFFSET_BITS: u32 = 9;
+const OFFSET_BITS: u32 = 10;
 
 /// Records appended to one of many partitions, in fixed chunks carved from
 /// big slabs: no copying on growth, and a chunk never moves. A chunk can also
@@ -187,8 +187,13 @@ impl<T: Copy> Buckets<T> {
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
-struct Parsed {
+struct IdRef {
     id: u64,
+    row: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Parsed {
     user: u64,
     /// Full UTC ingestion time, including copies ingested before the window.
     ingest: i64,
@@ -632,8 +637,27 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
-    buckets: Buckets<Parsed>,
+    buckets: Buckets<IdRef>,
+    bodies: Vec<Vec<Parsed>>,
     names: Vec<[u8; 33]>,
+}
+
+const BODY_SHIFT: usize = 15;
+const BODY_COUNT: usize = 1 << BODY_SHIFT;
+
+impl EventSource {
+    fn append(&mut self, record: Parsed) -> u32 {
+        if self.bodies.last().is_none_or(|block| block.len() == BODY_COUNT) {
+            self.bodies.push(Vec::with_capacity(BODY_COUNT));
+        }
+        let block = self.bodies.len() - 1;
+        let row = (block << BODY_SHIFT) | self.bodies[block].len();
+        self.bodies[block].push(record);
+        u32::try_from(row).expect("too many records for one worker")
+    }
+    fn body(&self, row: u32) -> &Parsed {
+        &self.bodies[row as usize >> BODY_SHIFT][row as usize & (BODY_COUNT - 1)]
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -696,13 +720,13 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             }
         }
         let record = Parsed {
-            id,
             user,
             ingest,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let row = out.append(record);
+        out.buckets.push((partition_hash >> id_shift) as usize, IdRef { id, row });
     });
 }
 
@@ -803,7 +827,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), bodies: Vec::new(), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -820,13 +844,9 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 // ---------------------------------------------------------------- phase 2
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
-    let links = shared.links.get().unwrap();
-    // The events go into the memory of the parsed records they came from: a
-    // parsed chunk, once read, is room for one chunk of events.
-    let mut out = Buckets::new(1 << shared.person_bits);
-    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
-    let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
+fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Vec<Vec<u32>> {
+    let mut losers = vec![Vec::new(); sources.len()];
+    let mut chunks: Vec<(*mut IdRef, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
@@ -878,11 +898,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            if (*record).ingest < (*other).ingest {
-                                (*other).ts = DEAD;
+                            let a = owners[index];
+                            let b = owners[(seen >> OFFSET_BITS) as usize];
+                            if sources[a].body((*record).row).ingest < sources[b].body((*other).row).ingest {
+                                losers[b].push((*other).row);
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
-                                (*record).ts = DEAD;
+                                losers[a].push((*record).row);
                             }
                             break;
                         }
@@ -890,23 +912,28 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
-                for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
-                        continue;
-                    }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
-                }
-            }
-            // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
+        }
+    }
+    losers
+}
+
+fn route_worker(shared: &Shared, source: &mut EventSource, losers: &[Vec<Vec<u32>>], owner: usize) -> Buckets<Event> {
+    let links = shared.links.get().unwrap();
+    let mut out = Buckets::new(1 << shared.person_bits);
+    for shard in losers {
+        for &row in &shard[owner] {
+            source.bodies[row as usize >> BODY_SHIFT][row as usize & (BODY_COUNT - 1)].ts = DEAD;
+        }
+    }
+    for &base in &source.buckets.bases { out.donate(base.cast()); }
+    for block in source.bodies.drain(..) {
+        for (index, record) in block.iter().enumerate() {
+            if let Some(future) = block.get(index + shared.ahead) { links.prefetch(future.user); }
+            if record.ts != DEAD {
+                let person = links.person(record.user);
+                out.push(person_part(person, shared.person_bits), Event {
+                    person, value: ((record.ts as u64) << 32) | record.payload as u64,
+                });
             }
         }
     }
@@ -1491,15 +1518,21 @@ fn main() -> io::Result<()> {
             .map(|handle| handle.join().unwrap())
             .collect::<io::Result<Vec<_>>>()
     })?;
-    let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
+    let (mut parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
 
     let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
+    let losers: Vec<_> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    let events: Vec<_> = std::thread::scope(|scope| {
+        let losers = &losers;
+        let handles: Vec<_> = parsed_events.iter_mut().enumerate()
+            .map(|(owner, source)| scope.spawn(move || route_worker(shared, source, losers, owner))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
