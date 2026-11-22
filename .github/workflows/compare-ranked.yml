@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 170781}
-          - {events: 60000000, format: current, seed: 170781}
-          - {events: 20000000, format: current, seed: 181997}
-          - {events: 60000000, format: current, seed: 181997}
+          - {events: 20000000, format: current, seed: 200683}
+          - {events: 60000000, format: current, seed: 200683}
+          - {events: 20000000, format: current, seed: 201117}
+          - {events: 60000000, format: current, seed: 201117}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: 2495dfc9e31fe401f60bade9b07508a5933a2766
+      RANKED: 2495dfc9e31fe401f60bade9b07508a5933a2766
+      CANDIDATE: 1d74ed1da2daf81c7d6184dc279bb4b248f0e916
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +33,7 @@ jobs:
           for label in ranked candidate v4; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=4660d6bba6b7c627eefa5e71657394b46149d23d; fi
+            if [ "$label" = v4 ]; then sha=425d620321c7829770d38a9cece30c74ac81e8c5; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -107,7 +107,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          for label in candidate; do
+          for label in candidate v4; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
