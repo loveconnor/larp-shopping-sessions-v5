@@ -1,7 +1,7 @@
-name: Measure event partition and read locality
+name: Measure parallelism for three pipeline phases on a pinned native CPU set
 on:
   push:
-    branches: [bench/partition-locality]
+    branches: [bench/phase-workers]
 permissions:
   contents: read
 jobs:
@@ -12,15 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 293611}
-          - {events: 60000000, format: current, seed: 293611}
-          - {events: 20000000, format: current, seed: 497939}
-          - {events: 60000000, format: current, seed: 497939}
+          - {events: 20000000, format: current, seed: 171617}
+          - {events: 60000000, format: current, seed: 171617}
+          - {events: 20000000, format: current, seed: 719441}
+          - {events: 60000000, format: current, seed: 719441}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+      RANKED: ee93892532a34b2261bc5c24a2ffeb2015ece16a
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,10 @@ jobs:
           for d in (scratch,out):
               d.mkdir()
               d.chmod(0o777)
-          cid = subprocess.check_output(["docker","run","-d","--runtime","runc","--memory","12g","--memory-swap","12g","--network","none","--read-only","--cap-drop","ALL","--user","1000:1000","--tmpfs","/tmp:rw,size=64m","-e","NCPU=8","-e","DATA_DIR=/data","-e","OUTPUT_DIR=/output","-e","SCRATCH_DIR=/scratch","-v",f"{root}/data:/data:ro","-v",f"{out}:/output","-v",f"{scratch}:/scratch","ranked","sleep","1800"],text=True).strip()
+          logical = sorted(os.sched_getaffinity(0))[:8]
+          workers = len(logical)
+          print("CPU affinity", logical, flush=True)
+          cid = subprocess.check_output(["docker","run","-d","--runtime","runc","--cpuset-cpus",",".join(map(str,logical)),"--memory","12g","--memory-swap","12g","--network","none","--read-only","--cap-drop","ALL","--user","1000:1000","--tmpfs","/tmp:rw,size=64m","-e",f"NCPU={workers}","-e","DATA_DIR=/data","-e","OUTPUT_DIR=/output","-e","SCRATCH_DIR=/scratch","-v",f"{root}/data:/data:ro","-v",f"{out}:/output","-v",f"{scratch}:/scratch","ranked","sleep","1800"],text=True).strip()
           def run(env):
               subprocess.run(["docker","exec",cid,"rm","-rf","/output/campaign_daily","/output/user_daily"],check=True)
               extra = [arg for k,v in env.items() for arg in ("-e",f"{k}={v}")]
@@ -73,9 +76,8 @@ jobs:
           run({})
           ref = root / "ref"
           shutil.copytree(out,ref)
-          candidates = [{"SS_ID_BITS": str(n)} for n in (5,6,7,8,9,10,11,12,13)]
-          candidates += [{"SS_BLOCK": str(1<<n)} for n in (17,18,19,20,22,23)]
-          candidates += [{"SS_AHEAD": str(n)} for n in (0,4,8,24,32,48)]
+          levels = sorted({max(1, workers//2),max(1,workers-1),workers+1,workers*3//2,workers*2})
+          candidates = [{key:str(n)} for key in ("SS_PARSER_WORKERS","SS_DEDUP_WORKERS","SS_SESSION_WORKERS") for n in levels if n!=workers]
           rng = random.Random(int(os.environ["SEED"]))
           samples = [[] for _ in candidates]
           def stage(ids, rounds):
