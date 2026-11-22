@@ -65,9 +65,7 @@ jobs:
               d.chmod(0o777)
           cid = subprocess.check_output(["docker","run","-d","--runtime","runc","--memory","12g","--memory-swap","12g","--network","none","--read-only","--cap-drop","ALL","--user","1000:1000","--tmpfs","/tmp:rw,size=64m","-e","NCPU=8","-e","DATA_DIR=/data","-e","OUTPUT_DIR=/output","-e","SCRATCH_DIR=/scratch","-v",f"{root}/data:/data:ro","-v",f"{out}:/output","-v",f"{scratch}:/scratch","ranked","sleep","1800"],text=True).strip()
           def run(env):
-              for item in out.iterdir():
-                  if item.is_dir(): shutil.rmtree(item)
-                  else: item.unlink()
+              subprocess.run(["docker","exec",cid,"rm","-rf","/output/campaign_daily","/output/user_daily"],check=True)
               extra = [arg for k,v in env.items() for arg in ("-e",f"{k}={v}")]
               started=time.monotonic()
               x=subprocess.run(["docker","exec",*extra,cid,"/app/shopping-sessions"],capture_output=True,text=True,check=True)
