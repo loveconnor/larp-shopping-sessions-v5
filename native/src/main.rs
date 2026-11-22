@@ -613,8 +613,12 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
-        let field = |at: usize| scan::field(buf, start, seps, at);
+    block.event_lines(|buf, start, seps, quotes| unsafe {
+        let field = |at: usize| {
+            let from = if at == 0 { start } else { seps[at-1] + 1 };
+            let q = u32::from((quotes >> at) & 1);
+            (buf.add((from + q) as usize), (seps[at] - from - 2*q) as usize)
+        };
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();

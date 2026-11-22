@@ -465,12 +465,29 @@ impl Block {
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
-            if N == 7 { return unsafe { self.event_rows::<N, true>(visit) }; }
             return unsafe { self.raw_wide(visit) };
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        if N == 7 { return unsafe { self.event_rows::<N, false>(visit) }; }
         self.raw_indexed::<N, false>(visit)
+    }
+
+    pub fn event_lines(&self, mut visit: impl FnMut(*const u8, u32, &[u32; 7], u8)) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "avx2"))]
+        unsafe {
+            if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
+                return self.event_rows::<7, true>(visit);
+            }
+            return self.event_rows::<7, false>(visit);
+        }
+        #[allow(unreachable_code)]
+        self.raw_lines(|buf,start,seps| unsafe { visit(buf,start,seps,Self::quote_flags(buf,seps)) });
+    }
+
+    unsafe fn quote_flags<const N: usize>(buf: *const u8, seps: &[u32;N]) -> u8 {
+        let mut flags = 0;
+        for (i,&end) in seps.iter().enumerate() {
+            if end > 0 && *buf.add(end as usize-1) == b'"' { flags |= 1 << i; }
+        }
+        flags
     }
 
     // Most event rows fit in two SIMD loads. Identify the row terminator,
@@ -478,7 +495,7 @@ impl Block {
     // consumer. The block loader provides readable padding past its tail.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn event_rows<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    unsafe fn event_rows<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N], u8)) {
         let buf = self.base;
         let data = std::slice::from_raw_parts(buf, self.end);
         let Some(first) = data[..self.own_end.min(self.end)].iter().position(|&ch| ch == b'\n') else { return };
@@ -489,7 +506,7 @@ impl Block {
             let (sh,nh,qh) = if WIDE { wide_classes(p.add(64)) } else { classes(p.add(64)) };
             let nl = u128::from(nl) | (u128::from(nh) << 64);
             if nl == 0 {
-                if let Some(found) = Self::split_line::<N>(buf, line) { visit(buf, line as u32, &found); }
+                if let Some(found) = Self::split_line::<N>(buf, line) { visit(buf, line as u32, &found, Self::quote_flags(buf,&found)); }
                 line += data[line..].iter().position(|&ch| ch == b'\n').unwrap_or(data.len()-line) + 1;
                 continue;
             }
@@ -510,7 +527,12 @@ impl Block {
                     let n = flatten::<5>(sep as u64, line as u32, out);
                     if n < N { flatten::<4>((sep >> 64) as u64, line as u32 + 64, out.add(n)); }
                 }
-                visit(buf, line as u32, &*out.cast::<[u32; N]>());
+                let flags = closing << 1;
+                use std::arch::x86_64::_pext_u64;
+                let lower = _pext_u64(flags as u64, sep as u64);
+                let upper = _pext_u64((flags >> 64) as u64, (sep >> 64) as u64);
+                let quoted = lower | (upper << (sep as u64).count_ones());
+                visit(buf, line as u32, &*out.cast::<[u32; N]>(), quoted as u8);
             }
             line += stop + 1;
         }
