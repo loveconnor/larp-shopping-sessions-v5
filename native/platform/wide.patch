@@ -73,15 +73,15 @@ index ce3aae9..7743174 100644
                  let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
 @@ -568,9 +567,44 @@ impl Block {
                      #[cfg(not(target_arch = "x86_64"))]
-                     let positions = flatten::<7>(sep, at, out.add(count));
+                     let positions = flatten::<8>(sep, at, out.add(count));
                      count += positions;
--                    lines += flatten::<2>(newline, at, ends.add(lines));
+-                    lines += flatten::<3>(newline, at, ends.add(lines));
 +                    if regular {
 +                        lines += newline.count_ones() as usize;
 +                        newline_masks[blocks] = newline;
 +                        blocks += 1;
 +                    } else {
-+                        lines += flatten::<2>(newline, at, ends.add(lines));
++                        lines += flatten::<3>(newline, at, ends.add(lines));
 +                    }
                      at += 64;
                  }
@@ -111,7 +111,7 @@ index ce3aae9..7743174 100644
 +                if regular {
 +                    lines = 0;
 +                    for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
-+                        lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
++                        lines += flatten::<3>(mask, window_start + (i * 64) as u32, ends.add(lines));
 +                    }
 +                }
                  // Sentinels: a line's separators are found by position.
