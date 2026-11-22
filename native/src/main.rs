@@ -702,6 +702,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
+        #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi"))]
+        let (starts,lengths) = scan::event_spans(buf,start,seps);
+        #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi"))]
+        let field = |at: usize| (buf.add(starts[at] as usize),lengths[at] as usize);
+        #[cfg(not(all(target_arch="x86_64",target_feature="avx512vbmi")))]
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {

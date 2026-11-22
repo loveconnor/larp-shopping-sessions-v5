@@ -262,6 +262,35 @@ pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N]
     }
 }
 
+/// Compute seven unquoted event spans together. A two-register byte shuffle
+/// reads all opening bytes of a short record directly from its cached text.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
+pub unsafe fn event_spans(buf: *const u8, start: u32, seps: &[u32;7]) -> ([u32;8],[u32;8]) {
+    use std::arch::x86_64::*;
+    if seps[6] - start >= 128 {
+        let mut from = [0;8];
+        let mut lengths = [0;8];
+        for i in 0..7 {
+            let (a,b) = unsafe { bounds(buf,start,seps,i) };
+            from[i] = a; lengths[i] = b-a;
+        }
+        return (from,lengths);
+    }
+    let ends = _mm256_maskz_loadu_epi32(0x7f,seps.as_ptr().cast());
+    let previous = _mm256_permutevar8x32_epi32(ends,_mm256_setr_epi32(0,0,1,2,3,4,5,6));
+    let left = _mm256_mask_mov_epi32(_mm256_add_epi32(previous,_mm256_set1_epi32(1)),1,_mm256_set1_epi32(start as i32));
+    let relative = _mm256_sub_epi32(left,_mm256_set1_epi32(start as i32));
+    let indices = _mm512_castsi128_si512(_mm256_cvtepi32_epi8(relative));
+    let row = unsafe { buf.add(start as usize) };
+    let openings = _mm512_permutex2var_epi8(_mm512_loadu_si512(row.cast()),indices,_mm512_loadu_si512(row.add(64).cast()));
+    let quoted = _mm512_cmpeq_epi8_mask(openings,_mm512_set1_epi8(b'"' as i8)) as u8;
+    let actual = _mm256_mask_add_epi32(left,quoted,left,_mm256_set1_epi32(1));
+    let lengths = _mm256_sub_epi32(ends,actual);
+    let lengths = _mm256_mask_sub_epi32(lengths,quoted,lengths,_mm256_set1_epi32(1));
+    (std::mem::transmute(actual),std::mem::transmute(lengths))
+}
+
 /// Field `at` of a line from `raw_lines`, without its quotes: (first byte, length).
 #[inline(always)]
 pub unsafe fn field<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (*const u8, usize) {
