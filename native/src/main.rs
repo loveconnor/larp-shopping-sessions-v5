@@ -1528,7 +1528,10 @@ fn main() -> io::Result<()> {
     let map_by_default = total >= 1 << 30;
     let block = tune("SS_BLOCK", if map_by_default { 1 << 21 } else { BLOCK }).max(4096);
     let map = tune("SS_MAP", u64::from(map_by_default || !cfg!(target_os = "linux"))) != 0;
-    let give_back = tune("SS_RELEASE", u64::from(large)) != 0;
+    // Release mapped working sets in parallel so exit does not reclaim
+    // every input page on one thread.
+    let release_pages = large || (cfg!(target_os = "linux") && map_by_default && map);
+    let give_back = tune("SS_RELEASE", u64::from(release_pages)) != 0;
     for (file, source) in files.iter_mut().enumerate() {
         if map {
             source.map_input();
