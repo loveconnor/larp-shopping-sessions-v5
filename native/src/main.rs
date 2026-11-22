@@ -1420,6 +1420,7 @@ fn main() -> io::Result<()> {
     }
 
     let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
+    if copies == 1 { keys::prepare_users(input_bytes); }
     let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;

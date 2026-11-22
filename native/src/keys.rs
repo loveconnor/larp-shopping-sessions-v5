@@ -76,32 +76,78 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     (INTERNED | ((i as u64) << 8) | shard as u64, table.entries[i].1)
 }
 
-thread_local! {
-    static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
-        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
+// The tag and complete name share a cache line. A slot transitions once
+// from empty to writing to published, so readers can reuse it without a lock.
+const FIXED_USER: u64 = 1 << 61;
+#[repr(C, align(64))]
+struct UserSlot {
+    tag: std::sync::atomic::AtomicU64,
+    name: std::cell::UnsafeCell<[u8; 33]>,
+}
+// Only the thread that claims an empty slot writes its name. All reads use
+// acquire publication or a key obtained from an already published slot.
+unsafe impl Sync for UserSlot {}
+static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::new();
+
+pub fn prepare_users(bytes: u64) {
+    USER_SLOTS.get_or_init(|| {
+        let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
+        let mut slots = Vec::with_capacity(size);
+        slots.resize_with(size, || UserSlot { tag: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
+        slots.into_boxed_slice()
+    });
 }
 
-/// Repeated long user names can be resolved by comparing their full bytes
-/// with a worker-local entry. The shared interner assigns the canonical key.
+#[inline(always)]
+unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let bytes = unsafe { &*p.cast::<[u8;33]>() };
+    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
+    let mixed = (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
+        .wrapping_mul(0x9e3779b97f4a7c15);
+    let hash = (mixed ^ (mixed >> 31)) | 2;
+    let mask = slots.len()-1;
+    let mut at = (mixed >> 24) as usize & mask;
+    for _ in 0..12 {
+        let slot = &slots[at];
+        let mut tag = slot.tag.load(Acquire);
+        if tag == 0 {
+            match slot.tag.compare_exchange(0, 1, Relaxed, Acquire) {
+                Ok(_) => {
+                    unsafe { slot.name.get().write(*bytes); }
+                    slot.tag.store(hash, Release);
+                    return INTERNED | FIXED_USER | at as u64;
+                }
+                Err(other) => tag = other,
+            }
+        }
+        while tag == 1 {
+            std::hint::spin_loop();
+            tag = slot.tag.load(Acquire);
+        }
+        if tag == hash && unsafe { *slot.name.get() == *bytes } {
+            return INTERNED | FIXED_USER | at as u64;
+        }
+        at = (at + 1) & mask;
+    }
+    // The probe window never empties. Future occurrences follow this same
+    // fallback and share the ordinary interner's canonical key.
+    intern(bytes)
+}
+
 #[inline(always)]
 pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
-    if n != 33 {
-        return unsafe { pack(p, n) };
+    if n == 33 {
+        if let Some(slots) = USER_SLOTS.get() { return unsafe { fixed_user(p, slots) }; }
     }
-    let value = unsafe { std::slice::from_raw_parts(p, n) };
-    let prefix = u64::from_le_bytes(value[1..9].try_into().unwrap());
-    let slot = (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49) as usize;
-    USERS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let entry = &mut cache[slot];
-        if entry.1 != value {
-            *entry = intern_name(value);
-        }
-        entry.0
-    })
+    unsafe { pack(p, n) }
 }
 
 fn name(key: u64) -> &'static [u8] {
+    if key & FIXED_USER != 0 {
+        let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];
+        return unsafe { &*slot.name.get() };
+    }
     let shard = (key & 255) as usize;
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
 }
