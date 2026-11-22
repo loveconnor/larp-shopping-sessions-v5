@@ -34,6 +34,7 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// The epoch day of each `YYYY-MM-DD` seen, by its day of month: a dataset
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
+    hours: Box<[[u64; 3]]>,
     month: [u64; 100],
     midnight: [i64; 100],
 }
@@ -41,6 +42,7 @@ pub struct Dates {
 impl Dates {
     pub fn new() -> Self {
         Self {
+            hours: vec![[0, 0, u64::MAX]; 1024].into_boxed_slice(),
             month: [0; 100],
             midnight: [0; 100],
         }
@@ -108,7 +110,7 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
 /// `civil_seconds_plain`, with the day and time read as one vector.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+unsafe fn full_civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe {
         use std::arch::x86_64::*;
         let raw = load64(p); // YYYY-MM-
@@ -156,8 +158,36 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+unsafe fn full_civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe { civil_seconds_plain(p, dates) }
+}
+
+/// Cache a validated YYYY-MM-DDTHH prefix. On a hit only the final six
+/// characters need to be checked, including both colon positions.
+#[inline(always)]
+unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+    unsafe {
+        let first = load64(p);
+        let last = load64(p.add(5));
+        let day = ((last >> 24) & 15) * 10 + ((last >> 32) & 15);
+        let hour = ((last >> 48) & 15) * 10 + ((last >> 56) & 15);
+        let slot = ((day * 32 + hour) & 1023) as usize;
+        let suffix = (load64(p.add(11)) >> 16) ^ 0x3030_3a30_303a;
+        let valid = ((suffix.wrapping_add(0x767a_7f76_7a7f) | suffix) & 0x8080_8080_8080) == 0;
+        if !valid { return BAD; }
+        let minute = byte(suffix, 1) * 10 + byte(suffix, 2);
+        let second = byte(suffix, 4) * 10 + byte(suffix, 5);
+        let within = minute * 60 + second;
+        let entry = dates.hours[slot];
+        if entry[0] == first && entry[1] == last && entry[2] != u64::MAX {
+            return entry[2] as i64 + within;
+        }
+        let parsed = full_civil_seconds(p, dates);
+        if parsed != BAD {
+            dates.hours[slot] = [first, last, (parsed - within) as u64];
+        }
+        parsed
+    }
 }
 
 /// Eight ASCII digits already reduced to 0..=9 per byte, first digit lowest.
@@ -209,16 +239,8 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
         if len != 20 || *p.add(19) != b'Z' {
             return parse(p, len, dates);
         }
-        let pair = |i: usize| {
-            let v = u16::from_le((p.add(i) as *const u16).read_unaligned());
-            i64::from((v & 15) * 10 + ((v >> 8) & 15))
-        };
-        let day = pair(8) as usize;
-        let raw = load64(p);
-        if day >= dates.month.len() || dates.month[day] != raw {
-            return parse(p, len, dates);
-        }
-        (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
+        let seconds = civil_seconds(p, dates);
+        if seconds == BAD { BAD } else { seconds * 1000 }
     }
 }
 
