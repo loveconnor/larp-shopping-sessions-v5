@@ -218,6 +218,18 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// The common number of newlines per 64 bytes differs across CSV layouts.
+#[inline(always)]
+unsafe fn flatten_newlines<const FIELDS: usize>(bits: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        match FIELDS {
+            7 => flatten::<1>(bits, base, out),
+            2 => flatten::<4>(bits, base, out),
+            _ => flatten::<2>(bits, base, out),
+        }
+    }
+}
+
 /// Writes the position of every set bit of `bits`, plus `base`, at `out`,
 /// and returns how many. Up to `UNROLL` are written without a branch; `out`
 /// needs room for 64 + `UNROLL`.
@@ -597,7 +609,7 @@ impl Block {
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<7>(sep, at, out.add(count));
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
+                    lines += flatten_newlines::<N>(newline, at, ends.add(lines));
                     at += 64;
                 }
                 // Sentinels: a line's separators are found by position.
