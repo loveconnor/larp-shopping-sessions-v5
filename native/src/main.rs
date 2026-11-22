@@ -82,7 +82,12 @@ unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
     /// Bytes of a chunk that hold records.
-    const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    const FILL: usize = if std::mem::size_of::<T>() == std::mem::size_of::<Event>() {
+        // Event chunks accept complete cache lines from the deduplicator.
+        CHUNK_BYTES - 64
+    } else {
+        (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>()
+    };
     /// Records per chunk.
     const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
     const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
@@ -206,6 +211,59 @@ struct Event {
     person: u64,
     /// `ts` in the top 32 bits, `payload` in the low 32.
     value: u64,
+}
+
+#[repr(align(64))]
+#[derive(Clone)]
+struct EventLine([Event; 4]);
+
+struct EventLines {
+    lines: Vec<EventLine>,
+    used: Vec<u8>,
+}
+
+impl EventLines {
+    fn new(parts: usize) -> Self {
+        let zero = Event { person: 0, value: 0 };
+        Self { lines: vec![EventLine([zero; 4]); parts], used: vec![0; parts] }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, out: &mut Buckets<Event>, part: usize, event: Event) {
+        let used = &mut self.used[part];
+        let line = &mut self.lines[part].0;
+        line[*used as usize] = event;
+        *used += 1;
+        if *used != 4 { return; }
+        *used = 0;
+        let mut dest = out.next[part];
+        if dest.addr() & (CHUNK_BYTES - 1) == Buckets::<Event>::FILL {
+            dest = out.grow(part);
+        }
+        // All preceding writes to this chunk are whole lines. Any residual
+        // entries are appended only when the worker has consumed its input.
+        unsafe {
+            #[cfg(all(target_arch="x86_64", target_feature="avx2"))]
+            {
+                use std::arch::x86_64::*;
+                let src = line.as_ptr().cast::<__m256i>();
+                let dst = dest.cast::<__m256i>();
+                _mm256_stream_si256(dst, _mm256_load_si256(src));
+                _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+            }
+            #[cfg(not(all(target_arch="x86_64", target_feature="avx2")))]
+            std::ptr::copy_nonoverlapping(line.as_ptr(), dest, 4);
+            out.next[part] = dest.add(4);
+        }
+    }
+
+    fn finish(self, out: &mut Buckets<Event>) {
+        #[cfg(all(target_arch="x86_64", target_feature="avx2"))]
+        unsafe { std::arch::x86_64::_mm_sfence(); }
+        for (part, (line, used)) in self.lines.into_iter().zip(self.used).enumerate() {
+            for &event in &line.0[..used as usize] { out.push(part, event); }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -921,6 +979,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
+    let mut lines = EventLines::new(1 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -1006,7 +1065,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    lines.push(&mut out, person_part(person, person_bits), Event { person, value });
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -1015,6 +1074,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
         }
     }
+    lines.finish(&mut out);
     out
 }
 
