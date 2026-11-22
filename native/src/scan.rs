@@ -252,6 +252,18 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     n
 }
 
+/// Enumerate the two independent halves of the mask so their bit scans overlap.
+#[inline(always)]
+unsafe fn split_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        let low = bits as u32;
+        let high = (bits >> 32) as u32;
+        let mid = low.count_ones() as usize;
+        flatten::<4>(low as u64, base, out);
+        mid + flatten::<4>(high as u64, base + 32, out.add(mid))
+    }
+}
+
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
 
@@ -564,7 +576,7 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { split_positions(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
                     count += positions;
