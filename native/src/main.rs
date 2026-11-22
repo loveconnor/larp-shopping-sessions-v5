@@ -633,11 +633,29 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
+    // Each entry is the address of a 64 KiB piece of a read-only input mapping.
+    // The shared input files outlive the entire deduplication phase.
+    regions: Vec<usize>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
 }
 
+impl EventSource {
+    unsafe fn name(&self, handle: u32) -> &[u8;33] {
+        if handle >> 31 != 0 { return &self.names[(handle & 0x7fff_ffff) as usize]; }
+        let base = self.regions[(handle >> 16) as usize];
+        unsafe { &*((base + (handle & 65535) as usize) as *const [u8;33]) }
+    }
+}
+
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    let (mapped, bytes) = block.mapped_span();
+    let n = bytes.div_ceil(65536);
+    let mapped = if !mapped.is_null() && out.regions.len() + n <= 32768 {
+        let first = (out.regions.len() as u32) << 16;
+        for i in 0..n {out.regions.push(mapped.wrapping_add(i*65536) as usize);}
+        Some(first)
+    } else { None };
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -658,8 +676,14 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let index = if let Some(first) = mapped {
+                first + block.offset(p) as u32
+            } else {
+                let index = u32::try_from(out.names.len()).unwrap();
+                assert!(index < 1 << 31);
+                out.names.push(*bytes);
+                index | (1 << 31)
+            };
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -823,7 +847,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { regions: Vec::new(), buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -892,8 +916,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             // Equal fingerprints select candidates. Only the full bytes
                             // decide whether these two records are duplicates.
                             id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                                && sources[owners[index]].name(id as u32)
+                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].name(other_id as u32)
                         } else {
                             id == other_id
                         };
@@ -1448,7 +1472,7 @@ fn main() -> io::Result<()> {
     }
     let large = total >= 4u64 << 30;
     let block = tune("SS_BLOCK", if large { 1 << 21 } else { BLOCK }).max(4096);
-    let map = tune("SS_MAP", u64::from(large || !cfg!(target_os = "linux"))) != 0;
+    let map = tune("SS_MAP", 1) != 0;
     let give_back = tune("SS_RELEASE", u64::from(large)) != 0;
     for (paths, events) in inputs {
         for path in paths {
