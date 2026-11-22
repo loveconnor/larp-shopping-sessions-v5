@@ -241,14 +241,31 @@ pub unsafe fn pack_plain(p: *const u8, len: usize) -> u64 {
 #[inline]
 pub fn unpack(key: u64, out: &mut Vec<u8>) {
     if key & INTERNED == 0 {
-        let mut shift = 56i32;
-        while shift >= 0 {
-            let byte = ((key >> shift) & 0x7F) as u8;
-            if byte == 0 {
-                break;
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        unsafe {
+            use std::arch::x86_64::_pdep_u64;
+            let word = _pdep_u64(key >> 7, 0x7f7f_7f7f_7f7f_7f7f).swap_bytes();
+            let ninth = (key & 127) as u8;
+            let zero = word.wrapping_sub(0x0101_0101_0101_0101) & !word & 0x8080_8080_8080_8080;
+            let count = if zero == 0 { 8 + usize::from(ninth != 0) } else { zero.trailing_zeros() as usize / 8 };
+            let start = out.len();
+            out.reserve(9);
+            let dest = out.as_mut_ptr().add(start);
+            dest.cast::<u64>().write_unaligned(word);
+            dest.add(8).write(ninth);
+            out.set_len(start + count);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let mut shift = 56i32;
+            while shift >= 0 {
+                let byte = ((key >> shift) & 0x7F) as u8;
+                if byte == 0 {
+                    break;
+                }
+                out.push(byte);
+                shift -= 7;
             }
-            out.push(byte);
-            shift -= 7;
         }
     } else {
         out.extend_from_slice(name(key));
@@ -284,6 +301,23 @@ pub fn compare(a: u64, b: u64) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_short_names_stops_at_the_first_zero_group() {
+        let mut state = 971321u64;
+        for i in 0..32768 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let zero_group = (i % 10) * 7;
+            let key = state & !INTERNED & !(127u64.wrapping_shl(zero_group));
+            let expected: Vec<_> = (0..9).map(|j| ((key >> (56 - 7 * j)) & 127) as u8)
+                .take_while(|&b| b != 0).collect();
+            let mut out = vec![17; i as usize % 11];
+            let start = out.len();
+            unpack(key, &mut out);
+            assert!(out[..start].iter().all(|&x| x == 17));
+            assert_eq!(&out[start..], expected);
+        }
+    }
 
     #[test]
     fn pack_matches_plain() {
