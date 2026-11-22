@@ -236,21 +236,16 @@ struct Touch {
 // ---------------------------------------------------------------- lookups
 
 /// `prefix` + number IDs in a dense table, anything else in a map. 0 is absent.
+const PRODUCT_PREFIX: &[u8] = b"p";
+const CAMPAIGN_PREFIX: &[u8] = b"c_";
+
+#[derive(Default)]
 struct Dim {
-    prefix: &'static [u8],
     dense: Vec<u32>,
     other: HashMap<Vec<u8>, u32>,
 }
 
 impl Dim {
-    fn new(prefix: &'static [u8]) -> Self {
-        Self {
-            prefix,
-            dense: Vec::new(),
-            other: HashMap::new(),
-        }
-    }
-
     fn insert(&mut self, name: &[u8], number: usize, value: u32) {
         if number == usize::MAX {
             self.other.insert(name.to_vec(), value);
@@ -263,9 +258,9 @@ impl Dim {
     }
 
     #[inline(always)]
-    unsafe fn get(&self, p: *const u8, len: usize) -> u32 {
+    unsafe fn get(&self, p: *const u8, len: usize, prefix: &[u8]) -> u32 {
         unsafe {
-            let number = ts::numbered(p, len, self.prefix);
+            let number = ts::numbered(p, len, prefix);
             if number < self.dense.len() {
                 return *self.dense.get_unchecked(number);
             }
@@ -750,7 +745,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 valid = false;
             } else {
                 let (p, n) = field(5);
-                let category = shared.products.get(p, n);
+                let category = shared.products.get(p, n, PRODUCT_PREFIX);
                 let category = if category == 0 { shared.unknown } else { category - 1 };
                 payload = (category << 24) | price;
             }
@@ -831,7 +826,7 @@ fn parse_clicks(
         }
         let (id, user) = (id ^ copy, user ^ copy);
         let (p, n) = field(2);
-        let campaign = shared.campaigns.get(p, n);
+        let campaign = shared.campaigns.get(p, n, CAMPAIGN_PREFIX);
         let (p, n) = field(3);
         let at = ts::parse(p, n, dates);
         if campaign == 0 || at < earliest || at >= window_end {
@@ -1646,8 +1641,8 @@ fn main() -> io::Result<()> {
     // Products, without an allocation per row: categories are numbered as they
     // appear, then renumbered in byte order so the smaller number wins a tie.
     let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
-    let mut products = Dim::new(b"p");
-    dimension_rows(&data.join("products.csv"), products.prefix, |product, number, category| {
+    let mut products = Dim::default();
+    dimension_rows(&data.join("products.csv"), PRODUCT_PREFIX, |product, number, category| {
         if product.is_empty() {
             return;
         }
@@ -1674,10 +1669,10 @@ fn main() -> io::Result<()> {
     }
     let unknown = renumber[0] - 1;
 
-    let mut campaigns = Dim::new(b"c_");
+    let mut campaigns = Dim::default();
     let mut campaign_names = vec![b"organic".to_vec()];
     let mut campaign_channels = vec![b"organic".to_vec()];
-    dimension_rows(&data.join("campaigns.csv"), campaigns.prefix, |campaign, number, channel| {
+    dimension_rows(&data.join("campaigns.csv"), CAMPAIGN_PREFIX, |campaign, number, channel| {
         if !campaign.is_empty() {
             campaigns.insert(campaign, number, campaign_names.len() as u32);
             campaign_names.push(campaign.to_vec());
