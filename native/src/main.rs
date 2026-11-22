@@ -1178,10 +1178,15 @@ impl Sessions<'_> {
             let ts = (value >> 32) as u32;
             let index = (ts >> BIN_SHIFT) as usize;
             let bin = &mut scratch.bins[index];
-            bin.first = bin.first.min(ts);
-            bin.last = bin.last.max(ts);
+            if bin.events == 0 {
+                scratch.occupied[index / 64] |= 1 << (index % 64);
+                bin.first = ts;
+                bin.last = ts;
+            } else {
+                bin.first = bin.first.min(ts);
+                bin.last = bin.last.max(ts);
+            }
             bin.events += 1;
-            scratch.occupied[index / 64] |= 1 << (index % 64);
             let payload = value as u32;
             if payload != 0 {
                 let category = (payload >> 24) as usize;
