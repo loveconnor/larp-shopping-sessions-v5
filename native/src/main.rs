@@ -686,7 +686,7 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
     }
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+fn parse_events(shared: &Shared, block: &mut Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -797,7 +797,7 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
 
 fn parse_clicks(
     shared: &Shared,
-    block: &Block,
+    block: &mut Block,
     copy: u64,
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
@@ -906,9 +906,9 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
+            parse_events(shared, &mut block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &mut block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
     Ok((events, clicks))

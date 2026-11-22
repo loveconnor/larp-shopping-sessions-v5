@@ -101,6 +101,9 @@ fn fetch(target: *const u8) {
 }
 
 pub struct Block {
+    separators: Vec<u32>,
+    newlines: Vec<u32>,
+    bad_chunks: Vec<u32>,
     buf: Vec<u8>,
     base: *const u8,
     own_end: usize,
@@ -347,6 +350,9 @@ unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
 impl Block {
     pub fn new() -> Self {
         Self {
+            separators: Vec::with_capacity(WINDOW * 64 + 256),
+            newlines: Vec::with_capacity(WINDOW * 64 + 64),
+            bad_chunks: Vec::new(),
             buf: Vec::new(),
             base: std::ptr::null(),
             own_end: 0,
@@ -466,7 +472,7 @@ impl Block {
     /// breaks one of these sends its lines down the old path, which says
     /// exactly which are wrong.
     #[inline(always)]
-    pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    pub fn raw_lines<const N: usize>(&mut self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
             return unsafe { self.raw_wide(visit) };
@@ -476,12 +482,12 @@ impl Block {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512bw,avx512vbmi2")]
-    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    unsafe fn raw_wide<const N: usize>(&mut self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         self.raw_indexed::<N, true>(visit)
     }
 
     #[inline(always)]
-    fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    fn raw_indexed<const N: usize, const WIDE: bool>(&mut self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -493,10 +499,11 @@ impl Block {
                 return;
             }
             let end = end as u32;
-            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
-            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            let seps = &mut self.separators;
+            let newlines = &mut self.newlines;
             // Starts of chunks that break a quote rule; the last is a sentinel.
-            let mut bad: Vec<u32> = Vec::new();
+            let bad = &mut self.bad_chunks;
+            bad.clear();
             let mut bad_at = 0usize;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
@@ -604,7 +611,7 @@ impl Block {
 
     /// `raw_lines`, with every field's bounds worked out and unquoted.
     #[inline(always)]
-    pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
+    pub fn lines<const N: usize>(&mut self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
         self.raw_lines::<N>(|buf, start, seps| unsafe {
             let mut fields = [(0u32, 0u32); N];
             for at in 0..N {
@@ -680,7 +687,7 @@ impl Block {
 mod tests {
     use super::*;
 
-    fn collect<const N: usize>(block: &Block, slow: bool) -> Vec<Vec<Vec<u8>>> {
+    fn collect<const N: usize>(block: &mut Block, slow: bool) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         let mut take = |buf: *const u8, fields: &[(u32, u32); N]| {
             out.push(
@@ -716,13 +723,14 @@ mod tests {
             base: std::ptr::null(),
             own_end: own,
             end,
+            ..Block::new()
         };
-        let block = Block {
+        let mut block = Block {
             base: unsafe { block.buf.as_ptr().add(PAD) },
             ..block
         };
-        let fast = collect::<N>(&block, false);
-        let slow = collect::<N>(&block, true);
+        let fast = collect::<N>(&mut block, false);
+        let slow = collect::<N>(&mut block, true);
         assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&data));
     }
 
@@ -802,7 +810,7 @@ mod real_files {
         while start < source.size {
             let end = (start + block_size).min(source.size);
             block.load(&source, start, end).unwrap();
-            let grab = |slow: bool| {
+            let mut grab = |slow: bool| {
                 let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
                 let mut take = |buf: *const u8, fields: &[(u32, u32); N]| {
                     out.push(fields.iter().map(|&(a, b)| unsafe {

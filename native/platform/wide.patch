@@ -31,7 +31,7 @@ index ce3aae9..7743174 100644
 @@ -472,17 +472,10 @@ impl Block {
      /// exactly which are wrong.
      #[inline(always)]
-     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+     pub fn raw_lines<const N: usize>(&mut self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
 -        #[cfg(target_arch = "x86_64")]
 -        if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
 -            return unsafe { self.raw_wide(visit) };
@@ -41,7 +41,7 @@ index ce3aae9..7743174 100644
 -
 -    #[cfg(target_arch = "x86_64")]
 -    #[target_feature(enable = "avx512bw,avx512vbmi2")]
--    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+-    unsafe fn raw_wide<const N: usize>(&mut self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
 -        self.raw_indexed::<N, true>(visit)
 +        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
 +        { self.raw_indexed::<N, true>(visit) }
@@ -53,14 +53,14 @@ index ce3aae9..7743174 100644
 @@ -499,6 +492,10 @@ impl Block {
              }
              let end = end as u32;
-             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+             let seps = &mut self.separators;
 +            // The portable mask enumerator benefits from fixed-stride rows.
 +            // Hardware byte compression already handles the wide engine.
 +            let regular = cfg!(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw"))) && !WIDE;
 +            let mut newline_masks = [0u64; WINDOW];
-             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+             let newlines = &mut self.newlines;
              // Starts of chunks that break a quote rule; the last is a sentinel.
-             let mut bad: Vec<u32> = Vec::new();
+             let bad = &mut self.bad_chunks;
 @@ -516,7 +513,9 @@ impl Block {
                      seps.reserve(WINDOW * 64 + 128);
                  }
