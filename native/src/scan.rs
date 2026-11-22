@@ -70,15 +70,25 @@ impl Source {
                 }
                 let page = getpagesize() as usize;
                 let rounded = (self.size as usize).div_ceil(page) * page;
+                const HUGE_PAGE: usize = 2 << 20;
+                let align = if rounded >= 2 * HUGE_PAGE { HUGE_PAGE.max(page) } else { page };
                 let length = rounded + page;
-                let region = mmap(std::ptr::null_mut(),length,1,2 | 0x20,-1,0);
+                let reserved = length + align - page;
+                let region = mmap(std::ptr::null_mut(), reserved, 1, 2 | 0x20, -1, 0);
                 if region as usize != usize::MAX {
-                    let file_map = mmap(region,self.size as usize,1,2 | 0x10,self.file.as_raw_fd(),0);
-                    if file_map == region {
-                        self.map = region.cast();
+                    let aligned = (region as usize).next_multiple_of(align);
+                    let address = aligned as *mut std::ffi::c_void;
+                    let file_map = mmap(address, self.size as usize, 1, 2 | 0x10, self.file.as_raw_fd(), 0);
+                    if file_map == address {
+                        self.map = file_map.cast();
                         self.guarded_tail = true;
+                        let prefix = aligned - region as usize;
+                        if prefix != 0 { munmap(region, prefix); }
+                        let suffix = reserved - length - prefix;
+                        if suffix != 0 { munmap((aligned + length) as *mut _, suffix); }
+                        if align > page { madvise(address, rounded, 14); }
                     } else {
-                        munmap(region,length);
+                        munmap(region, reserved);
                     }
                 }
             }
