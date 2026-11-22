@@ -71,15 +71,24 @@ impl Source {
                 let page = getpagesize() as usize;
                 let rounded = (self.size as usize).div_ceil(page) * page;
                 let length = rounded + page;
-                let region = mmap(std::ptr::null_mut(),length,1,2 | 0x20,-1,0);
-                if region as usize != usize::MAX {
-                    let file_map = mmap(region,self.size as usize,1,2 | 0x10,self.file.as_raw_fd(),0);
-                    if file_map == region {
-                        self.map = region.cast();
-                        self.guarded_tail = true;
-                    } else {
-                        munmap(region,length);
-                    }
+                // Match file offset zero to a huge-page boundary for large
+                // shards, allowing the kernel to use large file-cache folios.
+                let alignment=if rounded>=2<<20 {2<<20} else {page};
+                let reserve=length+alignment-page;
+                let area=mmap(std::ptr::null_mut(),reserve,1,2|0x20,-1,0);
+                if area as usize != usize::MAX {
+                    let addr=(area as usize+alignment-1)&!(alignment-1);
+                    let region=addr as *mut std::ffi::c_void;
+                    let file_map=mmap(region,self.size as usize,1,2|0x10,self.file.as_raw_fd(),0);
+                    if file_map==region {
+                        let prefix=addr-area as usize;
+                        let suffix=reserve-length-prefix;
+                        if prefix!=0 {munmap(area,prefix);}
+                        if suffix!=0 {munmap((addr+length) as *mut _,suffix);}
+                        if alignment>page {madvise(region,rounded,14);}
+                        self.map=region.cast();
+                        self.guarded_tail=true;
+                    } else {munmap(area,reserve);}
                 }
             }
             if self.map.is_null() {
