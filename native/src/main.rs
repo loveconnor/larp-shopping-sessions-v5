@@ -1601,6 +1601,40 @@ fn tune(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Assign a worker to a CPU only when the inherited affinity has exactly one
+/// CPU per worker. Quota-limited and oversubscribed launches retain the
+/// scheduler's full placement choice.
+#[cfg(target_os = "linux")]
+fn place_worker(worker: usize, threads: usize) {
+    unsafe extern "C" {
+        fn sched_getaffinity(pid: i32, bytes: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, bytes: usize, mask: *const u64) -> i32;
+    }
+    static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+    let cpus = CPUS.get_or_init(|| {
+        let mut allowed = [0u64; 16];
+        if unsafe { sched_getaffinity(0, std::mem::size_of_val(&allowed), allowed.as_mut_ptr()) } != 0 {
+            return Vec::new();
+        }
+        let mut cpus = Vec::new();
+        for (word, mut bits) in allowed.into_iter().enumerate() {
+            while bits != 0 {
+                cpus.push(word * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+        cpus
+    });
+    if cpus.len() == threads {
+        let cpu = cpus[worker];
+        let mut mask = [0u64; 16];
+        mask[cpu / 64] = 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()); }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn place_worker(_: usize, _: usize) {}
+
 /// One thread per CPU, except under a cgroup CPU quota (the scorer's
 /// `cpu.max` is 8 CPUs on a larger host): there, half as many threads again
 /// measured about 10% faster, since threads also wait on page faults.
@@ -1757,7 +1791,10 @@ fn main() -> io::Result<()> {
     let shards = &LinkShards::default();
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
+            .map(|thread| scope.spawn(move || {
+                place_worker(thread, threads);
+                parse_worker(shared, thread, threads, shards)
+            }))
             .collect();
         handles
             .into_iter()
@@ -1770,7 +1807,13 @@ fn main() -> io::Result<()> {
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|thread| {
+                let (sources, next) = (&parsed_events, &next);
+                scope.spawn(move || {
+                    place_worker(thread, threads);
+                    dedup_worker(shared, sources, next)
+                })
+            })
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
@@ -1792,7 +1835,10 @@ fn main() -> io::Result<()> {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
                 let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
+                scope.spawn(move || {
+                    place_worker(thread, threads);
+                    session_worker(shared, events, clicks, order, next, thread)
+                })
             })
             .collect();
         handles
