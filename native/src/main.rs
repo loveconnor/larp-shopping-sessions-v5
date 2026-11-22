@@ -364,6 +364,14 @@ impl Links {
         for (id, &up) in parent.iter().enumerate() {
             names[id] = names[up as usize];
         }
+        let store_in_dictionary = |key, person| {
+            if let Some(slot) = keys::canonical_slot(key) {
+                slot.store(person, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
@@ -371,7 +379,7 @@ impl Links {
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
-            if key == person { continue; }
+            if key == person || store_in_dictionary(key, person) { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
                 let group = &mut groups[at];
@@ -388,13 +396,19 @@ impl Links {
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty {
+        if let Some(slot) = keys::canonical_slot(key) {
+            prefetch(slot);
+        } else if !self.empty {
             prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
+        if let Some(slot) = keys::canonical_slot(key) {
+            let canonical = slot.load(Ordering::Relaxed);
+            return if canonical == 0 { key } else { canonical };
+        }
         if self.empty {
             return key;
         }

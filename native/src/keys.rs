@@ -83,6 +83,7 @@ const FIXED_USER: u64 = 1 << 61;
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
     name: std::cell::UnsafeCell<[u8; 33]>,
+    canonical: std::sync::atomic::AtomicU64,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
 // acquire publication or a key obtained from an already published slot.
@@ -96,7 +97,7 @@ pub fn prepare_users(bytes: u64) {
         // alignment. Untouched pages stay shared until a worker claims a slot.
         let bytes = size * size_of::<UserSlot>() + align_of::<UserSlot>() - 1;
         let storage = Box::leak(vec![0u8; bytes].into_boxed_slice());
-        // Both fields admit all-zero bits. The allocation belongs to this
+        // All fields admit all-zero bits. The allocation belongs to this
         // process-wide table and is accessed only through the aligned slots.
         let (_, slots, _) = unsafe { storage.align_to_mut::<UserSlot>() };
         &slots[..size]
@@ -166,6 +167,18 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
         if let Some(slots) = USER_SLOTS.get() { return unsafe { fixed_user(p, slots) }; }
     }
     unsafe { pack(p, n) }
+}
+
+/// Fixed-width user keys encode their dictionary slot. The links builder
+/// publishes the canonical key in the unused bytes of that same cache line.
+#[inline(always)]
+pub fn canonical_slot(key: u64) -> Option<&'static std::sync::atomic::AtomicU64> {
+    const TAG: u64 = INTERNED | FIXED_USER;
+    if key & TAG != TAG {
+        return None;
+    }
+    let index = (key & !TAG) as usize;
+    Some(&USER_SLOTS.get().unwrap()[index].canonical)
 }
 
 fn name(key: u64) -> &'static [u8] {
