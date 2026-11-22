@@ -126,6 +126,7 @@ fn fetch(target: *const u8) {
 }
 
 pub struct Block {
+    indices: std::cell::Cell<(Vec<u32>, Vec<u32>, Vec<u32>)>,
     buf: Vec<u8>,
     base: *const u8,
     own_end: usize,
@@ -372,6 +373,7 @@ unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
 impl Block {
     pub fn new() -> Self {
         Self {
+            indices: Default::default(),
             buf: Vec::new(),
             base: std::ptr::null(),
             own_end: 0,
@@ -533,10 +535,12 @@ impl Block {
                 return;
             }
             let end = end as u32;
-            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
-            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            let (mut seps, mut newlines, mut bad) = self.indices.take();
+            seps.clear();
+            seps.reserve(WINDOW * 64 + 256);
+            newlines.reserve(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
-            let mut bad: Vec<u32> = Vec::new();
+            bad.clear();
             let mut bad_at = 0usize;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
@@ -633,6 +637,7 @@ impl Block {
                 kept = count - sep_at;
                 std::ptr::copy(out.add(sep_at), out, kept);
             }
+            self.indices.set((seps, newlines, bad));
         }
     }
 
@@ -746,6 +751,7 @@ mod tests {
         let mut buf = vec![0u8; PAD + data.len() + 4 * PAD + 64];
         buf[PAD..PAD + data.len()].copy_from_slice(&data);
         let block = Block {
+            indices: Default::default(),
             buf,
             base: std::ptr::null(),
             own_end: own,
