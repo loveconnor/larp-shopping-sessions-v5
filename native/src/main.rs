@@ -1365,6 +1365,90 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// All people probed in this table belong to the same person partition.
+/// Multiplication by odd MIX is bijective and the partition fixes the high
+/// hash bits. Store the remaining exact hash bits and the local ordinal in
+/// one word. An exceptionally crowded partition uses a separate ordinal array.
+struct PersonIndex {
+    entries: Vec<u64>,
+    extra_ids: Vec<u32>,
+    partition_bits: u32,
+    ordinal_mask: u64,
+}
+
+impl PersonIndex {
+    fn new(partition_bits: u32) -> Self {
+        Self { entries: Vec::new(), extra_ids: Vec::new(), partition_bits,
+            ordinal_mask: (1u64 << partition_bits)-1 }
+    }
+
+    fn reset(&mut self, capacity: usize) {
+        self.entries.clear();
+        self.entries.resize(capacity, 0);
+        self.extra_ids.clear();
+    }
+
+    #[inline(always)]
+    fn probe(&self, hash: u64) -> Result<u32, usize> {
+        let mask = self.entries.len()-1;
+        let remainder = hash << self.partition_bits;
+        let mut slot = (hash >> 24) as usize & mask;
+        loop {
+            let word = self.entries[slot];
+            if word == 0 { return Err(slot); }
+            if word & !self.ordinal_mask == remainder {
+                let ordinal = word & self.ordinal_mask;
+                return Ok(if ordinal == self.ordinal_mask { self.extra_ids[slot] } else { (ordinal-1) as u32 });
+            }
+            slot = (slot+1)&mask;
+        }
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, slot: usize, hash: u64, id: u32) {
+        let mut ordinal = u64::from(id)+1;
+        if ordinal >= self.ordinal_mask {
+            if self.extra_ids.is_empty() { self.extra_ids.resize(self.entries.len(), 0); }
+            self.extra_ids[slot] = id;
+            ordinal = self.ordinal_mask;
+        }
+        self.entries[slot] = (hash << self.partition_bits) | ordinal;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn partition_remainders_distinguish_colliding_people_and_large_ordinals() {
+    for bits in [1, 2, 5, 10, 16] {
+        let mut index = PersonIndex::new(bits);
+        let ordinal_mask = (1u32 << bits)-1;
+        let prefix = 3u64.wrapping_mul(MIX) & (u64::MAX << (64-bits));
+        let mut pairs = Vec::new();
+        for fresh in 0..3u32 {
+            index.reset(2048);
+            pairs.clear();
+            for i in 0..511u32 {
+                // All names in a batch have the same initial table slot.
+                let hash = prefix | (u64::from(fresh) << 35) | (u64::from(i) << 4);
+                let id = match i%7 {
+                    0 => ordinal_mask-1,
+                    1 => ordinal_mask,
+                    2 => ordinal_mask+1,
+                    3 => u32::MAX-1,
+                    _ => i,
+                };
+                let slot = index.probe(hash).unwrap_err();
+                index.insert(slot, hash, id);
+                pairs.push((hash, id));
+            }
+            for &(hash, id) in &pairs {
+                assert_eq!(index.probe(hash), Ok(id));
+                assert!(index.probe(hash^1).is_err());
+            }
+        }
+    }
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1387,8 +1471,7 @@ fn session_worker(
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
-    let mut table_keys: Vec<u64> = Vec::new();
-    let mut table_ids: Vec<u32> = Vec::new();
+    let mut index = PersonIndex::new(shared.person_bits);
     let mut persons: Vec<u64> = Vec::new();
     let mut ends: Vec<u32> = Vec::new();
     let mut local: Vec<u32> = Vec::new();
@@ -1412,11 +1495,7 @@ fn session_worker(
 
         // Group the events by person: number the people as they appear.
         let mut capacity = (total / 4 + 16).next_power_of_two();
-        let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        index.reset(capacity);
         persons.clear();
         ends.clear();
         local.clear();
@@ -1424,38 +1503,26 @@ fn session_worker(
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
+                    let hash = person.wrapping_mul(MIX);
+                    let id = match index.probe(hash) {
+                        Ok(id) => id,
+                        Err(slot) => {
                             let id = persons.len() as u32;
-                            *table_keys.get_unchecked_mut(slot) = person;
-                            *table_ids.get_unchecked_mut(slot) = id;
+                            index.insert(slot, hash, id);
                             persons.push(person);
                             ends.push(0);
-                            break id;
+                            id
                         }
-                        slot = (slot + 1) & mask;
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
                     local.push(id);
                     if persons.len() * 2 > capacity {
                         capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
+                        index.reset(capacity);
                         for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
+                            let hash = person.wrapping_mul(MIX);
+                            let slot = index.probe(hash).unwrap_err();
+                            index.insert(slot, hash, id as u32);
                         }
                     }
                 }
@@ -1495,17 +1562,7 @@ fn session_worker(
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            break NONE;
-                        }
-                        slot = (slot + 1) & mask;
-                    };
+                    let id = index.probe(person.wrapping_mul(MIX)).unwrap_or(NONE);
                     click_local.push(id);
                     if id != NONE {
                         *click_ends.get_unchecked_mut(id as usize) += 1;
