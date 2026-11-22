@@ -91,7 +91,7 @@ static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::n
 
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
-        let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
+        let size = bytes.div_ceil(16384).clamp(256, 1 << 22).next_power_of_two() as usize;
         // All-zero bytes represent an empty atomic tag and a zeroed inline name.
         // Let workers fault in the table as they populate it, including its NUMA placement.
         let layout = std::alloc::Layout::array::<UserSlot>(size).unwrap();
