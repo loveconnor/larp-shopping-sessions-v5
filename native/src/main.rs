@@ -816,11 +816,45 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 // ---------------------------------------------------------------- phase 2
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
+// Sampling chooses which people to summarize early. The full key is checked on
+// every hit, so collisions and missed heavy users only affect work placement.
+struct HeavyPeople {
+    by_partition: Vec<(u64, usize)>,
+    count: usize,
+}
+
+impl HeavyPeople {
+    fn sample(shared: &Shared, sources: &[EventSource]) -> Self {
+        let links = shared.links.get().unwrap();
+        let mut samples = HashMap::<u64, usize>::new();
+        for source in sources {
+            for &base in source.buckets.bases.iter().step_by(4) {
+                let row = unsafe { *base };
+                if row.ts != DEAD { *samples.entry(links.person(row.user)).or_default() += 1; }
+            }
+        }
+        let mut top: Vec<_> = samples.into_iter().filter(|&(_, n)| n >= 4).collect();
+        top.sort_unstable_by_key(|&(key, n)| (std::cmp::Reverse(n), key));
+        let mut by_partition = vec![(0, 0); 1 << shared.person_bits];
+        let mut count = 0;
+        for (key, _) in top {
+            let cell = &mut by_partition[person_part(key, shared.person_bits)];
+            if cell.0 != 0 { continue; }
+            *cell = (key, count);
+            count += 1;
+            if count == 32 { break; }
+        }
+        Self { by_partition, count }
+    }
+}
+
+fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, hot: &HeavyPeople) -> (Buckets<Event>, Vec<TimeBins>) {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
+    let mut summaries: Vec<_> = (0..hot.count).map(|_| TimeBins::new(shared)).collect();
+    let mut active = vec![false; hot.count];
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
@@ -897,7 +931,18 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    let part = person_part(person, person_bits);
+                    let (key, id) = hot.by_partition[part];
+                    if key == person {
+                        summaries[id].add(value);
+                        if !active[id] {
+                            // One marker ensures the ordinary person/click join visits this summary.
+                            out.push(part, Event { person, value: 0 });
+                            active[id] = true;
+                        }
+                    } else {
+                        out.push(part, Event { person, value });
+                    }
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -906,7 +951,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
         }
     }
-    out
+    (out, summaries)
 }
 
 // ---------------------------------------------------------------- phase 3
@@ -938,6 +983,54 @@ struct TimeBins {
     bins: Vec<TimeBin>,
     occupied: Vec<u64>,
     purchases: Vec<(u32, usize)>,
+}
+
+impl TimeBins {
+    fn new(shared: &Shared) -> Self {
+        let count = ((shared.window_end - shared.window_start) as u64).div_ceil(SESSION_GAP) as usize;
+        Self { bins: vec![TimeBin::default(); count], occupied: vec![0; count.div_ceil(64)], purchases: Vec::new() }
+    }
+
+    #[inline(always)]
+    fn add(&mut self, value: u64) {
+        let ts = (value >> 32) as u32;
+        let index = (u64::from(ts) / SESSION_GAP) as usize;
+        let bin = &mut self.bins[index];
+        bin.first = bin.first.min(ts);
+        bin.last = bin.last.max(ts);
+        bin.events += 1;
+        self.occupied[index / 64] |= 1 << (index % 64);
+        let payload = value as u32;
+        if payload != 0 {
+            let next = bin.purchases;
+            bin.purchases = self.purchases.len();
+            self.purchases.push((payload, next));
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (word, &used) in other.occupied.iter().enumerate() {
+            self.occupied[word] |= used;
+            let mut bits = used;
+            while bits != 0 {
+                let index = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let from = other.bins[index];
+                let to = &mut self.bins[index];
+                to.first = to.first.min(from.first);
+                to.last = to.last.max(from.last);
+                to.events += from.events;
+                let mut purchase = from.purchases;
+                while purchase != usize::MAX {
+                    let (payload, next) = other.purchases[purchase];
+                    let previous = to.purchases;
+                    to.purchases = self.purchases.len();
+                    self.purchases.push((payload, previous));
+                    purchase = next;
+                }
+            }
+        }
+    }
 }
 
 struct Sessions<'a> {
@@ -1043,21 +1136,11 @@ impl Sessions<'_> {
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
-        for &value in events {
-            let ts = (value >> 32) as u32;
-            let index = (u64::from(ts) / SESSION_GAP) as usize;
-            let bin = &mut scratch.bins[index];
-            bin.first = bin.first.min(ts);
-            bin.last = bin.last.max(ts);
-            bin.events += 1;
-            scratch.occupied[index / 64] |= 1 << (index % 64);
-            let payload = value as u32;
-            if payload != 0 {
-                let next = bin.purchases;
-                bin.purchases = scratch.purchases.len();
-                scratch.purchases.push((payload, next));
-            }
-        }
+        for &value in events { scratch.add(value); }
+        self.finish_bins(person, clicks, scratch)
+    }
+
+    fn finish_bins(&mut self, person: u64, clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
         let mut cursor = (0, 0);
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
@@ -1196,6 +1279,8 @@ fn sort_by_time<'a, T: Copy>(values: &'a mut [T], scratch: &'a mut Vec<T>, time:
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
+    hot: &HeavyPeople,
+    summaries: &[Vec<TimeBins>],
     clicks: &[ClickSource],
     order: &[u32],
     next: &AtomicUsize,
@@ -1225,12 +1310,7 @@ fn session_worker(
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
     let mut click_scratch = Vec::new();
-    let count = ((shared.window_end - shared.window_start) as u64).div_ceil(SESSION_GAP) as usize;
-    let mut bins = TimeBins {
-        bins: vec![TimeBin::default(); count],
-        occupied: vec![0; count.div_ceil(64)],
-        purchases: Vec::new(),
-    };
+    let mut bins = TimeBins::new(shared);
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1408,7 +1488,11 @@ fn session_worker(
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
                 reached
             };
-            if mine.len() >= 128 {
+            let (hot_key, hot_id) = hot.by_partition[part];
+            if person == hot_key {
+                for batch in summaries { bins.merge(&batch[hot_id]); }
+                sessions.finish_bins(person, reached, &mut bins)?;
+            } else if mine.len() >= 128 {
                 sessions.person_binned(person, mine, reached, &mut bins)?;
             } else {
                 mine.sort_unstable();
@@ -1605,12 +1689,15 @@ fn main() -> io::Result<()> {
     let parse = began.elapsed();
 
     let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
+    let hot = HeavyPeople::sample(shared, &parsed_events);
+    let (events, summaries): (Vec<Buckets<Event>>, Vec<Vec<TimeBins>>) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next, &hot)))
             .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        handles.into_iter().map(|handle| handle.join().unwrap()).unzip()
     });
+    let hot = &hot;
+    let summaries = &summaries;
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
@@ -1629,7 +1716,7 @@ fn main() -> io::Result<()> {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
                 let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
+                scope.spawn(move || session_worker(shared, events, hot, summaries, clicks, order, next, thread))
             })
             .collect();
         handles
