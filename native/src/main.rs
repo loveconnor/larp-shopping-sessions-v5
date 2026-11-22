@@ -1079,6 +1079,7 @@ struct Sessions<'a> {
     pending_sessions: Vec<(u32, u32, u64, bool)>,
     day_ends: Vec<usize>,
     covered_until: Vec<usize>,
+    coverage_bits: Vec<u64>,
     covered_campaigns: Vec<usize>,
     /// Clicks of each campaign inside the current 7-day reach.
     reach: Vec<u32>,
@@ -1125,6 +1126,53 @@ impl Sessions<'_> {
         writer.category(5, top.map(|category| category as u8));
         writer.end_row();
         Ok(())
+    }
+
+    // Each bit represents one session. OR-ing the reachable interval of each
+    // unordered click counts a campaign once even across copies or tied clicks.
+    fn credit_bits(&mut self, clicks: &[Touch], sources: &[ClickSource]) {
+        let sessions = &self.pending_sessions;
+        let n = sessions.len();
+        debug_assert!((1..=64).contains(&n));
+        let mut winners = [None; 64];
+        let mask = |lo: usize, hi: usize| (u64::MAX << lo) & (u64::MAX >> (64 - hi));
+        let prefers = |candidate: Touch, previous: Option<Touch>| {
+            previous.is_none_or(|old| candidate.ts > old.ts || (candidate.ts == old.ts
+                && click_order(candidate.id, old.id, sources, self.shared.defer_long_events).is_lt()))
+        };
+        for &click in clicks {
+            let lower = click.ts.saturating_sub(WEEK as u32);
+            let lo = sessions.partition_point(|s| s.0 < lower);
+            let hi = sessions.partition_point(|s| s.0 <= click.ts);
+            if lo == hi { continue; }
+            let campaign = click.campaign as usize;
+            if self.coverage_bits[campaign] == 0 { self.covered_campaigns.push(campaign); }
+            self.coverage_bits[campaign] |= mask(lo, hi);
+            if prefers(click, winners[lo]) { winners[lo] = Some(click); }
+        }
+        let days = self.shared.days;
+        let mut latest = None;
+        let mut day_start = 0;
+        for (i, &(start, day, revenue, purchased)) in sessions.iter().enumerate() {
+            if let Some(next) = winners[i] {
+                if prefers(next, latest) { latest = Some(next); }
+            }
+            let winner = latest.filter(|c| c.ts >= start).map_or(0, |c| c.campaign as usize);
+            let row = &mut self.totals[winner * days + day as usize];
+            row[0] += 1;
+            row[1] += i64::from(purchased);
+            row[2] += revenue as i64;
+            if i + 1 == n || sessions[i + 1].1 != day {
+                let today = mask(day_start, i + 1);
+                for &campaign in &self.covered_campaigns {
+                    self.totals[campaign * days + day as usize][3] +=
+                        i64::from((self.coverage_bits[campaign] & today).count_ones());
+                }
+                day_start = i + 1;
+            }
+        }
+        for campaign in self.covered_campaigns.drain(..) { self.coverage_bits[campaign] = 0; }
+        self.pending_sessions.clear();
     }
 
     // In timestamp order both ends of a click's reachable session interval
@@ -1439,6 +1487,7 @@ fn session_worker(
         pending_sessions: Vec::new(),
         day_ends: Vec::new(),
         covered_until: vec![0; campaigns],
+        coverage_bits: vec![0; campaigns],
         covered_campaigns: Vec::new(),
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
@@ -1615,9 +1664,10 @@ fn session_worker(
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
+            let sort_clicks = |reached: &mut [Touch]| {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
-            }
+            };
+            if (2..64).contains(&reached.len()) { sort_clicks(reached); }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
                 if mine.len() <= 32 {
@@ -1633,7 +1683,14 @@ fn session_worker(
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
             }
-            if reached.len() >= 64 { sessions.credit_ranges(reached); }
+            if reached.len() >= 64 {
+                if sessions.pending_sessions.len() <= 64 {
+                    sessions.credit_bits(reached, clicks);
+                } else {
+                    sort_clicks(reached);
+                    sessions.credit_ranges(reached);
+                }
+            }
             from = to;
             click_from = click_to;
         }
