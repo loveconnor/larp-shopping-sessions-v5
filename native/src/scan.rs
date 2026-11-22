@@ -57,6 +57,31 @@ impl Source {
         Ok(source)
     }
 
+    /// Reserve one address range for file views plus an anonymous guard
+    /// after each file. A row's byte offset then fits in a compact handle.
+    #[cfg(target_os="linux")]
+    pub fn map_arena(files:&mut [Source]) -> Option<(usize,usize)> {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" { fn getpagesize() -> i32; }
+        let page = unsafe { getpagesize() } as usize;
+        let span = |s:&Source| (s.size as usize).div_ceil(page).checked_add(1)?.checked_mul(page);
+        let length = files.iter().try_fold(0usize,|n,s| n.checked_add(span(s)?))?;
+        if length == 0 || length as u64 >= 1u64 << 35 { return None; }
+        let region = unsafe { mmap(std::ptr::null_mut(),length,1,2|0x20,-1,0) };
+        if region as usize == usize::MAX { return None; }
+        let mut addr = region as usize;
+        for source in files {
+            if source.size > 0 {
+                let view = unsafe { mmap(addr as *mut _,source.size as usize,1,2|0x10,source.file.as_raw_fd(),0) };
+                if view as usize == addr {
+                    source.map = view.cast();
+                    source.guarded_tail = true;
+                }
+            }
+            addr += span(source).unwrap();
+        }
+        Some((region as usize,length))
+    }
     pub fn map_input(&mut self) {
         use std::os::fd::AsRawFd;
         if self.size != 0 && self.map.is_null() {
@@ -370,6 +395,10 @@ unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
 }
 
 impl Block {
+    pub fn in_arena(&self, arena:(usize,usize)) -> bool {
+        (self.base as usize).wrapping_sub(arena.0) < arena.1
+    }
+
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),

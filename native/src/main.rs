@@ -521,6 +521,7 @@ struct Shared {
     campaign_names: Vec<Vec<u8>>,
     campaign_channels: Vec<Vec<u8>>,
     files: Vec<Source>,
+    arena: (usize,usize),
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
@@ -634,7 +635,10 @@ fn person_part(person: u64, bits: u32) -> usize {
 }
 
 const LONG_EVENT: u64 = 3 << 62;
-const EVENT_FINGERPRINT: u64 = (1 << 30) - 1;
+const EVENT_FINGERPRINT: u64 = (1 << 26) - 1;
+const COPIED_NAME: u64 = 1 << 35;
+const NAME_MASK: u64 = COPIED_NAME - 1;
+const BORROWED_CLICK: u64 = 1 << 61;
 
 /// A hash selects the dedup bucket. Collisions are resolved by all 33 bytes.
 #[inline(always)]
@@ -687,6 +691,7 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    let borrowed = block.in_arena(shared.arena);
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -707,9 +712,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
-            (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
+            let index = if borrowed {
+                (p as usize - shared.arena.0) as u64
+            } else {
+                let i = out.names.len() as u64;
+                assert!(i < COPIED_NAME);
+                out.names.push(*bytes);
+                COPIED_NAME | i
+            };
+            (LONG_EVENT | (fingerprint << 36) | index, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
@@ -787,6 +798,9 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     }
     fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
         if key & LONG_EVENT == LONG_EVENT {
+            if key & BORROWED_CLICK != 0 {
+                return unsafe { &*((key & !(LONG_EVENT | BORROWED_CLICK)) as *const [u8;33]) };
+            }
             &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
         } else {
             keys::bytes(key, scratch)
@@ -803,6 +817,7 @@ fn parse_clicks(
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
 ) {
+    let borrowed = block.in_arena(shared.arena);
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
@@ -816,9 +831,13 @@ fn parse_clicks(
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
-            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-            out.names.push(*p.cast::<[u8; 33]>());
-            LONG_EVENT | (out.worker as u64) << 32 | index as u64
+            if borrowed && (p as u64) < BORROWED_CLICK {
+                LONG_EVENT | BORROWED_CLICK | (p as u64)
+            } else {
+                let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
+                out.names.push(*p.cast::<[u8; 33]>());
+                LONG_EVENT | (out.worker as u64) << 32 | index as u64
+            }
         } else {
             keys::pack(p, n)
         };
@@ -951,7 +970,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
+                    let hash_key = if long { (id >> 36) & EVENT_FINGERPRINT } else { id };
                     let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
@@ -967,9 +986,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         let equal = if long {
                             // Equal fingerprints select candidates. Only the full bytes
                             // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                            let spelling = |key:u64,owner:usize| -> &[u8;33] {
+                                let i = (key & NAME_MASK) as usize;
+                                if key & COPIED_NAME != 0 { &sources[owner].names[i] }
+                                else { &*((shared.arena.0+i) as *const [u8;33]) }
+                            };
+                            id >> 36 == other_id >> 36 &&
+                                spelling(id,owners[index]) == spelling(other_id,owners[(seen >> OFFSET_BITS) as usize])
                         } else {
                             id == other_id
                         };
@@ -1610,6 +1633,10 @@ fn main() -> io::Result<()> {
     // every input page on one thread.
     let release_pages = large || (cfg!(target_os = "linux") && map_by_default && map);
     let give_back = tune("SS_RELEASE", u64::from(release_pages)) != 0;
+    #[cfg(target_os="linux")]
+    let arena = if map {Source::map_arena(&mut files).unwrap_or((0,0))} else {(0,0)};
+    #[cfg(not(target_os="linux"))]
+    let arena = (0,0);
     for (file, source) in files.iter_mut().enumerate() {
         if map {
             source.map_input();
@@ -1644,6 +1671,7 @@ fn main() -> io::Result<()> {
         campaign_names,
         campaign_channels,
         files,
+        arena,
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
