@@ -903,12 +903,20 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
-    while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
-        block.load(&shared.files[work.file], work.start, work.end)?;
-        if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
-        } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+    // Neighboring blocks usually share mapping and read-ahead state. Keep
+    // small runs together and switch to single claims near the end.
+    loop {
+        let remaining = shared.work.len().saturating_sub(shared.next.load(Ordering::Relaxed));
+        let claim = if remaining > threads * 8 { 4 } else { 1 };
+        let first = shared.next.fetch_add(claim,Ordering::Relaxed);
+        if first >= shared.work.len() { break; }
+        for work in &shared.work[first..(first + claim).min(shared.work.len())] {
+            block.load(&shared.files[work.file], work.start, work.end)?;
+            if work.events {
+                parse_events(shared, &block, work.copy, &mut dates, &mut events);
+            } else {
+                parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            }
         }
     }
     Ok((events, clicks))
