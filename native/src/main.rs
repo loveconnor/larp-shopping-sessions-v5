@@ -655,9 +655,84 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+/// The common case is a single contiguous run per input worker and ID
+/// partition. Unusually heavy partitions continue in ordinary stable chunks.
+struct ParsedRuns {
+    storage: Vec<u8>,
+    first: *mut u8,
+    stride: usize,
+    cursors: Vec<(*mut Parsed,*mut Parsed)>,
+    overflow: Buckets<Parsed>,
+}
+unsafe impl Send for ParsedRuns {}
+unsafe impl Sync for ParsedRuns {}
+
+impl ParsedRuns {
+    fn new(parts: usize, input: u64, threads: usize) -> Self {
+        let expected = (input / 64).saturating_mul(std::mem::size_of::<Parsed>() as u64);
+        let per_worker = expected.div_ceil(threads as u64).min(512 << 20) as usize;
+        let stride = per_worker.div_ceil(parts).div_ceil(CHUNK_BYTES).max(1)*CHUNK_BYTES;
+        let bytes = stride*parts + CHUNK_BYTES;
+        let mut storage:Vec<u8> = Vec::with_capacity(bytes);
+        let first = storage.as_mut_ptr().wrapping_add(storage.as_ptr().align_offset(CHUNK_BYTES));
+        huge(first,stride*parts);
+        let cursors = (0..parts).map(|part| unsafe {
+            let start = first.add(part*stride).cast::<Parsed>();
+            (start,start.add(stride/std::mem::size_of::<Parsed>()))
+        }).collect();
+        Self { storage,first,stride,cursors,overflow:Buckets::new(parts) }
+    }
+
+    #[inline(always)]
+    fn push(&mut self,part:usize,row:Parsed) -> *mut Parsed {
+        let cursor = &mut self.cursors[part];
+        if cursor.0 == cursor.1 {return self.overflow.push(part,row);}
+        unsafe {
+            let dest=cursor.0;
+            #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+            std::arch::asm!("prefetchw [{p} + 64]",p=in(reg)dest,options(nostack,preserves_flags,readonly));
+            dest.write(row);
+            cursor.0=dest.add(1);
+            dest
+        }
+    }
+
+    fn used(&self,part:usize) -> (*mut Parsed,usize) {
+        unsafe {
+            let start=self.first.add(part*self.stride).cast::<Parsed>();
+            (start,self.cursors[part].0.offset_from(start) as usize)
+        }
+    }
+
+    fn chunks(&self,part:usize,out:&mut Vec<(*mut Parsed,usize)>) {
+        self.overflow.chunks(part,out);
+        let (start,count)=self.used(part);
+        // Preserve the chunk scan order and fit the packed dedup locator.
+        let step=Buckets::<Parsed>::CAPACITY;
+        for at in (0..count).step_by(step).rev() {
+            out.push((unsafe {start.add(at)},(count-at).min(step)));
+        }
+    }
+
+    fn recycle(&self,part:usize,out:&mut Buckets<Event>,scratch:&mut Vec<(*mut Parsed,usize)>) {
+        scratch.clear();
+        self.overflow.chunks(part,scratch);
+        for &(ptr,_) in scratch.iter() {out.donate(ptr.cast());}
+        let (start,count)=self.used(part);
+        for at in 0..(count*std::mem::size_of::<Parsed>()).div_ceil(CHUNK_BYTES) {
+            out.donate(unsafe {start.cast::<u8>().add(at*CHUNK_BYTES)});
+        }
+    }
+
+    fn release(&self) {
+        release(self.storage.as_ptr(),self.storage.capacity());
+        self.overflow.release();
+    }
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
-    buckets: Buckets<Parsed>,
+    buckets: ParsedRuns,
     names: Vec<[u8; 33]>,
 }
 
@@ -896,7 +971,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
     }
     let mut events = EventSource {
-        buckets: Buckets::new(1 << shared.id_bits),
+        buckets: ParsedRuns::new(1 << shared.id_bits,shared.files.iter().map(|f|f.size).sum(),threads),
         names: Vec::new(),
         overflow_times: Vec::new(),
     };
@@ -1010,9 +1085,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
-            }
+            for source in sources { source.buckets.recycle(part,&mut out,&mut chunks); }
         }
     }
     out
