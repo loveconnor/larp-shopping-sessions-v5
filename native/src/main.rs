@@ -718,8 +718,19 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
-        let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
+        let ingest_start = seps[2] + 1;
+        let span = seps[3] - ingest_start;
+        let raw = buf.add(ingest_start as usize);
+        // A twenty-byte span ending in Z cannot be a quoted field. Preserve
+        // the general decoder for every other width and spelling.
+        let ingest = if span == 20 && *raw.add(19) == b'Z' {
+            ts::ingest(raw, 20, dates)
+        } else if span == 22 && *raw == b'"' {
+            ts::ingest(raw.add(1), 20, dates)
+        } else {
+            let (p, n) = field(3);
+            ts::ingest(p, n, dates)
+        };
         if ingest == ts::BAD {
             return;
         }
