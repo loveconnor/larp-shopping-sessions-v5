@@ -627,9 +627,54 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+const RADIX_BATCH: usize = 128;
+const RADIX_GROUPS: usize = 32;
+
+struct StagedEvent {
+    partition: usize,
+    record: Parsed,
+}
+
 struct EventSource {
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
+    groups: Vec<Vec<StagedEvent>>,
+    group_bits: u32,
+}
+
+impl EventSource {
+    fn new(bits: u32) -> Self {
+        let parts = 1usize << bits;
+        let count = parts.min(RADIX_GROUPS);
+        Self {
+            buckets: Buckets::new(parts),
+            names: Vec::new(),
+            groups: (0..count).map(|_| Vec::with_capacity(RADIX_BATCH)).collect(),
+            group_bits: bits - count.ilog2(),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, partition: usize, record: Parsed) {
+        let group = &mut self.groups[partition >> self.group_bits];
+        group.push(StagedEvent { partition, record });
+        if group.len() == RADIX_BATCH {
+            Self::scatter(group, &mut self.buckets);
+        }
+    }
+
+    #[inline(never)]
+    fn scatter(group: &mut Vec<StagedEvent>, buckets: &mut Buckets<Parsed>) {
+        for entry in group.drain(..) {
+            buckets.push(entry.partition, entry.record);
+        }
+    }
+
+    fn finish(&mut self) {
+        for group in &mut self.groups {
+            Self::scatter(group, &mut self.buckets);
+        }
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -698,7 +743,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        out.push((partition_hash >> id_shift) as usize, record);
     });
 }
 
@@ -799,7 +844,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource::new(shared.id_bits);
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -811,6 +856,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
+    events.finish();
     Ok((events, clicks))
 }
 
