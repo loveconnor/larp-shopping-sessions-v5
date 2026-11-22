@@ -209,6 +209,22 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
         if len != 20 || *p.add(19) != b'Z' {
             return parse(p, len, dates);
         }
+        #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+        {
+            use std::arch::x86_64::*;
+            let raw=load64(p);
+            let ascii=_mm_loadu_si128(p.add(8).cast());
+            let order=_mm_setr_epi8(0,1,3,4,6,7,9,10,-1,-1,-1,-1,-1,-1,-1,-1);
+            let digits=_mm_and_si128(_mm_shuffle_epi8(ascii,order),_mm_set1_epi8(15));
+            let pairs=_mm_maddubs_epi16(digits,_mm_set1_epi16(0x010a));
+            let day=_mm_extract_epi16::<0>(pairs) as usize;
+            if day>=dates.month.len() || dates.month[day]!=raw {return parse(p,len,dates);}
+            let sum=_mm_madd_epi16(pairs,_mm_setr_epi16(0,3600,60,1,0,0,0,0));
+            let second=_mm_cvtsi128_si32(_mm_add_epi32(sum,_mm_srli_si128::<4>(sum)));
+            (dates.midnight[day]+i64::from(second))*1000
+        }
+        #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
+        {
         let pair = |i: usize| {
             let v = u16::from_le((p.add(i) as *const u16).read_unaligned());
             i64::from((v & 15) * 10 + ((v >> 8) & 15))
@@ -219,6 +235,7 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             return parse(p, len, dates);
         }
         (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
+        }
     }
 }
 
