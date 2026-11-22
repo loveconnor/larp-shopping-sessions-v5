@@ -1081,10 +1081,28 @@ struct Sessions<'a> {
     place: Vec<u32>,
     active: Vec<u32>,
     sums: [u64; 256],
-    touched: Vec<u8>,
+    generations: [u32; 256],
+    generation: u32,
+    best: Option<u8>,
+    best_amount: u64,
 }
 
 impl Sessions<'_> {
+    #[inline]
+    fn category_amount(&mut self, category: usize, amount: u64) {
+        if self.generations[category] != self.generation {
+            self.generations[category] = self.generation;
+            self.sums[category] = 0;
+        }
+        self.sums[category] += amount;
+        let total = self.sums[category];
+        let category = category as u8;
+        if total > self.best_amount || (total == self.best_amount && Some(category) < self.best) {
+            self.best = Some(category);
+            self.best_amount = total;
+        }
+    }
+
     fn row(&mut self, person: u64, day: u32, sessions: u32, events: u32, revenue: u64) -> io::Result<()> {
         let shared = self.shared;
         if self.writer.is_none() {
@@ -1105,20 +1123,14 @@ impl Sessions<'_> {
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);
         writer.int(4, revenue as i64);
-        let mut top: Option<usize> = None;
-        for &category in &self.touched {
-            let category = category as usize;
-            top = match top {
-                Some(best) if self.sums[best] > self.sums[category] => Some(best),
-                Some(best) if self.sums[best] == self.sums[category] && best < category => Some(best),
-                _ => Some(category),
-            };
+        writer.category(5, self.best.take());
+        self.best_amount = 0;
+        if self.generation == u32::MAX {
+            self.generations.fill(0);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
         }
-        for &category in &self.touched {
-            self.sums[category as usize] = 0;
-        }
-        self.touched.clear();
-        writer.category(5, top.map(|category| category as u8));
         writer.end_row();
         Ok(())
     }
@@ -1222,8 +1234,7 @@ impl Sessions<'_> {
                         let category = word * 64 + categories.trailing_zeros() as usize;
                         categories &= categories - 1;
                         let amount = std::mem::take(&mut scratch.revenue[index * scratch.categories + category]);
-                        if self.sums[category] == 0 { self.touched.push(category as u8); }
-                        self.sums[category] += amount;
+                        self.category_amount(category, amount);
                         day_revenue += amount;
                         revenue += amount;
                     }
@@ -1269,10 +1280,7 @@ impl Sessions<'_> {
                     purchased = true;
                     revenue += price;
                     let category = ((value >> 24) & 0xFF) as usize;
-                    if self.sums[category] == 0 {
-                        self.touched.push(category as u8);
-                    }
-                    self.sums[category] += price;
+                    self.category_amount(category, price);
                 }
                 at += 1;
             }
@@ -1383,7 +1391,10 @@ fn session_worker(
         place: vec![0; campaigns],
         active: Vec::new(),
         sums: [0; 256],
-        touched: Vec::new(),
+        generations: [0; 256],
+        generation: 1,
+        best: None,
+        best_amount: 0,
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
