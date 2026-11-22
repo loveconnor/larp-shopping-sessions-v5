@@ -222,6 +222,34 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// A valid ingestion clock also validates a matching civil-hour prefix.
+#[inline(always)]
+pub unsafe fn event_times(event: *const u8, en: usize, ingestion: *const u8, n: usize, dates: &mut Dates) -> (i64, i64) {
+    unsafe {
+        if en == 20 && n == 20 && *event.add(19) == b'Z' && *ingestion.add(19) == b'Z' {
+            let first = load64(ingestion);
+            let last = load64(ingestion.add(5));
+            let pair = |v: u64| ((v & 15) * 10 + ((v >> 8) & 15)) as i64;
+            let day = pair(last >> 24) as usize;
+            if load64(event) == first && load64(event.add(5)) == last
+                && day < 100 && first != 0 && dates.month[day] == first
+            {
+                let ing = load64(ingestion.add(11)) >> 16;
+                let raw = load64(event.add(11)) >> 16;
+                let suffix = raw ^ 0x3030_3a30_303a;
+                let base = dates.midnight[day] + 3600 * pair(last >> 48);
+                let ingest = (base + 60 * pair(ing >> 8) + pair(ing >> 32)) * 1000;
+                if (suffix.wrapping_add(0x767a_7f76_7a7f) | suffix) & 0x8080_8080_8080 != 0 {
+                    return (BAD, ingest);
+                }
+                return ((base + 60 * pair(raw >> 8) + pair(raw >> 32)) * 1000, ingest);
+            }
+        }
+        let ingest = ingest(ingestion, n, dates);
+        (parse(event, en, dates), ingest)
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
