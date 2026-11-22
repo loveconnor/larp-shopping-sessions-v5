@@ -34,13 +34,17 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// The epoch day of each `YYYY-MM-DD` seen, by its day of month: a dataset
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
+    pub origin_ms:i64,
     month: [u64; 100],
     midnight: [i64; 100],
 }
 
 impl Dates {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::relative_to(0) }
+
+    pub fn relative_to(window:i64) -> Self {
         Self {
+            origin_ms:window - window.rem_euclid(1000),
             month: [0; 100],
             midnight: [0; 100],
         }
@@ -97,7 +101,7 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
                 return BAD;
             }
             dates.month[slot] = raw;
-            let midnight = days * 86_400;
+            let midnight = days * 86_400 - dates.origin_ms/1000;
             dates.midnight[slot] = midnight;
             midnight
         };
@@ -146,7 +150,7 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
                 return BAD;
             }
             dates.month[slot] = raw;
-            let midnight = days * 86_400;
+            let midnight = days * 86_400 - dates.origin_ms/1000;
             dates.midnight[slot] = midnight;
             midnight
         };
@@ -254,7 +258,7 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             let high = load64(p) ^ 0x3030_3030_3030_3030;
             let low = load64(p.add(5)) ^ 0x3030_3030_3030_3030;
             if not_digits(high) | not_digits(low) == 0 {
-                return (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64;
+                return (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64 - dates.origin_ms;
             }
             return BAD;
         }
@@ -280,7 +284,8 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
                 }) * 1000;
             }
         }
-        digits_slow(p, len)
+        let ms = digits_slow(p,len);
+        if ms == BAD { BAD } else { ms - dates.origin_ms }
     }
 }
 

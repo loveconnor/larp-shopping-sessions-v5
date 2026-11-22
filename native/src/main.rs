@@ -691,8 +691,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    let window_start = shared.window_start;
-    let window_end = shared.window_end;
+    let window_start = shared.window_start - dates.origin_ms;
+    let window_end = shared.window_end - dates.origin_ms;
     const LOOKUPS: usize = 16;
     let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
     let mut queued = 0;
@@ -739,8 +739,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let mut valid = user != 0
             && (purchase || other)
             && field(5).1 > 0
-            && at >= window_start
-            && at < window_end
+            && (at.wrapping_sub(window_start) as u64) < (window_end-window_start) as u64
             && ingest - at <= DAY;
         let mut payload = 0;
         if purchase && valid {
@@ -803,8 +802,8 @@ fn parse_clicks(
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
 ) {
-    let earliest = shared.window_start - WEEK;
-    let window_end = shared.window_end;
+    let earliest = shared.window_start - dates.origin_ms - WEEK;
+    let window_end = shared.window_end - dates.origin_ms;
     pending.clear();
     let mut queued = Vec::with_capacity(16);
     let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
@@ -902,7 +901,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
-    let mut dates = ts::Dates::new();
+    let mut dates = ts::Dates::relative_to(shared.window_start);
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
@@ -979,7 +978,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             let earlier = if (a | b) < OVERFLOW_TIME {
                                 a < b
                             } else {
-                                let origin = shared.window_start - DAY;
+                                let origin = shared.window_start.rem_euclid(1000) - DAY;
                                 decode_ingest(a, origin, &sources[owners[index]].overflow_times)
                                     < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
                             };
