@@ -1,4 +1,4 @@
-name: Compare AVX-512 paths without byte compression
+name: Measure native AVX-512 byte-permutation Parquet packing
 on:
   push:
     branches: [bench/vector-revenue-stream]
@@ -12,10 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 471337, engine: n4}
-          - {events: 60000000, format: current, seed: 471337, engine: n4}
-          - {events: 20000000, format: current, seed: 817241, engine: n4}
-          - {events: 60000000, format: current, seed: 817241, engine: n4}
+          - {events: 20000000, format: current, seed: 324953, engine: n4}
+          - {events: 60000000, format: current, seed: 324953, engine: n4}
+          - {events: 20000000, format: current, seed: 630187, engine: n4}
+          - {events: 60000000, format: current, seed: 630187, engine: n4}
+          - {events: 20000000, format: current, seed: 917803, engine: n4}
+          - {events: 60000000, format: current, seed: 917803, engine: n4}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
@@ -24,11 +26,18 @@ jobs:
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
       CANDIDATE: f92c3ee5eed2590dad2f25563383c2460f123d4b
     steps:
+      - name: Detect native byte-permutation support
+        id: native
+        run: |
+          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
+          if grep -qw avx512vbmi /proc/cpuinfo; then echo "supported=true" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/checkout@v4
+        if: steps.native.outputs.supported == 'true'
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Check CPU and build the two submission images
+        if: steps.native.outputs.supported == 'true'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           for label in ranked candidate; do
@@ -43,6 +52,7 @@ jobs:
             docker rm "$cid"
           done
       - name: Compare every packed byte for widths 17 through 32
+        if: steps.native.outputs.supported == 'true'
         run: |
           if grep -qw avx512vbmi /proc/cpuinfo; then
             cd "$RUNNER_TEMP/candidate-src"
@@ -50,6 +60,7 @@ jobs:
             grep -q '1 passed' "$RUNNER_TEMP/narrow-delta-test.log"
           fi
       - name: Generate fresh data
+        if: steps.native.outputs.supported == 'true'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
@@ -60,6 +71,7 @@ jobs:
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate fresh restricted runc containers and compare both complete output tables
+        if: steps.native.outputs.supported == 'true'
         shell: python
         run: |
           import datetime, json, os, pathlib, shutil, statistics, subprocess
@@ -111,6 +123,7 @@ jobs:
               print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: steps.native.outputs.supported == 'true'
         if: matrix.events == 20000000 && matrix.format == 'current'
         run: |
           cd "$RUNNER_TEMP"
