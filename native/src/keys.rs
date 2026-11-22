@@ -87,27 +87,32 @@ struct UserSlot {
 // Only the thread that claims an empty slot writes its name. All reads use
 // acquire publication or a key obtained from an already published slot.
 unsafe impl Sync for UserSlot {}
-static USER_SLOTS: std::sync::OnceLock<Box<[UserSlot]>> = std::sync::OnceLock::new();
+static USER_SLOTS: std::sync::OnceLock<&'static [UserSlot]> = std::sync::OnceLock::new();
 
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
         let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
-        let mut slots = Vec::with_capacity(size);
-        slots.resize_with(size, || UserSlot { tag: 0.into(), name: std::cell::UnsafeCell::new([0; 33]) });
-        slots.into_boxed_slice()
+        // A byte allocation can use calloc even though the slots need cache-line
+        // alignment. Untouched pages stay shared until a worker claims a slot.
+        let bytes = size * size_of::<UserSlot>() + align_of::<UserSlot>() - 1;
+        let storage = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        // Both fields admit all-zero bits. The allocation belongs to this
+        // process-wide table and is accessed only through the aligned slots.
+        let (_, slots, _) = unsafe { storage.align_to_mut::<UserSlot>() };
+        &slots[..size]
     });
 }
 
 #[inline(always)]
-unsafe fn user_mix(p: *const u8) -> u64 {
-    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
+pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
+    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
         .wrapping_mul(0x9e3779b97f4a7c15)
 }
 
 #[inline(always)]
 pub unsafe fn prepare_long_user(p: *const u8) -> u64 {
-    let mixed = unsafe { user_mix(p) };
+    let mixed = long_name_mix(unsafe { &*p.cast::<[u8; 33]>() });
     let slots = USER_SLOTS.get().unwrap();
     crate::prefetch(&slots[(mixed >> 24) as usize & (slots.len()-1)]);
     mixed
@@ -119,7 +124,7 @@ pub unsafe fn finish_long_user(p: *const u8, mixed: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
-    unsafe { fixed_user_mixed(p,slots,user_mix(p)) }
+    unsafe { fixed_user_mixed(p, slots, long_name_mix(&*p.cast::<[u8; 33]>())) }
 }
 #[inline(always)]
 unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {

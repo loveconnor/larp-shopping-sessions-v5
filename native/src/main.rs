@@ -41,6 +41,7 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
+const MAX_THREADS: usize = 32;
 const GROUP_ROWS: usize = 1 << 17;
 /// How many records ahead to prefetch a links lookup.
 const AHEAD: usize = 16;
@@ -191,8 +192,8 @@ impl<T: Copy> Buckets<T> {
 struct Parsed {
     id: u64,
     user: u64,
-    /// Full UTC ingestion time, including copies ingested before the window.
-    ingest: i64,
+    /// Offset from the ingest origin, or a tagged index into the worker’s overflow times.
+    ingest: u32,
     /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
@@ -250,9 +251,7 @@ impl Dim {
         }
     }
 
-    fn insert(&mut self, name: &[u8], value: u32) {
-        // `numbered` reads only the name's own bytes.
-        let number = unsafe { ts::numbered(name.as_ptr(), name.len(), self.prefix) };
+    fn insert(&mut self, name: &[u8], number: usize, value: u32) {
         if number == usize::MAX {
             self.other.insert(name.to_vec(), value);
         } else {
@@ -544,8 +543,13 @@ fn csv_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
         return Ok(found);
     }
     for entry in fs::read_dir(folder)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "csv") && path.is_file() {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "csv") {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_file() || (kind.is_symlink() && path.is_file()) {
             found.push(path);
         }
     }
@@ -553,22 +557,22 @@ fn csv_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Every well-formed line of a small two-column file.
-fn read_pairs(path: &Path) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+/// Visit the fields in the padded CSV block while it is still alive.
+fn dimension_rows(path: &Path, prefix: &[u8], mut visit: impl FnMut(&[u8], usize, &[u8])) -> io::Result<()> {
     let source = Source::open(path, false)?;
-    let mut rows = Vec::new();
-    if source.size == 0 {
-        return Ok(rows);
+    if source.size != 0 {
+        let mut block = Block::new();
+        block.load(&source, 0, source.size)?;
+        block.lines::<2>(|buf, fields| unsafe {
+            let bytes = |at: usize| {
+                let (from, to) = fields[at];
+                std::slice::from_raw_parts(buf.add(from as usize), (to - from) as usize)
+            };
+            let name = bytes(0);
+            visit(name, ts::numbered(name.as_ptr(), name.len(), prefix), bytes(1));
+        });
     }
-    let mut block = Block::new();
-    block.load(&source, 0, source.size)?;
-    block.lines::<2>(|buf, fields| unsafe {
-        let text = |at: usize| {
-            std::slice::from_raw_parts(buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize).to_vec()
-        };
-        rows.push((text(0), text(1)));
-    });
-    Ok(rows)
+    Ok(())
 }
 
 fn manifest_time(text: &str, name: &str) -> i64 {
@@ -629,12 +633,41 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
         crc & EVENT_FINGERPRINT
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
-    { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
+    {
+        let mixed = keys::long_name_mix(bytes) ^ u64::from(bytes[0]);
+        (mixed ^ (mixed >> 32)) & EVENT_FINGERPRINT
+    }
 }
 
 struct EventSource {
+    overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
+}
+
+// Inline offsets cover nearly 25 days starting one day before the window.
+// Other timestamps retain all 64 bits in the parsing worker's side table.
+const OVERFLOW_TIME: u32 = 1 << 31;
+
+#[inline]
+fn encode_ingest(time: i64, origin: i64, overflow: &mut Vec<i64>) -> u32 {
+    let offset = time.wrapping_sub(origin) as u64;
+    if offset < u64::from(OVERFLOW_TIME) {
+        return offset as u32;
+    }
+    let index = overflow.len();
+    assert!(index < OVERFLOW_TIME as usize);
+    overflow.push(time);
+    OVERFLOW_TIME | index as u32
+}
+
+#[inline]
+fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
+    if encoded < OVERFLOW_TIME {
+        origin.wrapping_add(i64::from(encoded))
+    } else {
+        overflow[(encoded ^ OVERFLOW_TIME) as usize]
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -709,7 +742,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest,
+            ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
@@ -823,7 +856,11 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource {
+        buckets: Buckets::new(1 << shared.id_bits),
+        names: Vec::new(),
+        overflow_times: Vec::new(),
+    };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -898,7 +935,16 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            if (*record).ingest < (*other).ingest {
+                            let a = (*record).ingest;
+                            let b = (*other).ingest;
+                            let earlier = if (a | b) < OVERFLOW_TIME {
+                                a < b
+                            } else {
+                                let origin = shared.window_start - DAY;
+                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
+                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                            };
+                            if earlier {
                                 (*other).ts = DEAD;
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
@@ -1419,7 +1465,7 @@ fn main() -> io::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| count > 0)
         .unwrap_or_else(default_threads)
-        .min(32);
+        .min(MAX_THREADS);
 
     let manifest = fs::read_to_string(data.join("manifest.json"))?;
     let window_start = manifest_time(&manifest, "window_start");
@@ -1434,30 +1480,19 @@ fn main() -> io::Result<()> {
     // appear, then renumbered in byte order so the smaller number wins a tie.
     let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
     let mut products = Dim::new(b"p");
-    {
-        let source = Source::open(&data.join("products.csv"), false)?;
-        if source.size > 0 {
-            let mut block = Block::new();
-            block.load(&source, 0, source.size)?;
-            block.lines::<2>(|buf, fields| unsafe {
-                let text = |at: usize| {
-                    std::slice::from_raw_parts(buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize)
-                };
-                let (product, category) = (text(0), text(1));
-                if product.is_empty() {
-                    return;
-                }
-                let index = match seen.iter().position(|name| name.as_slice() == category) {
-                    Some(index) => index,
-                    None => {
-                        seen.push(category.to_vec());
-                        seen.len() - 1
-                    }
-                };
-                products.insert(product, index as u32 + 1);
-            });
+    dimension_rows(&data.join("products.csv"), products.prefix, |product, number, category| {
+        if product.is_empty() {
+            return;
         }
-    }
+        let index = match seen.iter().position(|name| name.as_slice() == category) {
+            Some(index) => index,
+            None => {
+                seen.push(category.to_vec());
+                seen.len() - 1
+            }
+        };
+        products.insert(product, number, index as u32 + 1);
+    })?;
     assert!(seen.len() <= 256, "more than 256 categories");
     let mut categories = seen.clone();
     categories.sort();
@@ -1475,51 +1510,47 @@ fn main() -> io::Result<()> {
     let mut campaigns = Dim::new(b"c_");
     let mut campaign_names = vec![b"organic".to_vec()];
     let mut campaign_channels = vec![b"organic".to_vec()];
-    for (campaign, channel) in read_pairs(&data.join("campaigns.csv"))? {
+    dimension_rows(&data.join("campaigns.csv"), campaigns.prefix, |campaign, number, channel| {
         if !campaign.is_empty() {
-            campaigns.insert(&campaign, campaign_names.len() as u32);
-            campaign_names.push(campaign);
-            campaign_channels.push(channel);
+            campaigns.insert(campaign, number, campaign_names.len() as u32);
+            campaign_names.push(campaign.to_vec());
+            campaign_channels.push(channel.to_vec());
         }
-    }
+    })?;
 
-    let mut files = Vec::new();
     let mut work = Vec::new();
-    let inputs = [(csv_files(&data.join("events"))?, true), (csv_files(&data.join("clicks"))?, false)];
-    let mut total = 0;
-    for (paths, _) in &inputs {
-        for path in paths { total += path.metadata()?.len(); }
-    }
+    let mut paths = csv_files(&data.join("events"))?;
+    let event_files = paths.len();
+    paths.extend(csv_files(&data.join("clicks"))?);
+    let mut files = paths.iter().map(|path| Source::open(path, false)).collect::<io::Result<Vec<_>>>()?;
+    let total: u64 = files.iter().map(|source| source.size).sum();
     let large = total >= 4u64 << 30;
-    let block = tune("SS_BLOCK", if large { 1 << 21 } else { BLOCK }).max(4096);
-    let map = tune("SS_MAP", u64::from(large || !cfg!(target_os = "linux"))) != 0;
+    let map_by_default = total >= 1 << 30;
+    let block = tune("SS_BLOCK", if map_by_default { 1 << 21 } else { BLOCK }).max(4096);
+    let map = tune("SS_MAP", u64::from(map_by_default || !cfg!(target_os = "linux"))) != 0;
     let give_back = tune("SS_RELEASE", u64::from(large)) != 0;
-    for (paths, events) in inputs {
-        for path in paths {
-            let source = Source::open(&path, map)?;
-            let size = source.size;
-            // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
-            for copy in 0..copies {
-                let mut start = 0;
-                while start < size {
-                    let end = (start + block).min(size);
-                    work.push(Work {
-                        events,
-                        copy: copy << 56,
-                        file: files.len(),
-                        start,
-                        end,
-                    });
-                    start = end;
-                }
+    for (file, source) in files.iter_mut().enumerate() {
+        if map {
+            source.map_input();
+        }
+        for copy in 0..copies {
+            let mut start = 0;
+            while start < source.size {
+                let end = (start + block).min(source.size);
+                work.push(Work { events: file < event_files, copy: copy << 56, file, start, end });
+                start = end;
             }
-            files.push(source);
         }
     }
 
-    let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
+    let input_bytes = total.saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
-    let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
+    // At intermediate sizes, fewer active destinations reduce scattered
+    // writes. Larger inputs need finer partitions for the dedup table.
+    let medium = (1 << 30..4u64 << 30).contains(&input_bytes);
+    let partition_bits = |bytes_per_part| input_bytes.div_ceil(bytes_per_part).max(threads as u64 * 8).ilog2();
+    let id_bits = partition_bits(if medium { 2 << 20 } else { 1 << 20 });
+    let person_bits = partition_bits(if medium { 4 << 20 } else { 1 << 20 });
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
@@ -1536,8 +1567,8 @@ fn main() -> io::Result<()> {
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
         defer_long_events: copies == 1,
-        id_bits: tune("SS_ID_BITS", partition_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
-        person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
+        id_bits: tune("SS_ID_BITS", id_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
+        person_bits: tune("SS_PERSON_BITS", person_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
         output,
@@ -1545,7 +1576,9 @@ fn main() -> io::Result<()> {
         day_offset,
         first_day,
     };
-    fs::create_dir_all(shared.output.join("user_daily"))?;
+    let user_dir = shared.output.join("user_daily");
+    let reusing_user_dir = user_dir.is_dir();
+    fs::create_dir_all(&user_dir)?;
     fs::create_dir_all(shared.output.join("campaign_daily"))?;
     let shared = &shared;
     let setup = began.elapsed();
@@ -1597,8 +1630,9 @@ fn main() -> io::Result<()> {
     })?;
     let sessions = began.elapsed();
 
-    if !results.iter().any(|result| result.1) {
-        let path = shared.output.join("user_daily").join("part-000.parquet");
+    let empty_result = !results.iter().any(|result| result.1);
+    if empty_result {
+        let path = user_dir.join("part-000.parquet");
         pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS, &shared.categories)?.finish()?;
     }
     let mut writer = pq::Writer::create(
@@ -1638,6 +1672,24 @@ fn main() -> io::Result<()> {
         }
     }
     writer.finish()?;
+    // A retry may use fewer workers or assign all rows to different workers.
+    // Remove only this writer's stale parts, after both tables are complete.
+    if reusing_user_dir {
+        for entry in fs::read_dir(&user_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let part = name.to_str().and_then(|s| s.strip_prefix("part-")?.strip_suffix(".parquet"));
+            let Some(digits) = part.filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())) else {
+                continue;
+            };
+            let worker = digits.parse::<usize>().unwrap();
+            let wrote = results.get(worker).is_some_and(|result| result.1) || (worker == 0 && empty_result);
+            if worker < MAX_THREADS && !wrote && entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    }
+
 
     // Nothing reads any of this any more. Give it back from every thread at
     // once: left to the kernel, it is freed on one thread at exit, on the clock.
@@ -1684,4 +1736,21 @@ fn main() -> io::Result<()> {
     );
     // Everything left is memory the kernel frees faster than we can.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod ingest_tests {
+    use super::*;
+
+    #[test]
+    fn compact_ingest_preserves_boundaries_and_overflow_values() {
+        let origin = 1_700_000_000_000;
+        let limit = i64::from(OVERFLOW_TIME);
+        let times = [i64::MIN, origin - 1, origin, origin + limit - 1, origin + limit, i64::MAX];
+        let mut overflow = Vec::new();
+        let encoded = times.map(|time| encode_ingest(time, origin, &mut overflow));
+        assert_eq!(encoded[2..4], [0, OVERFLOW_TIME - 1]);
+        assert_eq!(overflow, [i64::MIN, origin - 1, origin + limit, i64::MAX]);
+        assert_eq!(encoded.map(|time| decode_ingest(time, origin, &overflow)), times);
+    }
 }

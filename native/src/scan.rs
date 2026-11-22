@@ -40,6 +40,7 @@ unsafe impl Sync for Source {}
 
 impl Source {
     pub fn open(path: &std::path::Path, map: bool) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
         use std::os::fd::AsRawFd;
         let file = File::open(path)?;
         let size = file.metadata()?.len();
@@ -48,18 +49,21 @@ impl Source {
         if size > 0 {
             unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, 2) };
         }
-        let mut mapped = std::ptr::null();
-        if map && size > 0 {
-            let address = unsafe { mmap(std::ptr::null_mut(), size as usize, 1, 2, file.as_raw_fd(), 0) };
+        let mut source = Self { file, size, map: std::ptr::null() };
+        if map {
+            source.map_input();
+        }
+        Ok(source)
+    }
+
+    pub fn map_input(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.size != 0 && self.map.is_null() {
+            let address = unsafe { mmap(std::ptr::null_mut(), self.size as usize, 1, 2, self.file.as_raw_fd(), 0) };
             if address as usize != usize::MAX {
-                mapped = address as *const u8;
+                self.map = address.cast();
             }
         }
-        Ok(Self {
-            file,
-            size,
-            map: mapped,
-        })
     }
 
     /// Unmaps the pages of `[start, end)` now, from whichever thread calls. Left
@@ -160,23 +164,14 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
     unsafe {
         use std::arch::aarch64::*;
         let chunks = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
-        // Narrowing shifts pack four bits per byte: 64 bytes into a 256-bit
-        // mask in four u64s; one bit of each nibble is kept.
+        // Each matching byte contributes its bit within a group of eight.
+        // Pairwise addition concatenates the four vectors into one byte mask.
+        let weights = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
         let find = |byte: u8| -> u64 {
             let wanted = vdupq_n_u8(byte);
-            let mut out = 0u64;
-            for (at, chunk) in chunks.iter().enumerate() {
-                let hit = vceqq_u8(*chunk, wanted);
-                let nibbles = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
-                // One bit per byte: bit 4k of `nibbles` for byte k.
-                let mut bits = nibbles & 0x1111_1111_1111_1111;
-                bits = (bits | (bits >> 3)) & 0x0303_0303_0303_0303;
-                bits = (bits | (bits >> 6)) & 0x000F_000F_000F_000F;
-                bits = (bits | (bits >> 12)) & 0x0000_00FF_0000_00FF;
-                bits = (bits | (bits >> 24)) & 0xFFFF;
-                out |= bits << (16 * at);
-            }
-            out
+            let lanes = chunks.map(|chunk| vandq_u8(vceqq_u8(chunk, wanted), weights));
+            let pairs = vpaddq_u8(vpaddq_u8(lanes[0], lanes[1]), vpaddq_u8(lanes[2], lanes[3]));
+            vget_lane_u64(vreinterpret_u64_u8(vpadd_u8(vget_low_u8(pairs), vget_high_u8(pairs))), 0)
         };
         let (comma, newline) = (find(b','), find(b'\n'));
         (comma | newline, newline, find(b'"'))
