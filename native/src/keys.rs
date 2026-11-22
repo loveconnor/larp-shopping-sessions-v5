@@ -179,6 +179,12 @@ pub fn prepare_people(bytes:u64) {
     let _=PEOPLE.set(Ordinals {words,shift:64-n.trailing_zeros(),spill_start:n+long+1,spill:Mutex::default()});
 }
 #[inline(always)]
+pub fn prefetch_ordinal(key:u64) {
+    let dict=PEOPLE.get().unwrap();
+    let i=(key.wrapping_mul(0x9e3779b97f4a7c15)>>dict.shift) as usize;
+    crate::prefetch(&dict.words[i]);
+}
+#[inline(always)]
 pub fn ordinal(key:u64)->u64 {
     use std::sync::atomic::Ordering::Relaxed;
     if key==0{return 0;}

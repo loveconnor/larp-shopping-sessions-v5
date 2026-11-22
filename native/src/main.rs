@@ -545,11 +545,16 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     const LOOKUPS: usize = 16;
-    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    let empty = Parsed {id:0,user:0,ingest:0,ts:DEAD,payload:0};
+    let mut lookups = [(empty,0usize,std::ptr::null::<u8>(),0u64); LOOKUPS];
     let mut queued = 0;
-    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
-        for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::ordinal(keys::finish_long_user(name,mixed)) as u32; }
+    let drain = |items:&[(Parsed,usize,*const u8,u64)], buckets:&mut Buckets<Parsed>| {
+        for &(mut row,part,name,key) in items {
+            if row.ts != DEAD {
+                let raw = if name.is_null() {key} else {unsafe {keys::finish_long_user(name,key)}};
+                row.user = keys::ordinal(raw) as u32;
+            }
+            buckets.push(part,row);
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -579,7 +584,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let deferred = n == 33 && shared.defer_long_events;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if deferred || user == 0 { user } else { keys::ordinal(user ^ copy) };
+        let key = if deferred { mixed } else { user ^ copy };
+        if !deferred && user != 0 {keys::prefetch_ordinal(key);}
+        let part = (partition_hash >> id_shift) as usize;
+        #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+        std::arch::asm!("prefetchw [{p}]",p=in(reg) *out.buckets.next.get_unchecked(part),options(nostack,preserves_flags,readonly));
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -618,22 +627,19 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         };
         let record = Parsed {
             id,
-            user: user as u32,
+            user: 0,
             ingest: clock,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
-        if deferred {
-            lookups[queued] = (name,dest,mixed);
-            queued += 1;
-            if queued == LOOKUPS {
-                drain(&lookups);
-                queued = 0;
-            }
+        lookups[queued]=(record,part,if deferred {name} else {std::ptr::null()},key);
+        queued+=1;
+        if queued==LOOKUPS {
+            drain(&lookups,&mut out.buckets);
+            queued=0;
         }
     });
-    drain(&lookups[..queued]);
+    drain(&lookups[..queued],&mut out.buckets);
 }
 
 struct ClickSource {
