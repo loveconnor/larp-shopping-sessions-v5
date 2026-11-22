@@ -1,9 +1,10 @@
 use std::{fs, path::Path, time::Instant};
 
 mod current;
-mod merge64;
-mod merge128;
-mod stream;
+mod alt16;
+mod alt32;
+mod alt64;
+mod alt128;
 
 fn main() {
     let mut samples: [Vec<Vec<u64>>; 7] = Default::default();
@@ -19,20 +20,20 @@ fn main() {
             input = &input[2 + 8*n..];
         }
     }
-    let sorters: [(&str, fn(&mut [u64], &mut [u64])); 4] = [
-        ("current",current::apply), ("merge64",merge64::apply),
-        ("merge128",merge128::apply), ("stream",stream::apply),
+    let sorters: [(&str, fn(&mut [u64], &mut [u64])); 5] = [
+        ("current",current::apply), ("alt16",alt16::apply), ("alt32",alt32::apply),
+        ("alt64",alt64::apply), ("alt128",alt128::apply),
     ];
     for (bin, input) in samples.iter().enumerate() {
         if input.is_empty() { continue; }
         let mut expected = input.clone();
         for values in &mut expected { values.sort_unstable(); }
-        let mut runs: [Vec<f64>; 4] = Default::default();
+        let mut runs: [Vec<f64>; 5] = Default::default();
         let mut values = input.clone();
         let mut scratch = [0; 512];
-        for round in 0..32 {
-            for slot in 0..4 {
-                let engine = (if round % 8 >= 4 { 3-slot } else { slot } + round) % 4;
+        for round in 0..40 {
+            for slot in 0..5 {
+                let engine = (if round % 10 >= 5 { 4-slot } else { slot } + round) % 5;
                 for (dst, src) in values.iter_mut().zip(input) { dst.copy_from_slice(src); }
                 let start = Instant::now();
                 for v in &mut values {
@@ -40,7 +41,7 @@ fn main() {
                 }
                 let elapsed = start.elapsed().as_nanos() as f64 / input.len() as f64;
                 assert!(values == expected, "output differs in bin {bin}");
-                if round >= 8 { runs[engine].push(elapsed); }
+                if round >= 10 { runs[engine].push(elapsed); }
             }
         }
         for run in &mut runs { run.sort_by(f64::total_cmp); }

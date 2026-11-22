@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess, os
 root=Path(os.environ['RUNNER_TEMP']); src=root/'candidate'; src.mkdir()
-labels={'current':'f5364f4a92df4eec0d5f5556deadd3c2dcb64f30','merge64':'09a579006f99579417b9eb45d65c109b8ca91843','merge128':'6670741f51adb9885c2a0371d859b19cf4db9087','stream':'5403f8a7e02a7663123d07a5b5073a8cf8722b93'}
+labels={'current': '5403f8a7e02a7663123d07a5b5073a8cf8722b93', 'alt16': '2b7ec2f03d636cd418b8529e677000e3e263003e', 'alt32': '2b7ec2f03d636cd418b8529e677000e3e263003e', 'alt64': '2b7ec2f03d636cd418b8529e677000e3e263003e', 'alt128': '2b7ec2f03d636cd418b8529e677000e3e263003e'}
 with subprocess.Popen(['git','archive',labels['current'],'native'],stdout=subprocess.PIPE) as arc:
     subprocess.run(['tar','xf','-','-C',src],stdin=arc.stdout,check=True)
 p=src/'native/src/main.rs';s=p.read_text()
@@ -25,5 +25,8 @@ for label,sha in labels.items():
     s=subprocess.check_output(['git','show',sha+':native/src/main.rs'],text=True)
     first=min(i for name in ['unsafe fn sort_short_times(', 'unsafe fn sorted_registers('] if (i:=s.find(name))!=-1)
     a=s.rindex('#[cfg(',0,first);b=s.index('fn session_worker(',a)
-    args = 'v,scratch' if label == 'stream' else 'v,scratch,12'
+    args = 'v,scratch'
+    if label.startswith('alt'):
+        s = s[:a]+s[a:b].replace('const RUN: usize = 128;',f'const RUN: usize = {label[3:]};')
+        b = len(s)
     (root/(label+'.rs')).write_text(s[a:b]+'\npub fn apply(v:&mut [u64], scratch:&mut [u64]) {sort_medium_times('+args+')}\n')
