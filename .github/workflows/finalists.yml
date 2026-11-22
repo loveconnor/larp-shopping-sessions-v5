@@ -1,7 +1,7 @@
-name: Benchmark parser against ranked entry
+name: Verify final candidates against scored entry and an identical control
 on:
   push:
-    branches: [bench/parser-paired]
+    branches: [bench/controlled-finalists]
 permissions:
   contents: read
 jobs:
@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 535103}
-          - {events: 60000000, format: current, seed: 535103}
-          - {events: 20000000, format: current, seed: 728293}
-          - {events: 60000000, format: current, seed: 728293}
+          - {events: 20000000, format: current, seed: 710929}
+          - {events: 60000000, format: current, seed: 710929}
+          - {events: 20000000, format: current, seed: 101531}
+          - {events: 60000000, format: current, seed: 101531}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
-      CANDIDATE: 81d4e72f44468c513f15c08efc3fd81d0a3871b9
+      RANKED: 46fc4d2d43b3d07cca0e4b1876c605e3a67c9525
+      CANDIDATE: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +42,7 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
+          docker tag ranked control
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
@@ -55,20 +56,26 @@ jobs:
       - name: Alternate fresh restricted runc containers and compare both complete output tables
         shell: python
         run: |
-          import datetime, json, os, pathlib, shutil, statistics, subprocess
+          import datetime, itertools, json, math, os, pathlib, random, shutil, statistics, subprocess
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
           cpus = sorted(os.sched_getaffinity(0))[:8]
           cpuset = ",".join(map(str, cpus))
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "control"]
           samples = {label: [] for label in labels}
           print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
           scratch = root / "scratch"
           scratch.mkdir(mode=0o777)
           scratch.chmod(0o777)
-          for round_number in range(6):
-              for label in labels[::1 if round_number % 2 == 0 else -1]:
+          rng = random.Random(int(os.environ["SEED"]))
+          orders = []
+          for _ in range(2):
+              batch = list(itertools.permutations(labels))
+              rng.shuffle(batch)
+              orders.extend(batch)
+          for round_number, order in enumerate([labels] + orders):
+              for label in order:
                   output = root / f"{label}-out-{round_number}"
                   output.mkdir()
                   output.chmod(0o777)
@@ -93,12 +100,17 @@ jobs:
                   finally:
                       subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
           for table in ("user_daily", "campaign_daily"):
-              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-5/{table}/*.parquet')" for label in labels]
+              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-12/{table}/*.parquet')" for label in ("ranked","candidate")]
               for lhs, rhs in ((a,b),(b,a)):
                   assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
           for label in labels:
               m = statistics.median(samples[label])
               print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+
+          for label in ("control", "candidate"):
+              ratios = [a/b for a,b in zip(samples[label], samples["ranked"])]
+              ratios.sort()
+              print(f"PAIRED {label} median {statistics.median(ratios):.4f}, middle eight [{ratios[2]:.4f}, {ratios[-3]:.4f}], faster {sum(r < 1 for r in ratios)}/{len(ratios)}",flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
         if: matrix.events == 20000000 && matrix.format == 'current'
