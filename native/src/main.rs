@@ -1024,7 +1024,7 @@ impl Sessions<'_> {
             while at < events.len() {
                 let value = events[at];
                 let time = value >> 32;
-                if time - previous > SESSION_GAP {
+                if time.saturating_sub(previous) > SESSION_GAP {
                     break;
                 }
                 previous = time;
@@ -1098,34 +1098,56 @@ impl Sessions<'_> {
     }
 }
 
-/// Sorts many events of one person by their `ts` (the top 32 bits): three
-/// counting passes of 11 bits. Whales have a million events each.
-fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
+/// Within a gap-width time bin every event belongs to the same session.
+#[derive(Clone, Copy)]
+struct TimeBin {
+    end: usize,
+    first: u64,
+    last: u64,
+}
+
+fn group_session_times(values: &mut [u64], scratch: &mut Vec<u64>, bins: &mut Vec<TimeBin>) {
+    let bin_index = |v: u64| ((v >> 32) / SESSION_GAP) as usize;
+    let empty = TimeBin { end: 0, first: u64::MAX, last: 0 };
+    bins.clear();
+    for &value in values.iter() {
+        let i = bin_index(value);
+        if i >= bins.len() {
+            bins.resize(i + 1, empty);
+        }
+        let bin = &mut bins[i];
+        bin.end += 1;
+        bin.first = bin.first.min(value);
+        bin.last = bin.last.max(value);
+    }
+    let mut offset = 0;
+    for bin in bins.iter_mut() {
+        let count = bin.end;
+        bin.end = offset;
+        offset += count;
+    }
     scratch.clear();
     scratch.resize(values.len(), 0);
-    let mut histograms = [[0u32; 2048]; 3];
     for &value in values.iter() {
-        histograms[0][(value >> 32) as usize & 2047] += 1;
-        histograms[1][(value >> 43) as usize & 2047] += 1;
-        histograms[2][(value >> 54) as usize] += 1;
+        let bin = &mut bins[bin_index(value)];
+        scratch[bin.end] = value;
+        bin.end += 1;
     }
-    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for (shift, counts) in [32, 43, 54].into_iter().zip(&mut histograms) {
-        let mut sum = 0;
-        for count in counts.iter_mut() {
-            let here = *count;
-            *count = sum;
-            sum += here;
+    let mut start = 0;
+    for bin in bins.iter() {
+        if bin.end > start + 1 {
+            // Put the actual earliest and latest records at the boundaries,
+            // retaining every payload, including duplicate timestamps.
+            let group = &mut scratch[start..bin.end];
+            let first = group.iter().position(|&x| x == bin.first).unwrap();
+            group.swap(0, first);
+            let last = group.iter().rposition(|&x| x == bin.last).unwrap();
+            let end = group.len() - 1;
+            group.swap(end, last);
         }
-        for &value in from.iter() {
-            let slot = &mut counts[(value >> shift) as usize & 2047];
-            to[*slot as usize] = value;
-            *slot += 1;
-        }
-        std::mem::swap(&mut from, &mut to);
+        start = bin.end;
     }
-    // Three passes: the sorted values are in the scratch buffer.
-    to.copy_from_slice(from);
+    values.copy_from_slice(scratch);
 }
 
 fn session_worker(
@@ -1160,6 +1182,7 @@ fn session_worker(
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
     let mut scratch: Vec<u64> = Vec::new();
+    let mut bins = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1315,7 +1338,7 @@ fn session_worker(
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
             if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
+                group_session_times(mine, &mut scratch, &mut bins);
             } else {
                 mine.sort_unstable();
             }
