@@ -1,7 +1,7 @@
-name: Compare separator expansion on AVX2 and pre-VBMI2 AVX-512
+name: Measure destination prefetch distance and frequency for scattered records
 on:
   push:
-    branches: [bench/separator-decoding]
+    branches: [bench/destination-read-ahead]
 permissions:
   contents: read
 jobs:
@@ -12,15 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 971821}
-          - {events: 60000000, format: current, seed: 971821}
-          - {events: 20000000, format: current, seed: 662477}
-          - {events: 60000000, format: current, seed: 662477}
+          - {events: 20000000, format: current, seed: 225379}
+          - {events: 60000000, format: current, seed: 225379}
+          - {events: 20000000, format: current, seed: 471749}
+          - {events: 60000000, format: current, seed: 471749}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
+      RANKED: a057b4a6243282ef33ea848a5c33157f2a50aa81
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -48,26 +48,30 @@ jobs:
           cd "$RUNNER_TEMP/ranked-src"
           docker build -q --target builder -t cc-study .
           mkdir "$RUNNER_TEMP/engines"
-          docker run --rm -v "$PWD/native:/pristine:ro" -v "$RUNNER_TEMP/engines:/engines" cc-study sh -ec '
+          docker run --rm -v "$GITHUB_WORKSPACE/.github/workflows:/study:ro" -v "$PWD/native:/pristine:ro" -v "$RUNNER_TEMP/engines:/engines" cc-study sh -ec '
             cd /src
             cp /pristine/src/*.rs src/
+            command -v python3 || (apt-get update -qq && apt-get install -yq python3)
             profile=v5
             cpu=x86-64-v3
             features=
+            flags=
             if grep -qw avx512bw /proc/cpuinfo; then
               cpu=x86-64-v4
               profile=n4
               features="--features narrow-v4"
+              if grep -qw avx512_vbmi2 /proc/cpuinfo; then
+                patch -p2 < platform/wide.patch
+                profile=wide
+                features=
+                flags="-C target-feature=+avx512vbmi2"
+              fi
             fi
-            for variant in reference flat4 flat5 flat6 flat7 flat8 flat9 flat12 split3 split4 split5 split6; do
-              cp /pristine/src/scan.rs src/scan.rs
-              case "$variant" in
-                reference) ;;
-                flat*) lanes=${variant#flat}; sed -i "s/flatten::<10>(sep/flatten::<$lanes>(sep/g" src/scan.rs ;;
-                split*) lanes=${variant#split}
-                  sed -i "s/flatten::<10>(sep, at, out.add(count))/{ let low = flatten::<$lanes>(sep as u32 as u64, at, out.add(count)); low + flatten::<$lanes>(sep >> 32, at + 32, out.add(count + low)) }/g" src/scan.rs ;;
-              esac
-              RUSTFLAGS="-C linker=cc -C target-cpu=$cpu -Cprofile-use=/src/profile/$profile.profdata" cargo build --locked --release $features --target x86_64-unknown-linux-gnu
+            cp src/main.rs /tmp/prefetch.rs
+            for variant in reference off p32 p96 p128 p192 p256 p384 line64 line128 parsed128 event128; do
+              cp /tmp/prefetch.rs src/main.rs
+              python3 /study/prefetch.py "$variant"
+              RUSTFLAGS="-C linker=cc -C target-cpu=$cpu $flags -Cprofile-use=/src/profile/$profile.profdata" cargo build --locked --release $features --target x86_64-unknown-linux-gnu
               cp target/x86_64-unknown-linux-gnu/release/shopping-sessions "/engines/$variant"
             done
           '
