@@ -876,7 +876,8 @@ fn parse_clicks(
 
 type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
 
-fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards) -> io::Result<(EventSource, ClickSource)> {
+fn parse_worker<'scope, 'env: 'scope>(scope: &'scope std::thread::Scope<'scope, 'env>, shared: &'scope Shared,
+    worker: usize, threads: usize, shards: &LinkShards, independent_builder: bool) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
     let began = Instant::now();
     let own = read_links(shared, &mut block, worker, threads).unwrap_or_else(|error| {
@@ -889,11 +890,16 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         (parts.len() == threads).then(|| std::mem::take(&mut *parts))
     };
     if let Some(parts) = ready {
-        let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-        for mut shard in parts { pairs.append(&mut shard); }
-        let links = Links::build(&pairs);
-        let _ = shared.links.set(links);
-        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
+        let build = move || {
+            let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for mut shard in parts { pairs.append(&mut shard); }
+            let links = Links::build(&pairs);
+            let _ = shared.links.set(links);
+            LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
+        };
+        // A large input gives the link builder work to overlap with event
+        // parsing. The enclosing scope joins the builder before deduplication.
+        if independent_builder { scope.spawn(build); } else { build(); }
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
@@ -1757,7 +1763,7 @@ fn main() -> io::Result<()> {
     let shards = &LinkShards::default();
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
+            .map(|thread| scope.spawn(move || parse_worker(scope, shared, thread, threads, shards, large)))
             .collect();
         handles
             .into_iter()
