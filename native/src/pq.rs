@@ -167,6 +167,24 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
 // Eight values at a fixed bit width always end on a byte boundary.
 #[inline(always)]
 fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "bmi2"))]
+    if BITS <= 8 {
+        // Subtracting in the low byte is exact modulo 256. Each adjusted
+        // delta in this specialization fits within the selected bit width.
+        use std::arch::x86_64::*;
+        let select = 0x0101_0101_0101_0101 * ((1u64 << BITS) - 1);
+        out.reserve(values.len() / 8 * BITS);
+        unsafe {
+            let bias = _mm_set1_epi8(least as i8);
+            for group in values.chunks_exact(8) {
+                let deltas = _mm512_loadu_si512(group.as_ptr().cast());
+                let low = _mm_sub_epi8(_mm512_cvtepi64_epi8(deltas), bias);
+                let packed = _pext_u64(_mm_cvtsi128_si64(low) as u64, select);
+                out.extend_from_slice(&packed.to_le_bytes()[..BITS]);
+            }
+        }
+        return;
+    }
     for group in values.chunks_exact(8) {
         let mut packed = 0u128;
         for (index, &delta) in group.iter().enumerate() {
@@ -563,6 +581,25 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[test]
+    fn packed_narrow_deltas_match_bit_stream_for_wrapping_minima() {
+        fn check<const B: usize>() {
+            for least in [i64::MIN, -100_000, -257, -1, 0, 254, i64::MAX] {
+                let offsets: Vec<u64> = (0..64)
+                    .map(|i| (i * 47 + 19) & ((1 << B) - 1))
+                    .collect();
+                let deltas: Vec<_> = offsets.iter().map(|&v| least.wrapping_add(v as i64)).collect();
+                let mut actual = vec![11];
+                let mut expected = actual.clone();
+                pack_eight::<B>(&mut actual, &deltas, least);
+                pack(&mut expected, offsets.into_iter(), B as u32);
+                assert_eq!(actual, expected);
+            }
+        }
+        check::<1>(); check::<2>(); check::<3>(); check::<4>();
+        check::<5>(); check::<6>(); check::<7>(); check::<8>();
     }
 
     #[test]
