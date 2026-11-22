@@ -1042,12 +1042,11 @@ struct TimeBin {
     first: u32,
     last: u32,
     events: u32,
-    category_bits: [u64; 4],
 }
 
 impl Default for TimeBin {
     fn default() -> Self {
-        Self { first: u32::MAX, last: 0, events: 0, category_bits: [0; 4] }
+        Self { first: u32::MAX, last: 0, events: 0 }
     }
 }
 
@@ -1055,6 +1054,7 @@ struct TimeBins {
     bins: Vec<TimeBin>,
     occupied: Vec<u64>,
     revenue: Vec<u64>,
+    category_bits: Vec<[u64;4]>,
     categories: usize,
 }
 
@@ -1066,6 +1066,7 @@ impl TimeBins {
             bins: vec![TimeBin::default(); count],
             occupied: vec![0; count.div_ceil(64)],
             revenue: vec![0; count * categories],
+            category_bits:vec![[0;4];count],
             categories,
         }
     }
@@ -1187,7 +1188,7 @@ impl Sessions<'_> {
                 let category = (payload >> 24) as usize;
                 let price = u64::from(payload & 0xff_ffff);
                 scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
+                scratch.category_bits[index][category / 64] |= 1 << (category % 64);
             }
         }
         let mut cursor = (0, 0);
@@ -1216,7 +1217,7 @@ impl Sessions<'_> {
                 }
                 day_events += bin.events;
                 last = bin.last;
-                for (word, &occupied_categories) in bin.category_bits.iter().enumerate() {
+                for (word, occupied_categories) in std::mem::take(&mut scratch.category_bits[index]).into_iter().enumerate() {
                     let mut categories = occupied_categories;
                     while categories != 0 {
                         let category = word * 64 + categories.trailing_zeros() as usize;
