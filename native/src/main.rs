@@ -1042,12 +1042,12 @@ struct TimeBin {
     first: u32,
     last: u32,
     events: u32,
-    category_bits: [u64; 4],
+    category_bits: u64,
 }
 
 impl Default for TimeBin {
     fn default() -> Self {
-        Self { first: u32::MAX, last: 0, events: 0, category_bits: [0; 4] }
+        Self { first: u32::MAX, last: 0, events: 0, category_bits: 0 }
     }
 }
 
@@ -1056,6 +1056,7 @@ struct TimeBins {
     occupied: Vec<u64>,
     revenue: Vec<u64>,
     categories: usize,
+    extra_categories: Vec<[u64; 3]>,
 }
 
 impl TimeBins {
@@ -1067,6 +1068,7 @@ impl TimeBins {
             occupied: vec![0; count.div_ceil(64)],
             revenue: vec![0; count * categories],
             categories,
+            extra_categories: if categories > 64 { vec![[0; 3]; count] } else { Vec::new() },
         }
     }
 }
@@ -1187,7 +1189,11 @@ impl Sessions<'_> {
                 let category = (payload >> 24) as usize;
                 let price = u64::from(payload & 0xff_ffff);
                 scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
+                if category < 64 {
+                    bin.category_bits |= 1 << category;
+                } else {
+                    scratch.extra_categories[index][category / 64 - 1] |= 1 << (category % 64);
+                }
             }
         }
         let mut cursor = (0, 0);
@@ -1216,8 +1222,7 @@ impl Sessions<'_> {
                 }
                 day_events += bin.events;
                 last = bin.last;
-                for (word, &occupied_categories) in bin.category_bits.iter().enumerate() {
-                    let mut categories = occupied_categories;
+                let mut add = |word, mut categories: u64| {
                     while categories != 0 {
                         let category = word * 64 + categories.trailing_zeros() as usize;
                         categories &= categories - 1;
@@ -1227,6 +1232,11 @@ impl Sessions<'_> {
                         day_revenue += amount;
                         revenue += amount;
                     }
+                };
+                add(0, bin.category_bits);
+                if !scratch.extra_categories.is_empty() {
+                    let more = std::mem::take(&mut scratch.extra_categories[index]);
+                    for (i, mask) in more.into_iter().enumerate() { add(i + 1, mask); }
                 }
             }
         }
