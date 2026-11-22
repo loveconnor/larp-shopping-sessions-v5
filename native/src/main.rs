@@ -925,6 +925,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    let mut seen_once = Vec::new();
+    let mut repeated = Vec::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -940,6 +942,26 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         if total == 0 {
             continue;
         }
+        // Resolve only IDs that share a fingerprint with another row.
+        // These bitmaps are local to a single partition and one worker.
+        let words = total.div_ceil(4).next_power_of_two();
+        seen_once.clear();
+        seen_once.resize(words, 0u64);
+        repeated.clear();
+        repeated.resize(words, 0u64);
+        let hash = |id:u64| {
+            let key = if shared.defer_long_events && id & LONG_EVENT == LONG_EVENT { (id >> 32) & EVENT_FINGERPRINT } else { id };
+            key.wrapping_mul(MIX)
+        };
+        let location = |mixed:u64| (((mixed >> 30) as usize) & (words-1), 1u64 << ((mixed >> 24)&63));
+        for &(base,n) in &chunks {
+            for i in 0..n {
+                let id = unsafe {(*base.add(i)).id};
+                let (w,b) = location(hash(id));
+                repeated[w] |= seen_once[w] & b;
+                seen_once[w] |= b;
+            }
+        }
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
@@ -952,7 +974,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mixed = hash_key.wrapping_mul(MIX);
+                    let (w,b) = location(mixed);
+                    if repeated[w] & b == 0 { continue; }
+                    let mut slot = (mixed >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
