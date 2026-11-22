@@ -795,6 +795,25 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
 }
 
+fn scatter_clicks(shared: &Shared, links: &Links, pending: &[RawClick], out: &mut ClickSource) {
+    for at in 0..pending.len() {
+        if let Some(ahead) = pending.get(at + shared.ahead) {
+            links.prefetch(ahead.user);
+        }
+        let click = pending[at];
+        let person = links.person(click.user);
+        out.buckets.push(
+            person_part(person, shared.person_bits),
+            Click {
+                person,
+                id: click.id,
+                ts: click.ts,
+                campaign: click.campaign,
+            },
+        );
+    }
+}
+
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
@@ -805,6 +824,7 @@ fn parse_clicks(
 ) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
+    let mut ready = shared.links.get();
     pending.clear();
     let mut queued = Vec::with_capacity(16);
     let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
@@ -848,6 +868,14 @@ fn parse_clicks(
             queued.push((name, hash, index));
             if queued.len() == 16 { drain(&mut queued,pending); }
         }
+        if pending.len() % 128 == 0 {
+            if let Some(links) = ready.or_else(|| shared.links.get()) {
+                ready = Some(links);
+                drain(&mut queued, pending);
+                scatter_clicks(shared, links, pending, out);
+                pending.clear();
+            }
+        }
     });
     drain(&mut queued,pending);
     let links = loop {
@@ -856,22 +884,7 @@ fn parse_clicks(
             None => std::thread::yield_now(),
         }
     };
-    for at in 0..pending.len() {
-        if let Some(ahead) = pending.get(at + shared.ahead) {
-            links.prefetch(ahead.user);
-        }
-        let click = pending[at];
-        let person = links.person(click.user);
-        out.buckets.push(
-            person_part(person, shared.person_bits),
-            Click {
-                person,
-                id: click.id,
-                ts: click.ts,
-                campaign: click.campaign,
-            },
-        );
-    }
+    scatter_clicks(shared, links, pending, out);
 }
 
 type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
