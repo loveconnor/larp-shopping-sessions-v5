@@ -718,18 +718,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
-        let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
-        if ingest == ts::BAD {
-            return;
-        }
+        let (p,n) = field(2);
+        let at = ts::parse(p,n,dates);
+        let (p,n) = field(3);
+        let Some((ingest,timely)) = ts::ingestion_key(p,n,at,shared.first_day-1,dates,&mut out.overflow_times) else { return; };
         let (name,n) = field(1);
         let deferred = n == 33 && shared.defer_long_events;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         let user = if user == 0 { 0 } else { user ^ copy };
-        let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -741,7 +738,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             && field(5).1 > 0
             && at >= window_start
             && at < window_end
-            && ingest - at <= DAY;
+            && timely;
         let mut payload = 0;
         if purchase && valid {
             let (p, n) = field(6);
@@ -758,7 +755,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
+            ingest,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
@@ -979,9 +976,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             let earlier = if (a | b) < OVERFLOW_TIME {
                                 a < b
                             } else {
-                                let origin = shared.window_start - DAY;
-                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
-                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                let origin = shared.first_day - 1;
+                                ts::expand_ingestion(a, origin, &sources[owners[index]].overflow_times)
+                                    < ts::expand_ingestion(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
                             };
                             if earlier {
                                 (*other).ts = DEAD;

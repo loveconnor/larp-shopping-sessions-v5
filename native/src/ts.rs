@@ -239,6 +239,51 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Preserve chronological order without evaluating three decimal clock
+/// pairs on every event. The common same-date latency check is immediate.
+#[inline(always)]
+pub unsafe fn ingestion_key(p:*const u8, n:usize, at:i64, origin_day:i64, dates:&mut Dates,
+                            overflow:&mut Vec<i64>) -> Option<(u32,bool)> {
+    const DAY:i64 = 86_400_000;
+    #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+    if n == 20 && unsafe { *p.add(19) } == b'Z' {
+        let raw = unsafe { load64(p) };
+        let dd = unsafe { load32(p.add(8)) } & 0x00ff_ffff;
+        let a=dd&15; let b=(dd>>8)&15;
+        let slot=(a*10+b) as usize;
+        if dd & 0xfff0f0 == 0x543030 && a<=9 && b<=9 && raw != 0 && dates.month[slot] == raw {
+            let midnight=dates.midnight[slot]*1000;
+            let day=(midnight/ DAY).wrapping_sub(origin_day) as u64;
+            let text=unsafe { load64(p.add(11)) };
+            let digits=text ^ u64::from_le_bytes(*b"00:00:00");
+            let clock=unsafe { std::arch::x86_64::_pext_u64(text.swap_bytes(),0x0f0f_000f_0f00_0f0f) } as u32;
+            if day < 128 && (digits.wrapping_add(0x7676_7f76_767f_7676)|digits)&HIGH == 0 &&
+                clock >> 16 <= 0x23 && (clock >> 8) & 255 <= 0x59 && clock & 255 <= 0x59 {
+                let key=((day as u32)<<24)|clock;
+                let timely= at>=midnight || (at>=midnight-DAY && bcd_seconds(clock)*1000 <= at-(midnight-DAY));
+                return Some((key,timely));
+            }
+        }
+    }
+    let ms=unsafe { parse(p,n,dates) };
+    if ms==BAD {return None;}
+    let index=u32::try_from(overflow.len()).expect("ingestion overflow table");
+    assert!(index < (1<<31));
+    overflow.push(ms);
+    Some(((1<<31)|index,at!=BAD && ms.saturating_sub(at)<=DAY))
+}
+
+#[inline(always)]
+fn bcd_seconds(clock:u32)->i64 {
+    let pair=|v:u32| i64::from(10*((v>>4)&15)+(v&15));
+    pair(clock>>16)*3600+pair(clock>>8)*60+pair(clock)
+}
+
+pub fn expand_ingestion(key:u32, origin_day:i64, overflow:&[i64])->i64 {
+    if key & (1<<31) != 0 { return overflow[(key ^ (1<<31)) as usize]; }
+    (origin_day+i64::from(key>>24))*86_400_000 + bcd_seconds(key)*1000
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
