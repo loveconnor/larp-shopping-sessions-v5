@@ -298,12 +298,28 @@ unsafe fn wide_positions(bits: u64, base: u16, out: *mut u16) -> usize {
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
 
+#[derive(Clone, Copy)]
+pub enum Separators<'a, const N: usize> {
+    Window(&'a [u16; N]),
+    Full(&'a [u32; N]),
+}
+
+impl<const N: usize> Separators<'_, N> {
+    #[inline(always)]
+    fn at(self, index: usize) -> u32 {
+        match self {
+            Self::Window(fields) => u32::from(fields[index]),
+            Self::Full(fields) => fields[index],
+        }
+    }
+}
+
 /// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
 #[inline(always)]
-pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (u32, u32) {
+pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: Separators<'_, N>, at: usize) -> (u32, u32) {
     unsafe {
-        let from = if at == 0 { start } else { *seps.get_unchecked(at - 1) + 1 };
-        let to = *seps.get_unchecked(at);
+        let from = if at == 0 { start } else { seps.at(at - 1) + 1 };
+        let to = seps.at(at);
         // In a well-formed line a field that starts with a quote ends with one.
         let quoted = u32::from(*buf.add(from as usize) == b'"');
         (from + quoted, to - quoted)
@@ -312,7 +328,7 @@ pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N]
 
 /// Field `at` of a line from `raw_lines`, without its quotes: (first byte, length).
 #[inline(always)]
-pub unsafe fn field<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (*const u8, usize) {
+pub unsafe fn field<const N: usize>(buf: *const u8, start: u32, seps: Separators<'_, N>, at: usize) -> (*const u8, usize) {
     unsafe {
         let (from, to) = bounds(buf, start, seps, at);
         (buf.add(from as usize), (to - from) as usize)
@@ -529,7 +545,7 @@ impl Block {
     /// breaks one of these sends its lines down the old path, which says
     /// exactly which are wrong.
     #[inline(always)]
-    pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, Separators<'_, N>)) {
         #[cfg(all(target_arch = "x86_64", not(feature = "narrow-v4")))]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
             return unsafe { self.raw_wide(visit) };
@@ -539,12 +555,12 @@ impl Block {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512bw,avx512vbmi2")]
-    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, Separators<'_, N>)) {
         self.raw_indexed::<N, true>(visit)
     }
 
     #[inline(always)]
-    fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, Separators<'_, N>)) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -576,7 +592,7 @@ impl Block {
                     let rest = std::slice::from_raw_parts(buf.add(origin as usize), (end - origin) as usize);
                     let Some(length) = rest.iter().position(|&b| b == b'\n') else { break; };
                     if let Some(found) = Self::split_line::<N>(buf, origin as usize) {
-                        visit(buf, origin, &found);
+                        visit(buf, origin, Separators::Full(&found));
                     }
                     line = origin + length as u32 + 1;
                     at = line;
@@ -655,8 +671,8 @@ impl Block {
                     let clean = *bad.get_unchecked(bad_at) > stop;
                     let relative_stop = (stop - origin) as u16;
                     if *out.add(sep_at + N - 1) == relative_stop && clean {
-                        let found: [u32; N] = std::array::from_fn(|i| origin + u32::from(*out.add(sep_at + i)));
-                        visit(buf, start, &found);
+                        let fields = &*out.add(sep_at).cast::<[u16; N]>();
+                        visit(buf.add(origin as usize), start - origin, Separators::Window(fields));
                         sep_at += N;
                         continue;
                     }
@@ -666,7 +682,7 @@ impl Block {
                     sep_at += 1;
                     if !clean {
                         if let Some(found) = Self::split_line::<N>(buf, start as usize) {
-                            visit(buf, start, &found);
+                            visit(buf, start, Separators::Full(&found));
                         }
                     }
                 }
