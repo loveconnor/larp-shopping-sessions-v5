@@ -23,9 +23,9 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     mkdir -p /app && \
     if [ "$TARGETARCH" = amd64 ]; then \
         apt-get update && apt-get install -y --no-install-recommends patch && \
-        for level in base v3 v4 n4 wide p19; do \
+        for level in base v3 v4 n4 wide istr p19; do \
             cpu=x86-64-$level; profile=v5; features=; build_features=; \
-            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; n4) profile=n4; cpu=x86-64-v4; build_features="--features narrow-v4" ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; p19) patch -p2 < platform/register-merge.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
+            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; n4) profile=n4; cpu=x86-64-v4; build_features="--features narrow-v4" ;; wide) patch -p2 < platform/wide.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; istr) patch -p2 < platform/register-merge.patch || exit 1; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; p19) cpu=x86-64-v4; export RUSTC_BOOTSTRAP=1; features="-Ztune-cpu=znver4 -C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
             RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release $build_features --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
