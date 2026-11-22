@@ -57,6 +57,7 @@ jobs:
               for trial in 1 2 3; do
                 CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 "$binary"
               done
+              cp "$binary" /profile/engine
               ls -lh /profile
               test -x "$binary"
               echo "Sampled engine $binary"
@@ -65,6 +66,36 @@ jobs:
               head -65 /profile/lines.txt
               head -45 /profile/functions.txt
             '
+      - name: Resolve sampled instructions separately for each process address space
+        shell: python
+        run: |
+          import collections, os, pathlib, re, struct, subprocess
+          d = pathlib.Path(os.environ["RUNNER_TEMP"]) / "profile"
+          counts = collections.Counter()
+          total = 0
+          for f in d.glob("cpu-*"):
+              data = f.read_bytes()
+              words = struct.iter_unpack("<Q",data[:len(data)//8*8])
+              for i in range(5): next(words)
+              leaves = []
+              while True:
+                  n, depth = next(words)[0], next(words)[0]
+                  ips = [next(words)[0] for i in range(depth)]
+                  if ips == [0]: break
+                  leaves.append((n,ips[0]))
+              segments = [(int(a,16),int(b,16),int(off,16)) for a,b,off in re.findall(rb"(?m)^([a-f0-9]+)-([a-f0-9]+) r-xp ([a-f0-9]+) .*?/app/shopping-sessions[^\n]*",data)]
+              assert segments, f
+              for n,ip in leaves:
+                  total += n
+                  for a,b,off in segments:
+                      if a <= ip < b: counts[ip-a+off] += n
+          ips = list(counts)
+          locs = subprocess.check_output(["addr2line","-e",str(d/"engine")],input="".join(f"{ip:x}\n" for ip in ips),text=True).splitlines()
+          grouped = collections.Counter()
+          for ip,loc in zip(ips,locs): grouped[loc]+=counts[ip]
+          result = "\n".join(f"{n:5} {100*n/total:5.1f}%  {loc}" for loc,n in grouped.most_common(50))
+          print(f"{sum(counts.values())}/{total} leaf samples in the pipeline executable\n"+result)
+          (d/"hot-lines.txt").write_text(result)
       - uses: actions/upload-artifact@v4
         if: always()
         with:
