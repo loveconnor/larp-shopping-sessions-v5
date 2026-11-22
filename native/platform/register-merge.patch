@@ -1,15 +1,17 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 4b7bb4e..85bdad4 100644
+index 4b7bb4e..1744484 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -1331,38 +1331,160 @@ unsafe fn sort_short_times(values: &mut [u64]) {
+@@ -1331,38 +1331,194 @@ unsafe fn sort_short_times(values: &mut [u64]) {
      write(24,finish(_mm512_max_epu64(ah,bh)));
  }
  
+-#[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
+-fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
 +#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 +#[inline]
 +unsafe fn merge_histories<const REGISTERS: usize>(values: &mut [u64]) {
-+    use std::arch::x86_64::*;
+     use std::arch::x86_64::*;
 +    let half = 8 * REGISTERS;
 +    debug_assert!(values.len() > half && values.len() <= 2 * half);
 +    let (left, right) = values.split_at_mut(half);
@@ -71,10 +73,9 @@ index 4b7bb4e..85bdad4 100644
 +    }
 +}
 +
- #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
--fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
-+fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
-     use std::arch::x86_64::*;
++#[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
++fn sort_initial_run(values: &mut [u64]) {
++    debug_assert!(values.len() <= 128);
      let n=values.len();
      if n<=32 {
          if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
@@ -84,7 +85,27 @@ index 4b7bb4e..85bdad4 100644
 -    let (a,b,c)=(values[0],values[n/2],values[n-1]);
 -    let pivot=a.min(b).max(a.max(b).min(c));
 -    let (mut lo,mut hi)=(0,n);
--    unsafe {
++    if n <= 128 {
++        unsafe {
++            if n <= 64 { sort_up_to_64(values); }
++            else {
++                let (left, right) = values.split_at_mut(64);
++                sort_up_to_64(left);
++                sort_up_to_64(right);
++                merge_histories::<8>(values);
++            }
++        }
++        return;
++    }
++}
++
++#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
++fn merge_clock_runs(left: &[u64], right: &[u64], tmp: &mut [u64]) {
++    use std::arch::x86_64::*;
++    let n = left.len() + right.len();
++    // Both input runs are sorted. Merge eight values at a time while carrying
++    // the larger eight lanes forward, and write the last partial block exactly.
+     unsafe {
 -        let bound=_mm512_set1_epi64(pivot as i64);
 -        for i in (0..n).step_by(8) {
 -            let count=(n-i).min(8);
@@ -96,26 +117,6 @@ index 4b7bb4e..85bdad4 100644
 -            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(lo).cast(),below,v);
 -            _mm512_mask_compressstoreu_epi64(tmp.as_mut_ptr().add(hi).cast(),valid & !below,v);
 -            lo+=small;
-+    if n <= 128 {
-+        unsafe {
-+            if n <= 64 { sort_up_to_64(values); }
-+            else {
-+                let (left, right) = values.split_at_mut(64);
-+                sort_up_to_64(left);
-+                sort_up_to_64(right);
-+                merge_histories::<8>(values);
-+            }
-         }
-+        return;
-+    }
-+    let middle = n.next_power_of_two() / 2;
-+    let (left, right) = values.split_at_mut(middle);
-+    let (left_scratch, right_scratch) = tmp.split_at_mut(middle);
-+    sort_medium_times(left, left_scratch);
-+    sort_medium_times(right, right_scratch);
-+    // Both input runs are sorted. Merge eight values at a time while carrying
-+    // the larger eight lanes forward, and write the last partial block exactly.
-+    unsafe {
 +        let finish = |v| {
 +            let other = _mm512_permutexvar_epi64(_mm512_setr_epi64(4,5,6,7,0,1,2,3), v);
 +            let v = _mm512_mask_max_epu64(_mm512_min_epu64(v,other),0xf0,v,other);
@@ -147,13 +148,41 @@ index 4b7bb4e..85bdad4 100644
 +        }
 +        let mask = (0xffu16 >> (8 - (n - written))) as u8;
 +        _mm512_mask_storeu_epi64(tmp.as_mut_ptr().add(written).cast(), mask, carry);
-     }
--    if lo==0 || lo==n { values.sort_unstable(); return; }
-     values.copy_from_slice(&tmp[..n]);
--    let (left,right)=values.split_at_mut(lo);
--    let (l,r)=tmp.split_at_mut(lo);
--    sort_medium_times(left,l,depth-1);
--    sort_medium_times(right,r,depth-1);
++    }
++}
++
++#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
++fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
++    const RUN: usize = 128;
++    let n = values.len();
++    if n <= 64 {
++        if n < 5 { values.sort_unstable(); }
++        else { unsafe { sort_up_to_64(values); } }
++        return;
++    }
++    if n <= RUN { sort_initial_run(values); return; }
++    for run in values.chunks_mut(RUN) { sort_initial_run(run); }
++    let scratch = &mut tmp[..n];
++    let mut width = RUN;
++    let mut in_scratch = false;
++    while width < n {
++        let (source, target) = if in_scratch {
++            (&scratch[..], &mut values[..])
++        } else {
++            (&values[..], &mut scratch[..])
++        };
++        for (block, destination) in source.chunks(2*width).zip(target.chunks_mut(2*width)) {
++            if block.len() <= width {
++                destination.copy_from_slice(block);
++            } else {
++                let (left, right) = block.split_at(width);
++                merge_clock_runs(left, right, destination);
++            }
++        }
++        in_scratch = !in_scratch;
++        width *= 2;
++    }
++    if in_scratch { values.copy_from_slice(scratch); }
 +}
 +
 +#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
@@ -180,12 +209,18 @@ index 4b7bb4e..85bdad4 100644
 +            sort_medium_times(values, &mut vec![0; n]);
 +            assert_eq!(values, reference, "length={n} mode={mode}");
 +            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
-+        }
-+    }
+         }
+     }
+-    if lo==0 || lo==n { values.sort_unstable(); return; }
+-    values.copy_from_slice(&tmp[..n]);
+-    let (left,right)=values.split_at_mut(lo);
+-    let (l,r)=tmp.split_at_mut(lo);
+-    sort_medium_times(left,l,depth-1);
+-    sort_medium_times(right,r,depth-1);
  }
  
  fn session_worker(
-@@ -1563,7 +1685,7 @@ fn session_worker(
+@@ -1563,7 +1719,7 @@ fn session_worker(
                      if mine.len() >= 5 {unsafe {sort_short_times(mine)}} else {mine.sort_unstable();}
                  } else {
                      if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
