@@ -1,39 +1,39 @@
-name: Train target-specific profiles using Rust 1.100 and LLVM 23
+name: Collect matched profiles for the seven-delimiter parser
 on:
   push:
-    branches: [bench/llvm23-training]
+    branches: [bench/seven-delimiter-training]
 permissions:
   contents: read
 jobs:
   profile:
     strategy:
       matrix:
-        seed: [385817, 385819, 385831, 385837]
+        seed: [606371, 606379, 606383, 606389, 606401, 606427]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
+          ref: a057b4a6243282ef33ea848a5c33157f2a50aa81
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
-          grep -qw avx512bw /proc/cpuinfo || exit 0
           cd "$RUNNER_TEMP"
           curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
           rows=20000000
-          if [ ${{ matrix.seed }} -ge 385830 ]; then rows=60000000; fi
+          if [ ${{ matrix.seed }} -ge 606385 ]; then rows=60000000; fi
           generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
           mkdir "$RUNNER_TEMP/profile"
-          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.100-slim-bookworm sh -ec '
+          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
             cp -a /src /tmp/native
             cd /tmp/native
             apt-get update -qq && apt-get install -yq --no-install-recommends patch
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
-            for level in v4 n4 wide; do
+            if grep -qw avx512bw /proc/cpuinfo; then levels=n4; else levels=v3; fi
+            for level in $levels; do
               cpu=x86-64-$level
               feature=
               build_features=
