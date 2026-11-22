@@ -655,10 +655,42 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+/// Worker-local storage for identifiers needed again during deduplication or
+/// click tie-breaking. Appending a page leaves earlier identifier bytes in place.
+#[derive(Default)]
+struct LongIds {
+    pages: Vec<Vec<[u8; 33]>>,
+    len: usize,
+}
+
+impl LongIds {
+    const PER_PAGE: usize = 2048;
+
+    #[inline(always)]
+    fn push(&mut self, id: [u8; 33]) -> u32 {
+        let index = u32::try_from(self.len).expect("too many long IDs in one worker");
+        if self.len % Self::PER_PAGE == 0 {
+            self.pages.push(Vec::with_capacity(Self::PER_PAGE));
+        }
+        self.pages.last_mut().unwrap().push(id);
+        self.len += 1;
+        index
+    }
+}
+
+impl std::ops::Index<usize> for LongIds {
+    type Output = [u8; 33];
+
+    #[inline(always)]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.pages[index / Self::PER_PAGE][index % Self::PER_PAGE]
+    }
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: LongIds,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -707,8 +739,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let index = out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -777,7 +808,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
 
 struct ClickSource {
     buckets: Buckets<Click>,
-    names: Vec<[u8; 33]>,
+    names: LongIds,
     worker: usize,
 }
 
@@ -816,8 +847,7 @@ fn parse_clicks(
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
-            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-            out.names.push(*p.cast::<[u8; 33]>());
+            let index = out.names.push(*p.cast::<[u8; 33]>());
             LONG_EVENT | (out.worker as u64) << 32 | index as u64
         } else {
             keys::pack(p, n)
@@ -897,10 +927,10 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
-        names: Vec::new(),
+        names: LongIds::default(),
         overflow_times: Vec::new(),
     };
-    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
+    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: LongIds::default(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
