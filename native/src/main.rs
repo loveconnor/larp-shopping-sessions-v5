@@ -588,9 +588,9 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
+fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize) -> io::Result<Vec<(u64, u64)>> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for path in &shared.link_files {
+    for path in shared.link_files.iter().skip(worker).step_by(threads) {
         let source = Source::open(path, true)?;
         let size = source.size;
         let mut start = 0;
@@ -625,7 +625,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
         }
     }
     pairs.retain(|&(a,b)| a != 0 && b != 0 && a != b);
-    Ok(Links::build(&pairs))
+    Ok(pairs)
 }
 
 #[inline(always)]
@@ -874,17 +874,26 @@ fn parse_clicks(
     }
 }
 
-fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
+type LinkShards = std::sync::Mutex<Vec<Vec<(u64, u64)>>>;
+
+fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkShards) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
-    if worker == 0 {
-        // The other threads wait on this table, so a failure must not leave them waiting.
-        let began = Instant::now();
-        let links = read_links(shared, &mut block).unwrap_or_else(|error| {
-            eprintln!("links: {error}");
-            std::process::exit(1);
-        });
-        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
+    let began = Instant::now();
+    let own = read_links(shared, &mut block, worker, threads).unwrap_or_else(|error| {
+        eprintln!("links: {error}");
+        std::process::exit(1);
+    });
+    let ready = {
+        let mut parts = shards.lock().unwrap();
+        parts.push(own);
+        (parts.len() == threads).then(|| std::mem::take(&mut *parts))
+    };
+    if let Some(parts) = ready {
+        let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for mut shard in parts { pairs.append(&mut shard); }
+        let links = Links::build(&pairs);
         let _ = shared.links.set(links);
+        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
@@ -1655,9 +1664,10 @@ fn main() -> io::Result<()> {
     let shared = &shared;
     let setup = began.elapsed();
 
+    let shards = &LinkShards::default();
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
+            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
             .collect();
         handles
             .into_iter()
