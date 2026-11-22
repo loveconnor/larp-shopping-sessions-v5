@@ -273,7 +273,7 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
-const WINDOW: usize = 64;
+const WINDOW: usize = 128;
 
 /// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
 #[inline(always)]

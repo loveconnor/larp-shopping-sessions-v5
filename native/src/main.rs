@@ -44,7 +44,7 @@ const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
 const GROUP_ROWS: usize = 1 << 17;
 /// How many records ahead to prefetch a links lookup.
-const AHEAD: usize = 16;
+const AHEAD: usize = 32;
 
 // ---------------------------------------------------------------- buckets
 
