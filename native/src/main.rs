@@ -1665,51 +1665,48 @@ fn main() -> io::Result<()> {
     let setup = began.elapsed();
 
     let shards = &LinkShards::default();
-    let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread, threads, shards)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<io::Result<Vec<_>>>()
-    })?;
-    let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
-    let parse = began.elapsed();
+    let rendezvous = std::sync::Barrier::new(threads);
+    let parsed = OnceLock::new();
+    let routed = OnceLock::new();
+    let input = std::sync::Mutex::new(Vec::with_capacity(threads));
+    let output = std::sync::Mutex::new(Vec::with_capacity(threads));
+    let next_id = AtomicUsize::new(0);
+    let next_person = AtomicUsize::new(0);
 
-    let next = AtomicUsize::new(0);
-    let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
-    let dedup = began.elapsed();
-    let parsed_events = &parsed_events;
-
-    // Biggest person buckets first, so a whale's is never the last one running.
-    let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
-    let weight = |part: u32| {
-        events
-            .iter()
-            .map(|buckets| buckets.chunks[part as usize] as u64)
-            .sum::<u64>()
+    let pipeline = |worker| -> io::Result<(Vec<Totals>,bool)> {
+        let rows = parse_worker(shared,worker,threads,shards);
+        input.lock().unwrap().push((worker,rows));
+        if rendezvous.wait().is_leader() {
+            let mut collected = std::mem::take(&mut *input.lock().unwrap());
+            // Long click spellings are addressed by their original producer.
+            collected.sort_unstable_by_key(|(worker,_)| *worker);
+            let rows: io::Result<(Vec<EventSource>,Vec<ClickSource>)> =
+                collected.into_iter().map(|(_,result)| result).collect::<io::Result<Vec<_>>>()
+                    .map(|rows| rows.into_iter().unzip());
+            let _ = parsed.set((began.elapsed(),rows));
+        }
+        let (_,rows) = parsed.wait();
+        let (parsed_events,clicks) = rows.as_ref().map_err(|e| io::Error::new(e.kind(),e.to_string()))?;
+        let events = dedup_worker(shared,parsed_events,&next_id);
+        output.lock().unwrap().push(events);
+        if rendezvous.wait().is_leader() {
+            let events = std::mem::take(&mut *output.lock().unwrap());
+            let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
+            order.sort_by_cached_key(|&part| std::cmp::Reverse(
+                events.iter().map(|b| b.chunks[part as usize] as u64).sum::<u64>()));
+            let _ = routed.set((began.elapsed(),events,order));
+        }
+        let (_,events,order) = routed.wait();
+        session_worker(shared,events,clicks,order,&next_person,worker)
     };
-    order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
-    let order = &order;
-    let next = AtomicUsize::new(0);
-    let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| {
-                let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<io::Result<Vec<_>>>()
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads).map(|i| scope.spawn(move || pipeline(i))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<io::Result<Vec<_>>>()
     })?;
+    let (parse, rows) = parsed.into_inner().unwrap();
+    let (parsed_events, clicks) = rows?;
+    let parsed_events = &parsed_events;
+    let (dedup,events,_) = routed.into_inner().unwrap();
     let sessions = began.elapsed();
 
     let empty_result = !results.iter().any(|result| result.1);
