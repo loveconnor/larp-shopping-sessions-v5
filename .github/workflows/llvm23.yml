@@ -1,14 +1,14 @@
-name: Collect matched profiles for the seven-delimiter parser
+name: Train practice- and final-size profiles on matching native machines
 on:
   push:
-    branches: [bench/seven-delimiter-training]
+    branches: [bench/size-specific-profiles]
 permissions:
   contents: read
 jobs:
   profile:
     strategy:
       matrix:
-        seed: [606371, 606379, 606383, 606389, 606401, 606427]
+        seed: [311951, 311957, 311963, 311981]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,9 +22,9 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo build --release --locked --manifest-path generator/Cargo.toml
-          rows=20000000
-          if [ ${{ matrix.seed }} -ge 606385 ]; then rows=60000000; fi
-          generator/target/release/generate --seed ${{ matrix.seed }} --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train"
+          for rows in 20000000 60000000; do
+            generator/target/release/generate --seed "$(( ${{ matrix.seed }} + rows / 1000 ))" --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/train-$rows"
+          done
           mkdir "$RUNNER_TEMP/profile"
           docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
             cp -a /src /tmp/native
@@ -32,7 +32,11 @@ jobs:
             apt-get update -qq && apt-get install -yq --no-install-recommends patch
             rustup component add llvm-tools-preview
             merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
-            if grep -qw avx512bw /proc/cpuinfo; then levels=n4; else levels=v3; fi
+            levels=v3
+            if grep -qw avx512bw /proc/cpuinfo; then
+              levels=n4
+              if grep -qw avx512_vbmi2 /proc/cpuinfo; then levels="n4 wide"; fi
+            fi
             for level in $levels; do
               cpu=x86-64-$level
               feature=
@@ -47,10 +51,12 @@ jobs:
                 cpu=x86-64-v4
                 feature="-C target-feature=+avx512vbmi2"
               fi
-              mkdir /work/profile/$level
-              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/work/profile/$level" cargo build --release --locked $build_features --target x86_64-unknown-linux-gnu
-              NCPU=8 DATA_DIR=/work/train OUTPUT_DIR=/work/out-$level target/x86_64-unknown-linux-gnu/release/shopping-sessions
-              "$merger" merge --sparse /work/profile/$level/*.profraw -o /work/profile/$level.profdata
+              RUSTFLAGS="-C target-cpu=$cpu $feature -Cprofile-generate=/tmp/profile" cargo build --release --locked $build_features --target x86_64-unknown-linux-gnu
+              for rows in 20000000 60000000; do
+                mkdir -p /work/profile/$level-$rows
+                LLVM_PROFILE_FILE="/work/profile/$level-$rows/%m.profraw" NCPU=8 DATA_DIR="/work/train-$rows" OUTPUT_DIR="/work/out-$level-$rows" target/x86_64-unknown-linux-gnu/release/shopping-sessions
+                "$merger" merge --sparse /work/profile/$level-$rows/*.profraw -o /work/profile/$level-$rows.profdata
+              done
             done
           '
       - uses: actions/upload-artifact@v4
