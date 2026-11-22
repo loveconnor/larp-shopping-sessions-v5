@@ -273,7 +273,7 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
-const WINDOW: usize = 64;
+const WINDOW: usize = 48;
 
 /// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
 #[inline(always)]
@@ -593,9 +593,9 @@ impl Block {
                         }
                     }
                     #[cfg(target_arch = "x86_64")]
-                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<7>(sep, at, out.add(count)) };
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<5>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
-                    let positions = flatten::<7>(sep, at, out.add(count));
+                    let positions = flatten::<5>(sep, at, out.add(count));
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
