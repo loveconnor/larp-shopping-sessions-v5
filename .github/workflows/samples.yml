@@ -1,7 +1,7 @@
-name: Sample guarded parser and session aggregation
+name: Sample selected AVX2 and pre-VBMI2 native hot paths
 on:
   push:
-    branches: [bench/guarded-samples]
+    branches: [bench/narrow-instruction-samples]
 permissions:
   contents: read
 jobs:
@@ -12,13 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 856919}
-          - {events: 60000000, format: current, seed: 856919}
+          - {events: 20000000, format: current, seed: 797819}
+          - {events: 60000000, format: current, seed: 797819}
+          - {events: 20000000, format: current, seed: 165511}
+          - {events: 60000000, format: current, seed: 165511}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+      RANKED: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +55,9 @@ jobs:
           chmod 777 sampled-out profile
           docker run --rm -v "$RUNNER_TEMP/data:/data:ro" -v "$RUNNER_TEMP/profile:/profile" \
             -v "$RUNNER_TEMP/sampled-out:/output" -e NCPU=8 sampled sh -ec '
-              binary=$(/app/shopping-sessions)
+              binary=/app/shopping-sessions.v3
+              if grep -qw avx512bw /proc/cpuinfo; then binary=/app/shopping-sessions.n4; fi
+              echo "$binary" > /profile/engine-name.txt
               test -x "$binary"
               for trial in 1 2 3; do
                 CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 "$binary"
@@ -109,5 +113,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-cpu-samples-${{ matrix.events }}
+          name: native-cpu-samples-${{ matrix.events }}-${{ matrix.seed }}
           path: ${{ runner.temp }}/profile/
