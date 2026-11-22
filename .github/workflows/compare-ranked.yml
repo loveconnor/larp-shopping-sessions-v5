@@ -51,9 +51,43 @@ jobs:
       - name: Sample the scored pipeline on native hardware
         run: |
           cd "$RUNNER_TEMP"
-          sudo apt-get update -qq
-          sudo apt-get install -y google-perftools libgoogle-perftools4t64 || sudo apt-get install -y google-perftools
+          cat > sample.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <link.h>
+          #include <signal.h>
+          #include <stdint.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/time.h>
+          #include <ucontext.h>
+          static uintptr_t base;
+          static int fd;
+          static int main_image(struct dl_phdr_info *p,size_t n,void *arg) {
+              if (!*p->dlpi_name) { base=p->dlpi_addr; return 1; }
+              return 0;
+          }
+          static void sample(int sig,siginfo_t *info,void *ctx) {
+              uintptr_t pc=((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP]-base;
+              write(fd,&pc,sizeof(pc));
+          }
+          __attribute__((constructor)) static void start(void) {
+              dl_iterate_phdr(main_image,0);
+              fd=open("sample.pc",O_WRONLY|O_CREAT|O_TRUNC|O_APPEND,0600);
+              struct sigaction sa={.sa_sigaction=sample,.sa_flags=SA_SIGINFO|SA_RESTART};
+              sigaction(SIGPROF,&sa,0);
+              struct itimerval timer={{0,1000},{0,1000}};
+              setitimer(ITIMER_PROF,&timer,0);
+          }
+          EOF
+          gcc -O2 -shared -fPIC sample.c -o sample.so
           mkdir prof-out
-          CPUPROFILE_FREQUENCY=1000 CPUPROFILE="$PWD/samples.prof" LD_PRELOAD=libprofiler.so.0 DATA_DIR="$PWD/data" OUTPUT_DIR="$PWD/prof-out" NCPU="$(nproc)" "$PWD/ranked"
-          google-pprof --text "$PWD/ranked" "$PWD/samples.prof" | sed -n '1,45p'
-          google-pprof --lines --text "$PWD/ranked" "$PWD/samples.prof" | sed -n '1,70p'
+          LD_PRELOAD="$PWD/sample.so" DATA_DIR="$PWD/data" OUTPUT_DIR="$PWD/prof-out" NCPU="$(nproc)" "$PWD/ranked"
+          python - <<'PYTHON'
+          import array,collections,subprocess
+          a=array.array("Q")
+          a.frombytes(open("sample.pc","rb").read())
+          data=subprocess.check_output(["addr2line","-C","-f","-e","ranked"],input="".join(f"{x:x}\n" for x in a),text=True).splitlines()
+          print("SAMPLES",len(a))
+          for k,v in collections.Counter(data[::2]).most_common(25): print("FUNC",v,k)
+          for k,v in collections.Counter(data[1::2]).most_common(40): print("LINE",v,k)
+          PYTHON
