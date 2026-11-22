@@ -112,7 +112,7 @@ impl Source {
 /// 4 KB pages and hardware prefetchers stop at each page's end; on the Intel
 /// machines this was measured on, reading ahead by hand made the scan up to
 /// twice as fast, and it cost nothing where it did not help.
-const READ_AHEAD: usize = 1024;
+const READ_AHEAD: usize = 512;
 
 #[inline(always)]
 fn fetch(target: *const u8) {
@@ -273,7 +273,7 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
-const WINDOW: usize = 64;
+const WINDOW: usize = 40;
 
 /// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
 #[inline(always)]
