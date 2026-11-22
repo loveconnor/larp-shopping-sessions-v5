@@ -199,10 +199,11 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
         let mut widths = [0u8; BLOCK / MINI];
         for mini in 0..minis {
             let end = ((mini + 1) * MINI).min(count);
-            let most = deltas[mini * MINI..end]
+            // The highest set bit of the union is the width of the largest offset.
+            let bits_used = deltas[mini * MINI..end]
                 .iter()
-                .fold(0u64, |most, &delta| most.max(delta.wrapping_sub(least) as u64));
-            widths[mini] = width(most) as u8;
+                .fold(0u64, |bits, &delta| bits | delta.wrapping_sub(least) as u64);
+            widths[mini] = width(bits_used) as u8;
         }
         out.extend_from_slice(&widths);
         for mini in 0..minis {
