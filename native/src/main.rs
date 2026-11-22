@@ -188,7 +188,7 @@ impl<T: Copy> Buckets<T> {
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
-#[repr(C, packed(4))]
+#[repr(C, align(32))]
 struct Parsed {
     id: u64,
     user: u64,
@@ -198,6 +198,7 @@ struct Parsed {
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
     payload: u32,
+    probe_hash: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -758,6 +759,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
+            probe_hash: (partition_hash >> 24) as u32,
             ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
@@ -951,8 +953,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut slot = (*record).probe_hash as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
