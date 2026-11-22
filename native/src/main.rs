@@ -597,34 +597,41 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
         while start < size {
             let end = (start + LINK_BLOCK).min(size);
             block.load(&source, start, end)?;
-            let mut queued = Vec::with_capacity(32);
-            let drain = |queued: &mut Vec<(*const u8, u64, usize, bool)>, pairs: &mut Vec<(u64,u64)>| {
-                for (name, hash, row, right) in queued.drain(..) {
-                    let user = unsafe { keys::finish_long_user(name, hash) };
-                    if right { pairs[row].1 = user; } else { pairs[row].0 = user; }
+            const ROWS: usize = 48;
+            let mut staged = [[0u64; 2]; ROWS];
+            let mut pending = [(std::ptr::null::<u8>(), 0u64, 0usize); 2 * ROWS];
+            let mut count = 0;
+            let mut deferred = 0;
+            let drain = |staged: &mut [[u64; 2]], pending: &[(*const u8, u64, usize)], pairs: &mut Vec<(u64, u64)>| {
+                for &(name, hash, slot) in pending {
+                    staged[slot / 2][slot % 2] = unsafe { keys::finish_long_user(name, hash) };
                 }
+                pairs.extend(staged.iter().filter(|p| p[0] != p[1]).map(|p| (p[0], p[1])));
             };
             block.raw_lines::<2>(|buf, start, seps| unsafe {
-                let (left, nl) = scan::field(buf, start, seps, 0);
-                let (right, nr) = scan::field(buf, start, seps, 1);
-                if nl == 0 || nr == 0 { return; }
-                let row = pairs.len();
-                let mut user = |p,n,is_right| {
-                    if n == 33 && shared.defer_long_events {
-                        queued.push((p, keys::prepare_long_user(p), row, is_right));
-                        1
-                    } else { keys::pack_user(p,n) }
-                };
-                let a = user(left,nl,false);
-                let b = user(right,nr,true);
-                pairs.push((a,b));
-                if queued.len() >= 30 { drain(&mut queued, &mut pairs); }
+                let left = scan::field(buf, start, seps, 0);
+                let right = scan::field(buf, start, seps, 1);
+                if left.1 == 0 || right.1 == 0 { return; }
+                for (side, (name, len)) in [left, right].into_iter().enumerate() {
+                    staged[count][side] = if len == 33 && shared.defer_long_events {
+                        pending[deferred] = (name, keys::prepare_long_user(name), 2 * count + side);
+                        deferred += 1;
+                        0
+                    } else {
+                        keys::pack_user(name, len)
+                    };
+                }
+                count += 1;
+                if count == ROWS {
+                    drain(&mut staged, &pending[..deferred], &mut pairs);
+                    count = 0;
+                    deferred = 0;
+                }
             });
-            drain(&mut queued, &mut pairs);
+            drain(&mut staged[..count], &pending[..deferred], &mut pairs);
             start = end;
         }
     }
-    pairs.retain(|&(a,b)| a != 0 && b != 0 && a != b);
     Ok(pairs)
 }
 
