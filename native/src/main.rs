@@ -192,12 +192,8 @@ impl<T: Copy> Buckets<T> {
 struct Parsed {
     id: u64,
     user: u64,
-    /// Offset from the ingest origin, or a tagged index into the worker’s overflow times.
-    ingest: u32,
-    /// Milliseconds after `window_start`, or `DEAD`.
-    ts: u32,
-    /// 0, or for a purchase its category in the top 8 bits and price below.
-    payload: u32,
+    clock: u32,
+    data: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -656,33 +652,54 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
-    overflow_times: Vec<i64>,
+    overflow_times: Vec<(i64, u32, u32)>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
 }
 
-// Inline offsets cover nearly 25 days starting one day before the window.
-// Other timestamps retain all 64 bits in the parsing worker's side table.
-const OVERFLOW_TIME: u32 = 1 << 31;
+// Ordinary events keep two millisecond offsets. Purchases on whole seconds
+// store their time and delivery delay in one word, leaving one word for price/category.
+const PURCHASE_CLOCK: u32 = 1 << 31;
+const EXTERNAL_CLOCK: u32 = u32::MAX;
 
-#[inline]
-fn encode_ingest(time: i64, origin: i64, overflow: &mut Vec<i64>) -> u32 {
-    let offset = time.wrapping_sub(origin) as u64;
-    if offset < u64::from(OVERFLOW_TIME) {
-        return offset as u32;
+fn encode_clock(ingest: i64, start: i64, at: u32, payload: u32, overflow: &mut Vec<(i64, u32, u32)>) -> (u32, u32) {
+    let offset = ingest.wrapping_sub(start - DAY) as u64;
+    if payload == 0 && offset < PURCHASE_CLOCK as u64 {
+        return (offset as u32, at);
     }
-    let index = overflow.len();
-    assert!(index < OVERFLOW_TIME as usize);
-    overflow.push(time);
-    OVERFLOW_TIME | index as u32
+    if payload != 0 && at % 1000 == 0 && at / 1000 < 0x1fffff {
+        let delay = ingest.wrapping_sub(start).wrapping_sub(i64::from(at)) as u64;
+        if delay < 1_024_000 && delay % 1000 == 0 {
+            return (PURCHASE_CLOCK | (at / 1000) << 10 | (delay / 1000) as u32, payload);
+        }
+    }
+    let index = u32::try_from(overflow.len()).expect("too many exceptional timestamps in one worker");
+    overflow.push((ingest, at, payload));
+    (EXTERNAL_CLOCK, index)
 }
 
-#[inline]
-fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
-    if encoded < OVERFLOW_TIME {
-        origin.wrapping_add(i64::from(encoded))
-    } else {
-        overflow[(encoded ^ OVERFLOW_TIME) as usize]
+impl Parsed {
+    #[inline]
+    fn ingest(self, start: i64, overflow: &[(i64, u32, u32)]) -> i64 {
+        if self.clock < PURCHASE_CLOCK {
+            start - DAY + i64::from(self.clock)
+        } else if self.clock == EXTERNAL_CLOCK {
+            overflow[self.data as usize].0
+        } else {
+            start + i64::from(((self.clock ^ PURCHASE_CLOCK) >> 10) + (self.clock & 1023)) * 1000
+        }
+    }
+
+    #[inline]
+    fn session_data(self, overflow: &[(i64, u32, u32)]) -> (u32, u32) {
+        if self.clock < PURCHASE_CLOCK {
+            (self.data, 0)
+        } else if self.clock == EXTERNAL_CLOCK {
+            let (_, at, payload) = overflow[self.data as usize];
+            (at, payload)
+        } else {
+            (((self.clock ^ PURCHASE_CLOCK) >> 10) * 1000, self.data)
+        }
     }
 }
 
@@ -755,13 +772,9 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
-        let record = Parsed {
-            id,
-            user,
-            ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
-            ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
-        };
+        let at = if valid { (at - window_start) as u32 } else { DEAD };
+        let (clock, data) = encode_clock(ingest, window_start, at, payload, &mut out.overflow_times);
+        let record = Parsed { id, user, clock, data };
         let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
         if deferred {
             lookups[queued] = (name,dest,mixed);
@@ -974,20 +987,19 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            let a = (*record).ingest;
-                            let b = (*other).ingest;
-                            let earlier = if (a | b) < OVERFLOW_TIME {
+                            let a = (*record).clock;
+                            let b = (*other).clock;
+                            let earlier = if (a | b) < PURCHASE_CLOCK {
                                 a < b
                             } else {
-                                let origin = shared.window_start - DAY;
-                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
-                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                (*record).ingest(shared.window_start, &sources[owners[index]].overflow_times)
+                                    < (*other).ingest(shared.window_start, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
                             };
                             if earlier {
-                                (*other).ts = DEAD;
+                                (*other).user = 0;
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
-                                (*record).ts = DEAD;
+                                (*record).user = 0;
                             }
                             break;
                         }
@@ -995,17 +1007,19 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
+            for (&(base, count), &owner) in chunks.iter().zip(&owners) {
+                let overflow = &sources[owner].overflow_times;
                 for offset in 0..count {
                     if offset + ahead < count {
                         links.prefetch((*base.add(offset + ahead)).user);
                     }
                     let record = *base.add(offset);
-                    if record.ts == DEAD {
+                    let (at, payload) = record.session_data(overflow);
+                    if at == DEAD || record.user == 0 {
                         continue;
                     }
                     let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    let value = ((at as u64) << 32) | payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
@@ -1827,12 +1841,18 @@ mod ingest_tests {
     #[test]
     fn compact_ingest_preserves_boundaries_and_overflow_values() {
         let origin = 1_700_000_000_000;
-        let limit = i64::from(OVERFLOW_TIME);
+        let limit = i64::from(PURCHASE_CLOCK);
         let times = [i64::MIN, origin - 1, origin, origin + limit - 1, origin + limit, i64::MAX];
         let mut overflow = Vec::new();
-        let encoded = times.map(|time| encode_ingest(time, origin, &mut overflow));
-        assert_eq!(encoded[2..4], [0, OVERFLOW_TIME - 1]);
-        assert_eq!(overflow, [i64::MIN, origin - 1, origin + limit, i64::MAX]);
-        assert_eq!(encoded.map(|time| decode_ingest(time, origin, &overflow)), times);
+        for at in [0, 951, 1000, 2_100_000_000, DEAD] {
+            for payload in [0, 1, u32::MAX] {
+                for ingest in times.into_iter().chain([origin + 2000, origin + 3000]) {
+                    let (clock, data) = encode_clock(ingest, origin, at, payload, &mut overflow);
+                    let row = Parsed { id: 42, user: 27, clock, data };
+                    assert_eq!(row.ingest(origin, &overflow), ingest);
+                    assert_eq!(row.session_data(&overflow), (at, payload));
+                }
+            }
+        }
     }
 }
