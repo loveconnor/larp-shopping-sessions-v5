@@ -240,6 +240,42 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// The block buffer provides at least 32 readable bytes after the field.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn epoch_millis_13(p: *const u8) -> i64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ascii = _mm_loadu_si128(p.cast());
+        // Right-align the 13 digits and discard the three following CSV bytes.
+        let digits = _mm_slli_si128::<3>(_mm_sub_epi8(ascii, _mm_set1_epi8(b'0' as i8)));
+        let excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if _mm_testz_si128(excess, excess) == 0 {
+            return BAD;
+        }
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+        let packed = _mm_packus_epi32(quads, quads);
+        let halves = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
+        i64::from(_mm_cvtsi128_si32(halves)) * 100_000_000
+            + i64::from(_mm_extract_epi32::<1>(halves))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn epoch_millis_13(p: *const u8) -> i64 {
+    unsafe {
+        let high = load64(p) ^ 0x3030_3030_3030_3030;
+        let low = load64(p.add(5)) ^ 0x3030_3030_3030_3030;
+        if not_digits(high) | not_digits(low) == 0 {
+            (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64
+        } else {
+            BAD
+        }
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
@@ -252,12 +288,7 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             return BAD;
         }
         if len == 13 {
-            let high = load64(p) ^ 0x3030_3030_3030_3030;
-            let low = load64(p.add(5)) ^ 0x3030_3030_3030_3030;
-            if not_digits(high) | not_digits(low) == 0 {
-                return (eight_digits(high << 24) * 100_000_000 + eight_digits(low)) as i64;
-            }
-            return BAD;
+            return epoch_millis_13(p);
         }
         if len == 25 {
             let sign = *p.add(19);
@@ -383,6 +414,24 @@ mod tests {
                 )
             };
             assert_eq!(fast, plain, "{:?}", String::from_utf8_lossy(&text[..20]));
+        }
+    }
+
+    #[test]
+    fn thirteen_digit_field_boundaries() {
+        let mut raw = [0xff; 48];
+        let mut seed = 0u64;
+        for i in 0..12_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let field = format!("{:013}", seed % 10_000_000_000_000);
+            raw[..13].copy_from_slice(field.as_bytes());
+            raw[13..16].fill(i as u8);
+            let pos = i % 13;
+            if i % 2 == 0 { raw[pos] = (seed >> 32) as u8; }
+            let expected = raw[..13].iter().try_fold(0i64, |v, &b| {
+                b.is_ascii_digit().then(|| 10 * v + i64::from(b - b'0'))
+            });
+            assert_eq!(unsafe { epoch_millis_13(raw.as_ptr()) }, expected.unwrap_or(BAD));
         }
     }
 
