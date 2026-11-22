@@ -508,6 +508,10 @@ impl Block {
                 }
                 let mut count = kept;
                 let mut lines = 0usize;
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                let mut regular = kept < N;
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                let regular = false;
                 let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
                 let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
@@ -558,9 +562,38 @@ impl Block {
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
+                    // In a regular window every Nth separator is a newline.
+                    // Check the entire mask, including any short or overfull row.
+                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                    {
+                        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
+                        let first = N - 1 - count % N;
+                        let pattern = const { let mut mask = 0u64; let mut i = 0; while i < 64 { mask |= 1 << i; i += N; } mask };
+                        let wanted = _bzhi_u64(pattern << first, positions as u32);
+                        regular &= _pext_u64(newline, sep) == wanted;
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                    { lines += flatten::<2>(newline, at, ends.add(lines)); }
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
+                }
+                if regular && bad.last().is_none_or(|&offset| u64::from(offset) + 64 <= u64::from(line)) {
+                    bad_at = bad.len();
+                    let completed = count / N * N;
+                    for row in std::slice::from_raw_parts(out.cast::<[u32; N]>(), count / N) {
+                        visit(buf, line, row);
+                        line = row[N - 1] + 1;
+                    }
+                    kept = count - completed;
+                    std::ptr::copy(out.add(completed), out, kept);
+                    continue;
+                }
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                for &position in std::slice::from_raw_parts(out, count) {
+                    if *buf.add(position as usize) == b'\n' {
+                        *ends.add(lines) = position;
+                        lines += 1;
+                    }
                 }
                 // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
