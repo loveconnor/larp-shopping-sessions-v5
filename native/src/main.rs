@@ -686,6 +686,17 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
     }
 }
 
+#[inline(never)]
+unsafe fn purchase_payload(shared: &Shared, buf: *const u8, start: u32, seps: &[u32;7]) -> u32 {
+    let (price, length) = unsafe { scan::field(buf,start,seps,6) };
+    let cents = unsafe { ts::price(price,length) };
+    if cents == 0 { return 0; }
+    let (product, length) = unsafe { scan::field(buf,start,seps,5) };
+    let category = unsafe { shared.products.get(product,length) };
+    let category = if category == 0 { shared.unknown } else { category - 1 };
+    (category << 24) | cents
+}
+
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -742,19 +753,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             && at >= window_start
             && at < window_end
             && ingest - at <= DAY;
-        let mut payload = 0;
-        if purchase && valid {
-            let (p, n) = field(6);
-            let price = ts::price(p, n);
-            if price == 0 {
-                valid = false;
-            } else {
-                let (p, n) = field(5);
-                let category = shared.products.get(p, n);
-                let category = if category == 0 { shared.unknown } else { category - 1 };
-                payload = (category << 24) | price;
-            }
-        }
+        let payload = if purchase && valid {
+            let payload = purchase_payload(shared,buf,start,seps);
+            valid = payload != 0;
+            payload
+        } else { 0 };
         let record = Parsed {
             id,
             user,
