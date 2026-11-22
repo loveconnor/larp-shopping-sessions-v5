@@ -1034,8 +1034,7 @@ type Totals = [i64; 4];
 
 // Every pair in one bin is within a session gap. Between occupied bins,
 // comparing their exact extrema decides whether their sessions connect.
-const BIN_SHIFT: u32 = 20;
-const _: () = assert!((1u64 << BIN_SHIFT) <= SESSION_GAP);
+const BIN_MILLIS: usize = SESSION_GAP as usize + 1;
 
 #[derive(Clone, Copy)]
 struct TimeBin {
@@ -1060,7 +1059,7 @@ struct TimeBins {
 
 impl TimeBins {
     fn new(shared: &Shared) -> Self {
-        let count = ((shared.window_end - shared.window_start) as usize).div_ceil(1 << BIN_SHIFT);
+        let count = ((shared.window_end - shared.window_start) as usize).div_ceil(BIN_MILLIS);
         let categories = shared.categories.len();
         Self {
             bins: vec![TimeBin::default(); count],
@@ -1176,7 +1175,7 @@ impl Sessions<'_> {
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
         for &value in events {
             let ts = (value >> 32) as u32;
-            let index = (ts >> BIN_SHIFT) as usize;
+            let index = ts as usize / BIN_MILLIS;
             let bin = &mut scratch.bins[index];
             bin.first = bin.first.min(ts);
             bin.last = bin.last.max(ts);
