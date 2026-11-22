@@ -1,7 +1,7 @@
-name: Sample guarded parser and session aggregation
+name: Measure per-worker times within scoring phases
 on:
   push:
-    branches: [bench/guarded-samples]
+    branches: [bench/worker-phase-distribution]
 permissions:
   contents: read
 jobs:
@@ -12,15 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 514793}
-          - {events: 60000000, format: current, seed: 514793}
-          - {events: 20000000, format: current, seed: 803203}
-          - {events: 60000000, format: current, seed: 803203}
+          - {events: 20000000, format: current, seed: 345139}
+          - {events: 60000000, format: current, seed: 345139}
+          - {events: 20000000, format: current, seed: 756191}
+          - {events: 60000000, format: current, seed: 756191}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
+      RANKED: ca09a75a98461c83a42e3e5430adbd17280916d4
       CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
     steps:
       - uses: actions/checkout@v4
@@ -33,10 +33,6 @@ jobs:
           mkdir "$RUNNER_TEMP/profile-src"
           git archive "$RANKED" | tar -x -C "$RUNNER_TEMP/profile-src"
           cd "$RUNNER_TEMP/profile-src"
-          sed -i '/^WORKDIR \/src/a ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none' Dockerfile
-          sed -i 's/install -y --no-install-recommends libjemalloc2/install -y --no-install-recommends libjemalloc2 google-perftools binutils/' Dockerfile
-          sed -i '1i#include <stdio.h>' native/platform/select-engine.c
-          sed -i 's/execv(path, argv);/puts(path); return 0;/' native/platform/select-engine.c
           docker build -q -t sampled .
       - name: Generate fresh data
         run: |
@@ -48,68 +44,15 @@ jobs:
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
-      - name: Sample native CPU time at source lines with the ranked allocator and engine
+      - name: Run with both matched and eight software workers
         run: |
           cd "$RUNNER_TEMP"
-          mkdir -p sampled-out profile
-          chmod 777 sampled-out profile
-          docker run --rm -v "$RUNNER_TEMP/data:/data:ro" -v "$RUNNER_TEMP/profile:/profile" \
-            -v "$RUNNER_TEMP/sampled-out:/output" -e NCPU=8 sampled sh -ec '
-              binary=$(/app/shopping-sessions)
-              test -x "$binary"
-              for trial in 1 2 3; do
-                CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 "$binary"
-              done
-              cp "$binary" /profile/engine
-              ls -lh /profile
-              test -x "$binary"
-              echo "Sampled engine $binary"
-              google-pprof --text --lines "$binary" /profile/cpu-* > /profile/lines.txt
-              google-pprof --text "$binary" /profile/cpu-* > /profile/functions.txt
-              head -65 /profile/lines.txt
-              head -45 /profile/functions.txt
-            '
-      - name: Resolve sampled instructions separately for each process address space
-        shell: python
-        run: |
-          import sys, pathlib,re,struct,collections,subprocess
-          import os
-          d=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile'
-          exe=(d/'engine').read_bytes()
-          phoff,=struct.unpack_from('<Q',exe,32)
-          sz,count=struct.unpack_from('<HH',exe,54)
-          load=[struct.unpack_from('<IIQQQQQQ',exe,phoff+i*sz) for i in range(count)]
-          counts=collections.Counter()
-          total=0
-          for f in d.glob('cpu-*'):
-           data=f.read_bytes()
-           maps=[(int(a,16),int(b,16),int(off,16)) for a,b,off in re.findall(rb'(?m)^([a-f0-9]+)-([a-f0-9]+) r-xp ([a-f0-9]+) .*?/app/shopping-sessions[^\n]*',data)]
-           pos=40
-           while True:
-            n,depth=struct.unpack_from('<QQ',data,pos);pos+=16
-            ip,=struct.unpack_from('<Q',data,pos);pos+=depth*8
-            if depth==1 and ip==0:break
-            total+=n
-            for a,b,off in maps:
-             if not a<=ip<b:continue
-             ofs=ip-a+off
-             for typ,flags,pofs,va,_,filesize,_,_ in load:
-              if typ==1 and pofs<=ofs<pofs+filesize: counts[ofs-pofs+va]+=n;break
-          ips=list(counts)
-          raw=subprocess.check_output(['addr2line','-a','-i','-f','-e',str(d/'engine')],input=''.join(f'{ip:x}\n' for ip in ips),text=True)
-          loc=collections.Counter();full=collections.Counter()
-          for ip,group in zip(ips,re.split(r'(?m)^0x[0-9a-f]+\n',raw)[1:]):
-           lines=group.strip().splitlines()
-           user=next((x for x in lines[1::2] if re.search(r'/(main|keys|scan|pq|ts)\.rs:',x)),lines[1])
-           loc[user]+=counts[ip]
-           full[tuple(lines[1::2])]+=counts[ip]
-          print('in-executable',sum(counts.values()),'total',total)
-          for x,c in loc.most_common(24):print(c,round(c/total*100,1),x)
-          for x,c in full.most_common(8):print(c,x[:5])
-          (d/'source-lines.txt').write_text(''.join(f'{c} {x}\n' for x,c in loc.most_common(120)))
-          (d/'inline-lines.txt').write_text(''.join(f'{c} {x}\n' for x,c in full.most_common(120)))
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: native-cpu-samples-${{ matrix.events }}-${{ matrix.seed }}
-          path: ${{ runner.temp }}/profile/
+          for workers in "$(nproc)" 8; do
+            for trial in 1 2 3; do
+              out="$RUNNER_TEMP/output-$workers-$trial"
+              mkdir -p "$out"
+              chmod 777 "$out"
+              echo "PROFILE_START $workers $trial"
+              docker run --rm --network none --read-only --cap-drop ALL --user 1000:1000 --memory 12g --memory-swap 12g -v "$RUNNER_TEMP/data:/data:ro" -v "$out:/output" -e NCPU="$workers" sampled
+            done
+          done
