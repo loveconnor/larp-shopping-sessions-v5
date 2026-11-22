@@ -103,14 +103,20 @@ impl<T: Copy> Buckets<T> {
 
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) {
+        unsafe { self.reserve_slot(part).write(value); }
+    }
+
+    /// The owning worker initializes this slot before exposing the buckets.
+    #[inline(always)]
+    fn reserve_slot(&mut self, part: usize) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
             if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
                 at = self.grow(part);
             }
-            at.write(value);
             *slot = at.add(1);
+            at
         }
     }
 
@@ -661,6 +667,9 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
+        let dest = out.buckets.reserve_slot((partition_hash >> id_shift) as usize);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        std::arch::asm!("prefetchw [{p}]", p = in(reg) dest, options(nostack, preserves_flags, readonly));
         let (p, n) = field(1);
         let user = keys::pack_user(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
@@ -698,7 +707,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        dest.write(record);
     });
 }
 
