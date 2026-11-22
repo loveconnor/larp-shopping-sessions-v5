@@ -1076,6 +1076,10 @@ struct Sessions<'a> {
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
+    pending_sessions: Vec<(u32, u32, u64, bool)>,
+    day_ends: Vec<usize>,
+    covered_until: Vec<usize>,
+    covered_campaigns: Vec<usize>,
     /// Clicks of each campaign inside the current 7-day reach.
     reach: Vec<u32>,
     place: Vec<u32>,
@@ -1123,8 +1127,61 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    // In timestamp order both ends of a click's reachable session interval
+    // move forward. Merge each campaign's intervals by remembering its last
+    // covered session and add only the new suffix to the affected days.
+    fn credit_ranges(&mut self, clicks: &[Touch]) {
+        let sessions = &self.pending_sessions;
+        let days = self.shared.days;
+        let n = sessions.len();
+        self.day_ends.resize(n, n);
+        let mut day_end = n;
+        for i in (0..n).rev() {
+            if i + 1 < n && sessions[i].1 != sessions[i + 1].1 { day_end = i + 1; }
+            self.day_ends[i] = day_end;
+        }
+        let mut low = 0;
+        let mut high = 0;
+        let mut latest: Option<&Touch> = None;
+        let credit = |totals: &mut [Totals], (start, day, revenue, purchased): (u32,u32,u64,bool), latest: Option<&Touch>| {
+            let winner = latest.filter(|c| c.ts >= start).map_or(0, |c| c.campaign as usize);
+            let row = &mut totals[winner * days + day as usize];
+            row[0] += 1;
+            row[1] += i64::from(purchased);
+            row[2] += revenue as i64;
+        };
+        for click in clicks {
+            while low < n && u64::from(sessions[low].0) + (WEEK as u64) < u64::from(click.ts) {
+                credit(&mut self.totals, sessions[low], latest);
+                low += 1;
+            }
+            // Equal-time clicks arrive in bytewise ID order, so keep the first.
+            if latest.is_none_or(|last| last.ts != click.ts) { latest = Some(click); }
+            while high < n && sessions[high].0 <= click.ts { high += 1; }
+            let campaign = click.campaign as usize;
+            let previous = self.covered_until[campaign];
+            let mut from = previous.max(low);
+            if from < high {
+                if previous == 0 { self.covered_campaigns.push(campaign); }
+                self.covered_until[campaign] = high;
+                while from < high {
+                    let end = self.day_ends[from].min(high);
+                    self.totals[campaign * days + sessions[from].1 as usize][3] += (end - from) as i64;
+                    from = end;
+                }
+            }
+        }
+        for &session in &sessions[low..] { credit(&mut self.totals, session, latest); }
+        for campaign in self.covered_campaigns.drain(..) { self.covered_until[campaign] = 0; }
+        self.pending_sessions.clear();
+    }
+
     #[inline(always)]
     fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
+        if clicks.len() >= 64 {
+            self.pending_sessions.push((start as u32, day, revenue, purchased));
+            return cursor;
+        }
         let (mut low, mut high) = cursor;
         let days = self.shared.days;
         let mut credited = 0usize;
@@ -1379,6 +1436,10 @@ fn session_worker(
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
+        pending_sessions: Vec::new(),
+        day_ends: Vec::new(),
+        covered_until: vec![0; campaigns],
+        covered_campaigns: Vec::new(),
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
         active: Vec::new(),
@@ -1572,6 +1633,7 @@ fn session_worker(
                 let bins = bins.get_or_insert_with(|| TimeBins::new(shared));
                 sessions.person_binned(person, mine, reached, bins)?;
             }
+            if reached.len() >= 64 { sessions.credit_ranges(reached); }
             from = to;
             click_from = click_to;
         }
