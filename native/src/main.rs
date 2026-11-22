@@ -50,9 +50,9 @@ const AHEAD: usize = 16;
 /// Bytes per chunk. Chunks are aligned to their size, so a partition's write
 /// position alone says when its chunk is full: the hot state of a partition is
 /// one pointer, and 2048 of them stay in the L1 cache.
-const CHUNK_BYTES: usize = 8192;
+const CHUNK_BYTES: usize = 2048;
 /// Chunks per slab.
-const SLAB: usize = 1 << 13;
+const SLAB: usize = (64 << 20) / CHUNK_BYTES;
 /// The dedup table packs a record's offset in its chunk into this many bits.
 const OFFSET_BITS: u32 = 9;
 
