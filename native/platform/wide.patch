@@ -1,8 +1,7 @@
 diff --git a/native/src/main.rs b/native/src/main.rs
-index 371b35d..89968a0 100644
 --- a/native/src/main.rs
 +++ b/native/src/main.rs
-@@ -335,6 +335,10 @@ impl Links {
+@@ -339,6 +339,10 @@
              }
              numbered.push(index);
          }
@@ -13,7 +12,7 @@ index 371b35d..89968a0 100644
          // Join. The smaller number is the root, so no cycle can form.
          let mut aliases = 0usize;
          let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-@@ -364,9 +368,7 @@ impl Links {
+@@ -368,9 +372,7 @@
          let shift = 64 - count.trailing_zeros();
          let mut groups = vec![AliasGroup::default(); count];
          huge(groups.as_ptr(), count);
@@ -25,10 +24,9 @@ index 371b35d..89968a0 100644
              let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
              loop {
 diff --git a/native/src/scan.rs b/native/src/scan.rs
-index ce3aae9..7743174 100644
 --- a/native/src/scan.rs
 +++ b/native/src/scan.rs
-@@ -472,17 +472,10 @@ impl Block {
+@@ -507,17 +507,10 @@
      /// exactly which are wrong.
      #[inline(always)]
      pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
@@ -50,7 +48,7 @@ index ce3aae9..7743174 100644
      }
  
      #[inline(always)]
-@@ -499,6 +492,10 @@ impl Block {
+@@ -534,6 +527,10 @@
              }
              let end = end as u32;
              let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
@@ -61,30 +59,65 @@ index ce3aae9..7743174 100644
              let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
              // Starts of chunks that break a quote rule; the last is a sentinel.
              let mut bad: Vec<u32> = Vec::new();
-@@ -516,7 +513,9 @@ impl Block {
+@@ -544,16 +541,6 @@
+             // 1 while a field that opened with a quote in an earlier chunk has
+             // its closing separator still to come.
+             let mut carry = 0u64;
+-            // The sequence of newline flags in a clean N-column CSV is
+-            // periodic when indexed by delimiters rather than input bytes.
+-            const fn every_nth(n: usize) -> u128 {
+-                let mut mask = 0;
+-                let mut bit = n - 1;
+-                while bit < 128 { mask |= 1u128 << bit; bit += n; }
+-                mask
+-            }
+-            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4"))]
+-            let mut masks = [0u64; WINDOW];
+             while at < end {
+                 if seps.capacity() < kept + WINDOW * 64 + 128 {
+                     // The separators kept from the last window move with the buffer.
+@@ -561,9 +548,9 @@
                      seps.reserve(WINDOW * 64 + 128);
                  }
                  let mut count = kept;
+-                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4"))]
+-                let (first_byte, mut blocks, mut mismatched) = (at, 0, kept >= N);
 +                let window_start = at;
                  let mut lines = 0usize;
 +                let mut blocks = 0;
                  let out = seps.as_mut_ptr();
                  let ends = newlines.as_mut_ptr();
                  let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
-@@ -568,9 +567,44 @@ impl Block {
+@@ -614,34 +601,43 @@
+                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                      #[cfg(not(target_arch = "x86_64"))]
                      let positions = flatten::<10>(sep, at, out.add(count));
-                     count += positions;
--                    lines += flatten::<2>(newline, at, ends.add(lines));
+-                    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4"))]
+-                    {
+-                        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
+-                        let wanted = (const { every_nth(N) } >> (count % N)) as u64;
+-                        mismatched |= _pext_u64(newline, sep) != _bzhi_u64(wanted, positions as u32);
+-                        masks[blocks] = newline;
++                    count += positions;
 +                    if regular {
 +                        lines += newline.count_ones() as usize;
 +                        newline_masks[blocks] = newline;
-+                        blocks += 1;
+                         blocks += 1;
+-                    }
+-                    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4")))]
+-                    { lines += flatten::<2>(newline, at, ends.add(lines)); }
+-                    count += positions;
 +                    } else {
 +                        lines += flatten::<2>(newline, at, ends.add(lines));
 +                    }
                      at += 64;
                  }
+-                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", feature = "narrow-v4"))]
+-                {
+-                    if !mismatched && bad_at == bad.len() {
+-                        let consumed = count / N * N;
+-                        for i in (0..consumed).step_by(N) {
+-                            let row = &*out.add(i).cast::<[u32; N]>();
 +                // If all expected terminators are newlines, and their number
 +                // equals the actual newline count, no row can have an extra
 +                // or missing separator. An unfinished last line stays buffered.
@@ -97,14 +130,16 @@ index ce3aae9..7743174 100644
 +                    if mismatch == 0 {
 +                        for i in 0..lines {
 +                            let row = &*out.add(i * N).cast::<[u32; N]>();
-+                            visit(buf, line, row);
-+                            line = row[N - 1] + 1;
-+                        }
+                             visit(buf, line, row);
+                             line = row[N - 1] + 1;
+                         }
 +                        let consumed = lines * N;
-+                        kept = count - consumed;
-+                        std::ptr::copy(out.add(consumed), out, kept);
-+                        continue;
-+                    }
+                         kept = count - consumed;
+                         std::ptr::copy(out.add(consumed), out, kept);
+                         continue;
+                     }
+-                    for (i, &mask) in masks[..blocks].iter().enumerate() {
+-                        lines += flatten::<2>(mask, first_byte + (64 * i) as u32, ends.add(lines));
 +                }
 +                // Irregular windows recover each real row ending from the
 +                // saved masks, including malformed rows across window edges.
@@ -112,8 +147,6 @@ index ce3aae9..7743174 100644
 +                    lines = 0;
 +                    for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
 +                        lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
-+                    }
-+                }
+                     }
+                 }
                  // Sentinels: a line's separators are found by position.
-                 for extra in 0..N {
-                     *out.add(count + extra) = u32::MAX;
