@@ -607,6 +607,104 @@ impl Block {
         }
     }
 
+    /// Index separators modulo 256 and store each newline's separator rank.
+    /// Rows spanning more than 255 bytes use the unrestricted field splitter.
+    #[cfg(all(target_arch="x86_64",target_feature="avx512bw",target_feature="avx512vbmi2"))]
+    #[inline(always)]
+    unsafe fn raw_byte_positions<const N:usize>(&self, mut visit:impl FnMut(*const u8,u32,&[u32;N])){
+        use std::arch::x86_64::*;
+        assert!(N<=8);
+        let buf=self.base;
+        let end=self.end as u32;
+        let head=std::slice::from_raw_parts(buf,self.own_end.min(self.end));
+        let Some(first)=head.iter().position(|&c|c==b'\n') else{return};
+        let mut line=first as u32+1;
+        let mut at=line;
+        let mut carried=0usize;
+        let mut carry=0u64;
+        let mut bad=Vec::new();let mut bad_at=0;
+        let mut pos=Vec::<u8>::new();
+        let mut rows=Vec::<(u32,usize)>::with_capacity(128);
+        let offs:[u8;64]=std::array::from_fn(|i|i as u8);
+        let offsets=_mm512_loadu_si512(offs.as_ptr().cast());
+        while at<end{
+            let stop=end.min(at.saturating_add((WINDOW*64) as u32));
+            pos.resize(carried+WINDOW*64+64,0);
+            rows.clear();
+            let mut count=carried;
+            while at<stop{
+                let p=buf.add(at as usize);
+                fetch(p.wrapping_add(READ_AHEAD));
+                let (mut sep,mut newline,mut quote)=wide_classes(p);
+                if end-at<64{
+                    let valid=(1u64<<(end-at))-1;
+                    sep&=valid;newline&=valid;quote&=valid;
+                }
+                    let before = *p.sub(1);
+                    // A quote just before the chunk can close a field at its first byte.
+                    if (quote | carry) != 0 || before == b'"' {
+                        let after = *p.add(64);
+                        let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
+                        let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
+                        let quote_before = (quote << 1) | u64::from(before == b'"');
+                        let quote_after = (quote >> 1) | (u64::from(after == b'"') << 63);
+                        let opening = quote & sep_before;
+                        let closing = quote & sep_after;
+                        let mut wrong = (quote & !(opening | closing)) | (opening & closing);
+                        // The separator ending each field that opened with a quote,
+                        // found by a carry through the run of non-separators after
+                        // it; it must be a separator right after a closing quote.
+                        // A field opening at the chunk's first byte counts here,
+                        // not in the chunk before: that one may have skipped
+                        // these checks for having no quotes.
+                        let opens = sep & quote_after & !(1u64 << 63);
+                        let first_opens = opening & 1;
+                        let (sum, over) = (!sep).overflowing_add(opens << 1);
+                        let (sum, over2) = sum.overflowing_add(carry | first_opens);
+                        let closes = sum & sep;
+                        wrong |= closes ^ (sep & quote_before);
+                        carry = u64::from(over | over2);
+                        if wrong != 0 {
+                            bad.push(at);
+                        }
+                    }
+                let all=_mm512_add_epi8(offsets,_mm512_set1_epi8(at as i8));
+                let dst=pos.as_mut_ptr().add(count);
+                let n=sep.count_ones() as usize;
+                if n<=16{
+                    let bytes=_mm512_maskz_compress_epi8(sep,all);
+                    _mm_storeu_si128(dst.cast(),_mm512_castsi512_si128(bytes));
+                }else{_mm512_mask_compressstoreu_epi8(dst.cast(),sep,all);}
+                while newline!=0{
+                    let rank=count+(sep & ((newline & newline.wrapping_neg()).wrapping_sub(1) | (newline & newline.wrapping_neg()))).count_ones() as usize;
+                    rows.push((at+newline.trailing_zeros(),rank));
+                    newline&=newline-1;
+                }
+                count+=n;
+                at+=64;
+            }
+            bad.push(u32::MAX-64);
+            let mut consumed=0;
+            for &(last,rank) in &rows{
+                while bad[bad_at]+64<=line{bad_at+=1;}
+                let clean=bad[bad_at]>last;
+                if rank-consumed==N && clean && last-line<=255 {
+                    let bytes=_mm_loadl_epi64(pos.as_ptr().add(consumed).cast());
+                    let relative=_mm_sub_epi8(bytes,_mm_set1_epi8(line as i8));
+                    let decoded=_mm256_cvtepu8_epi32(relative);
+                    let offsets:[u32;8]=std::mem::transmute(decoded);
+                    visit(buf.add(line as usize),0,&*offsets.as_ptr().cast::<[u32;N]>());
+                } else if !clean || rank-consumed==N{
+                    if let Some(row)=Self::split_line::<N>(buf,line as usize){visit(buf,line,&row);}
+                }
+                line=last+1;consumed=rank;
+            }
+            bad.pop();
+            carried=count-consumed;
+            pos.copy_within(consumed..count,0);
+        }
+    }
+
     /// `raw_lines`, with every field's bounds worked out and unquoted.
     #[inline(always)]
     pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {

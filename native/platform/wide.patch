@@ -25,10 +25,9 @@ index 371b35d..89968a0 100644
              let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
              loop {
 diff --git a/native/src/scan.rs b/native/src/scan.rs
-index ce3aae9..7743174 100644
 --- a/native/src/scan.rs
 +++ b/native/src/scan.rs
-@@ -472,17 +472,10 @@ impl Block {
+@@ -472,17 +472,10 @@
      /// exactly which are wrong.
      #[inline(always)]
      pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
@@ -44,13 +43,13 @@ index ce3aae9..7743174 100644
 -    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
 -        self.raw_indexed::<N, true>(visit)
 +        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
-+        { self.raw_indexed::<N, true>(visit) }
++        { unsafe {self.raw_byte_positions::<N>(visit)} }
 +        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2")))]
 +        { self.raw_indexed::<N, false>(visit) }
      }
  
      #[inline(always)]
-@@ -499,6 +492,10 @@ impl Block {
+@@ -499,6 +492,10 @@
              }
              let end = end as u32;
              let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
@@ -61,7 +60,7 @@ index ce3aae9..7743174 100644
              let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
              // Starts of chunks that break a quote rule; the last is a sentinel.
              let mut bad: Vec<u32> = Vec::new();
-@@ -516,7 +513,9 @@ impl Block {
+@@ -516,7 +513,9 @@
                      seps.reserve(WINDOW * 64 + 128);
                  }
                  let mut count = kept;
@@ -71,7 +70,7 @@ index ce3aae9..7743174 100644
                  let out = seps.as_mut_ptr();
                  let ends = newlines.as_mut_ptr();
                  let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
-@@ -568,9 +567,44 @@ impl Block {
+@@ -568,8 +567,43 @@
                      #[cfg(not(target_arch = "x86_64"))]
                      let positions = flatten::<10>(sep, at, out.add(count));
                      count += positions;
@@ -84,7 +83,7 @@ index ce3aae9..7743174 100644
 +                        lines += flatten::<2>(newline, at, ends.add(lines));
 +                    }
                      at += 64;
-                 }
++                }
 +                // If all expected terminators are newlines, and their number
 +                // equals the actual newline count, no row can have an extra
 +                // or missing separator. An unfinished last line stays buffered.
@@ -113,7 +112,6 @@ index ce3aae9..7743174 100644
 +                    for (i, &mask) in newline_masks[..blocks].iter().enumerate() {
 +                        lines += flatten::<2>(mask, window_start + (i * 64) as u32, ends.add(lines));
 +                    }
-+                }
+                 }
                  // Sentinels: a line's separators are found by position.
                  for extra in 0..N {
-                     *out.add(count + extra) = u32::MAX;
