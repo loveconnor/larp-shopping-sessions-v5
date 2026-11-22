@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 502811}
-          - {events: 60000000, format: current, seed: 502811}
-          - {events: 20000000, format: current, seed: 503033}
-          - {events: 60000000, format: current, seed: 503033}
+          - {events: 20000000, format: current, seed: 512881}
+          - {events: 60000000, format: current, seed: 512881}
+          - {events: 20000000, format: current, seed: 513013}
+          - {events: 60000000, format: current, seed: 513013}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 2495dfc9e31fe401f60bade9b07508a5933a2766
-      CANDIDATE: 28a071b7969587be7167eb85ad24bb1488d9f8ba
+      CANDIDATE: e1388dd190501d20676403eca969035fbe1d9abd
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,10 +30,10 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked candidate; do
+          for label in ranked candidate v4; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=5d0991700ccf6a52a0fed5fe871f07c89d5252a8; fi
+            if [ "$label" = v4 ]; then sha=b574efcc6d96856af5f6788e81506103afc01efc; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -64,7 +64,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "v4"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
@@ -107,7 +107,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          for label in candidate; do
+          for label in candidate v4; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
