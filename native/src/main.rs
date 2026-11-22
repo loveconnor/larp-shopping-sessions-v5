@@ -64,6 +64,8 @@ const OFFSET_BITS: u32 = 9;
 struct Buckets<T: Copy> {
     /// Where each partition's next record goes.
     next: Vec<*mut T>,
+    // Empty partitions share one writable spill slot until their first growth.
+    _initial_spill: Vec<u8>,
     /// Each partition's newest chunk, and how many chunks it has.
     head: Vec<u32>,
     chunks: Vec<u32>,
@@ -82,16 +84,20 @@ unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
     /// Bytes of a chunk that hold records.
-    const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    const FILL: usize = (CHUNK_BYTES - std::mem::size_of::<T>()) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
     /// Records per chunk.
     const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
     const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
 
     fn new(parts: usize) -> Self {
         let () = Self::FITS;
+        let mut initial_spill = Vec::<u8>::with_capacity(2 * CHUNK_BYTES);
+        let base = initial_spill.as_mut_ptr();
+        let offset = base.align_offset(CHUNK_BYTES) + Self::FILL;
+        let spill = unsafe { base.add(offset).cast::<T>() };
         Self {
-            // A position that reads as a full chunk, so the first push grows.
-            next: vec![Self::FILL as *mut T; parts],
+            next: vec![spill; parts],
+            _initial_spill: initial_spill,
             head: vec![NONE; parts],
             chunks: vec![0; parts],
             slabs: Vec::new(),
@@ -107,14 +113,17 @@ impl<T: Copy> Buckets<T> {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
-            if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
-                at = self.grow(part);
-            }
             // Each worker owns its chunks. Bring the next destination line
             // into its cache while other partitions are receiving records.
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
             at.write(value);
+            if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
+                // The last slot is scratch. Publish only the copy in the new
+                // chunk so a deferred user-name write always reaches the live row.
+                at = self.grow(part);
+                at.write(value);
+            }
             *slot = at.add(1);
             at
         }
@@ -183,6 +192,40 @@ impl<T: Copy> Buckets<T> {
             out.push((self.bases[chunk as usize], Self::CAPACITY));
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn bucket_spills_return_live_rows_and_visit_every_published_value_once() {
+    fn check<const WORDS: usize>() {
+        let mut buckets = Buckets::<[u32; WORDS]>::new(7);
+        let n = 4 * Buckets::<[u32; WORDS]>::CAPACITY + 1;
+        let mut expected = vec![Vec::new(); 7];
+        let mut addresses = Vec::new();
+        for i in 0..n {
+            for part in [0, 2, 5] {
+                let value = (i * 7 + part) as u32;
+                addresses.push((buckets.push(part, [value; WORDS]), value));
+                expected[part].push(value);
+            }
+        }
+        for (ptr, value) in addresses {
+            unsafe { assert_eq!((*ptr)[0], value); (*ptr)[WORDS - 1] = !value; }
+        }
+        for (part, wanted) in expected.into_iter().enumerate() {
+            let mut chunks = Vec::new();
+            buckets.chunks(part, &mut chunks);
+            let mut values = Vec::new();
+            for (base, count) in chunks.into_iter().rev() {
+                for row in unsafe { std::slice::from_raw_parts(base, count) } {
+                    assert_eq!(row[WORDS - 1], !row[0]);
+                    values.push(row[0]);
+                }
+            }
+            assert_eq!(values, wanted);
+        }
+    }
+    check::<4>(); check::<6>(); check::<7>(); check::<8>();
 }
 
 // ---------------------------------------------------------------- records
