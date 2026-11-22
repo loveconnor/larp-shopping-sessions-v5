@@ -354,7 +354,7 @@ impl Links {
                 let root = a.min(b) as usize;
                 let child = a.max(b) as usize;
                 parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
+                if keys::compare_users(names[child], names[root]) == Order::Less {
                     names[root] = names[child];
                 }
             }
@@ -1061,7 +1061,7 @@ impl Sessions<'_> {
             )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        writer.keyed(0, person, |name| keys::unpack(person, name));
+        writer.keyed(0, person, |name| keys::unpack_user(person, name));
         writer.int(1, shared.first_day + day as i64);
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);

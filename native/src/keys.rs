@@ -68,14 +68,22 @@ fn intern(value: &[u8]) -> u64 {
     intern_name(value).0
 }
 
-/// Event IDs need equality only. An eight-byte suffix can serve directly
-/// as a key whenever its top bit leaves room for the interner namespace.
+/// A nonempty suffix with a nonzero last byte is unambiguous when
+/// padded with zero bytes. Remaining names use the disjoint interner.
+#[inline(always)]
+unsafe fn suffix(p:*const u8,len:usize,prefix:u8) -> Option<u64> {
+    unsafe {
+        if !(2..=9).contains(&len) || *p!=prefix || *p.add(len-1)==0 {return None;}
+        let word=u64::from_le(p.add(1).cast::<u64>().read_unaligned());
+        Some(if len==9 {word} else {word & ((1u64 << (8*(len-1)))-1)})
+    }
+}
+
 #[inline(always)]
 pub unsafe fn event_key(p:*const u8,len:usize) -> u64 {
     unsafe {
-        if len==9 && *p==b'e' {
-            let suffix=u64::from_le(p.add(1).cast::<u64>().read_unaligned());
-            if suffix!=0 && suffix & INTERNED == 0 {return suffix;}
+        if let Some(word)=suffix(p,len,b'e') {
+            if word & INTERNED == 0 {return word;}
         }
         if len==0 {0} else {intern(std::slice::from_raw_parts(p,len))}
     }
@@ -175,10 +183,17 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
 
 #[inline(always)]
 pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
-    if n == 33 {
-        if let Some(slots) = USER_SLOTS.get() { return unsafe { fixed_user(p, slots) }; }
+    unsafe {
+        if let Some(slots)=USER_SLOTS.get() {
+            if n==33 {return fixed_user(p,slots);}
+            if let Some(word)=suffix(p,n,b'u') {
+                let key=word.swap_bytes();
+                if key & INTERNED == 0 {return key;}
+            }
+            return if n==0 {0} else {intern(std::slice::from_raw_parts(p,n))};
+        }
+        pack(p,n)
     }
-    unsafe { pack(p, n) }
 }
 
 fn name(key: u64) -> &'static [u8] {
@@ -276,6 +291,27 @@ pub fn bytes(key: u64, packed: &mut [u8; 9]) -> &[u8] {
         *byte = ((key >> (56 - i * 7)) & 127) as u8;
     }
     &packed[..packed.iter().position(|&b| b == 0).unwrap_or(9)]
+}
+
+#[inline]
+fn user_bytes(key:u64, buf:&mut [u8;9]) -> &[u8] {
+    if key & INTERNED != 0 {return name(key);}
+    buf[0]=b'u';
+    buf[1..].copy_from_slice(&key.to_be_bytes());
+    &buf[..9-key.trailing_zeros() as usize/8]
+}
+
+#[inline]
+pub fn unpack_user(key:u64,out:&mut Vec<u8>) {
+    if USER_SLOTS.get().is_some() {out.extend_from_slice(user_bytes(key,&mut [0;9]));}
+    else {unpack(key,out);}
+}
+
+#[inline]
+pub fn compare_users(a:u64,b:u64) -> Ordering {
+    if (a|b) & INTERNED==0 {return a.cmp(&b);}
+    if USER_SLOTS.get().is_none() {return compare_slow(a,b);}
+    user_bytes(a,&mut [0;9]).cmp(user_bytes(b,&mut [0;9]))
 }
 
 #[cold]
