@@ -1072,6 +1072,7 @@ impl TimeBins {
 }
 
 struct Sessions<'a> {
+    click_sources: &'a [ClickSource],
     shared: &'a Shared,
     writer: Option<pq::Writer>,
     thread: usize,
@@ -1124,8 +1125,8 @@ impl Sessions<'_> {
     }
 
     #[inline(always)]
-    fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
-        let (mut low, mut high) = cursor;
+    fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize, usize) {
+        let (mut low, mut high, mut winner) = cursor;
         let days = self.shared.days;
         let mut credited = 0usize;
         if !clicks.is_empty() {
@@ -1133,6 +1134,13 @@ impl Sessions<'_> {
             // the clicks in reach are those with start <= ts <= start + 7 days.
             let limit = start + WEEK as u64;
             while high < clicks.len() && clicks[high].ts as u64 <= limit {
+                // Both time cutoffs include or exclude a complete tie group.
+                // Its smallest ID remains the winner until a later click enters.
+                if high == 0 || clicks[high].ts != clicks[winner].ts
+                    || click_order(clicks[high].id, clicks[winner].id, self.click_sources, self.shared.defer_long_events).is_lt()
+                {
+                    winner = high;
+                }
                 let campaign = clicks[high].campaign as usize;
                 if self.reach[campaign] == 0 {
                     self.place[campaign] = self.active.len() as u32;
@@ -1155,12 +1163,7 @@ impl Sessions<'_> {
                 low += 1;
             }
             if high > low {
-                let latest = clicks[high - 1].ts;
-                let mut pick = high - 1;
-                while pick > low && clicks[pick - 1].ts == latest {
-                    pick -= 1;
-                }
-                credited = clicks[pick].campaign as usize;
+                credited = clicks[winner].campaign as usize;
             }
             for &campaign in &self.active {
                 self.totals[campaign as usize * days + day as usize][3] += 1;
@@ -1170,7 +1173,7 @@ impl Sessions<'_> {
         totals[0] += 1;
         totals[1] += i64::from(purchased);
         totals[2] += revenue as i64;
-        (low, high)
+        (low, high, winner)
     }
 
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
@@ -1190,7 +1193,7 @@ impl Sessions<'_> {
                 bin.category_bits[category / 64] |= 1 << (category % 64);
             }
         }
-        let mut cursor = (0, 0);
+        let mut cursor = (0, 0, 0);
         let mut current_day = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
         let (mut start, mut last, mut revenue) = (0u32, 0u32, 0u64);
@@ -1239,7 +1242,7 @@ impl Sessions<'_> {
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let day_offset = self.shared.day_offset;
-        let (mut low, mut high) = (0usize, 0usize);
+        let mut cursor = (0, 0, 0);
         let mut at = 0;
         let mut current = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
@@ -1280,7 +1283,7 @@ impl Sessions<'_> {
             day_events += (at - first) as u32;
             day_revenue += revenue;
 
-            (low, high) = self.credit(clicks, (low, high), start, day, revenue, purchased);
+            cursor = self.credit(clicks, cursor, start, day, revenue, purchased);
         }
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
@@ -1375,6 +1378,7 @@ fn session_worker(
 ) -> io::Result<(Vec<Totals>, bool)> {
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
+        click_sources: clicks,
         shared,
         writer: None,
         thread,
@@ -1555,7 +1559,7 @@ fn session_worker(
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+                reached.sort_unstable_by_key(|click| click.ts);
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
