@@ -1334,6 +1334,84 @@ impl Sessions<'_> {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn sort_clock_lanes(values: &mut [u32]) {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=32).contains(&values.len()));
+    unsafe {
+        macro_rules! split {
+            ($v:expr, $other:expr, $mask:literal) => {{
+                let (v, other) = ($v, $other);
+                _mm256_blend_epi32::<$mask>(_mm256_min_epu32(v, other), _mm256_max_epu32(v, other))
+            }}
+        }
+        let finish = |v| {
+            let v = split!(v,_mm256_permute2x128_si256::<1>(v,v),0xf0);
+            let v = split!(v,_mm256_shuffle_epi32::<0x4e>(v),0xcc);
+            split!(v,_mm256_shuffle_epi32::<0xb1>(v),0xaa)
+        };
+        let sort = |v| {
+            let v = split!(v,_mm256_shuffle_epi32::<0xb1>(v),0x66);
+            let v = split!(v,_mm256_shuffle_epi32::<0x4e>(v),0x3c);
+            finish(split!(v,_mm256_shuffle_epi32::<0xb1>(v),0x5a))
+        };
+        let reverse = |v| _mm256_permutevar8x32_epi32(v,_mm256_setr_epi32(7,6,5,4,3,2,1,0));
+        let merge = |a,b| {
+            let other = reverse(b);
+            (finish(_mm256_min_epu32(a,other)),finish(_mm256_max_epu32(a,other)))
+        };
+        let n = values.len();
+        let p = values.as_mut_ptr().cast::<i32>();
+        let mask = |at| _mm256_cmpgt_epi32(_mm256_set1_epi32(n.saturating_sub(at) as i32),_mm256_setr_epi32(0,1,2,3,4,5,6,7));
+        let read = |at| {
+            if at >= n { return _mm256_set1_epi32(-1); }
+            if n - at >= 8 { return sort(_mm256_loadu_si256(p.add(at).cast())); }
+            let valid = mask(at);
+            sort(_mm256_or_si256(_mm256_maskload_epi32(p.add(at),valid),_mm256_andnot_si256(valid,_mm256_set1_epi32(-1))))
+        };
+        let write = |at,v| {
+            if at < n { _mm256_maskstore_epi32(p.add(at), mask(at), v); }
+        };
+        let a = read(0);
+        if n <= 8 { write(0,a); return; }
+        let (a,b) = merge(a,read(8));
+        if n <= 16 { write(0,a); write(8,b); return; }
+        let (c,d) = merge(read(16),read(24));
+        let (c,d) = (reverse(c),reverse(d));
+        let (al,ah) = (_mm256_min_epu32(a,d),_mm256_max_epu32(a,d));
+        let (bl,bh) = (_mm256_min_epu32(b,c),_mm256_max_epu32(b,c));
+        write(0,finish(_mm256_min_epu32(al,bl)));
+        write(8,finish(_mm256_max_epu32(al,bl)));
+        write(16,finish(_mm256_min_epu32(ah,bh)));
+        write(24,finish(_mm256_max_epu32(ah,bh)));
+    }
+}
+
+#[cfg(all(test,target_arch="x86_64",target_feature="avx2"))]
+#[test]
+fn clock_lanes_boundaries() {
+    let mut seed = 1_697_432u32;
+    for n in 1..=32 {
+        for sample in 0..1024 {
+            let mut raw = [0xab181112; 34];
+            let v = &mut raw[1..=n];
+            for (i,x) in v.iter_mut().enumerate() {
+                seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+                *x = match sample % 6 {
+                    0 => u32::MAX, 1 => i as u32, 2 => u32::MAX - i as u32,
+                    3 => seed & 3, 4 => seed | 0x7fff_ffff, _ => seed,
+                };
+            }
+            let mut expected = v.to_vec();
+            expected.sort_unstable();
+            unsafe {sort_clock_lanes(v);}
+            assert_eq!(v,expected);
+            assert_eq!((raw[0],raw[n+1]),(0xab181112,0xab181112));
+        }
+    }
+}
+
 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
 #[inline(always)]
 unsafe fn sort_short_times(values: &mut [u64]) {
@@ -1611,6 +1689,9 @@ fn session_worker(
                         count += 1;
                     }
                 }
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                if times.len() <= 32 { unsafe { sort_clock_lanes(times); } } else { times.sort_unstable(); }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
                 times.sort_unstable();
                 let tagged = &mut purchases[..count];
                 tagged.sort_unstable();
