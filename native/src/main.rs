@@ -151,6 +151,10 @@ impl<T: Copy> Buckets<T> {
                 base
             }
         };
+        // Starting aligned partitions at different offsets reduces early cache
+        // set conflicts. Later chunks keep their full record capacity.
+        let skipped = if self.head[part] == NONE { ((part ^ (part >> 4)) & 15) * 2 } else { 0 };
+        let base = unsafe { base.add(skipped) };
         let chunk = self.bases.len() as u32;
         self.bases.push(base);
         self.previous.push(self.head[part]);
@@ -180,7 +184,9 @@ impl<T: Copy> Buckets<T> {
             if chunk == NONE {
                 break;
             }
-            out.push((self.bases[chunk as usize], Self::CAPACITY));
+            let start = self.bases[chunk as usize];
+            let skipped_bytes = start.addr() & (CHUNK_BYTES - 1);
+            out.push((start, Self::CAPACITY - skipped_bytes / std::mem::size_of::<T>()));
         }
     }
 }
@@ -1011,7 +1017,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
+                out.donate(base.cast::<u8>().map_addr(|address| address & !(CHUNK_BYTES - 1)));
             }
         }
     }
