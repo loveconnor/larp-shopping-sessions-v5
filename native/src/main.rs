@@ -193,11 +193,11 @@ impl<T: Copy> Buckets<T> {
 
 // ---------------------------------------------------------------- records
 
-// Four deduplication records share a cache line. Their users and prices
-// occupy the following line and stay cold until the winners are routed.
+// Four deduplication records are contiguous. Their users and prices follow
+// in a packed 48-byte region and stay cold until the winners are routed.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
-struct ParsedSlot([u8; 32]);
+#[repr(C, align(4))]
+struct ParsedSlot([u8; 28]);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -208,7 +208,7 @@ struct DedupFields {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed(4))]
 struct UserFields {
     user: u64,
     payload: u32,
@@ -218,9 +218,12 @@ impl ParsedSlot {
     #[inline(always)]
     fn fields(slot: *mut Self) -> (*mut DedupFields, *mut UserFields) {
         const _: () = assert!(std::mem::size_of::<DedupFields>() == 16
-            && std::mem::size_of::<UserFields>() == 16 && CHUNK_BYTES % 128 == 0);
-        let tile = slot.cast::<u8>().map_addr(|address| address & !127);
-        let lane = (slot.addr() >> 5) & 3;
+            && std::mem::size_of::<UserFields>() == 12 && CHUNK_BYTES % 16 == 0
+            && Buckets::<ParsedSlot>::CAPACITY % 4 == 0);
+        // Address / 4 advances by seven per logical record. Seven is -1
+        // modulo four, so these two low bits recover the lane without division.
+        let lane = (slot.addr().wrapping_neg() >> 2) & 3;
+        let tile = unsafe { slot.cast::<u8>().sub(28 * lane) };
         unsafe { (tile.cast::<DedupFields>().add(lane), tile.add(64).cast::<UserFields>().add(lane)) }
     }
 }
