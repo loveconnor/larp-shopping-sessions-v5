@@ -225,6 +225,24 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
 unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) -> usize {
     unsafe {
         let count = bits.count_ones() as usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "bmi2", feature = "narrow-v4"))]
+        if UNROLL == 7 && count <= 16 {
+            use std::arch::x86_64::*;
+            // Gather the six bits of each position independently. The mask
+            // registers expand those bits directly into sixteen output lanes.
+            let plane = |ones, value| {
+                _mm512_maskz_set1_epi32(_pext_u64(ones, bits) as u16, value)
+            };
+            let low = _mm512_ternarylogic_epi32::<0xfe>(
+                plane(0xaaaa_aaaa_aaaa_aaaa, 1), plane(0xcccc_cccc_cccc_cccc, 2),
+                plane(0xf0f0_f0f0_f0f0_f0f0, 4));
+            let high = _mm512_ternarylogic_epi32::<0xfe>(
+                plane(0xff00_ff00_ff00_ff00, 8), plane(0xffff_0000_ffff_0000, 16),
+                plane(0xffff_ffff_0000_0000, 32));
+            let offsets = _mm512_or_si512(low, high);
+            _mm512_storeu_si512(out.cast(), _mm512_add_epi32(offsets, _mm512_set1_epi32(base as i32)));
+            return count;
+        }
         for at in 0..UNROLL {
             *out.add(at) = base + bits.trailing_zeros();
             bits &= bits.wrapping_sub(1);
