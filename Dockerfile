@@ -38,6 +38,6 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 && rm -rf /var/lib/apt/lists/*
 ENV LD_PRELOAD=libjemalloc.so.2
-ENV MALLOC_CONF=narenas:2,background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto
+ENV MALLOC_CONF=narenas:4,background_thread:false,dirty_decay_ms:-1,muzzy_decay_ms:-1,thp:always,metadata_thp:auto
 COPY --from=builder /app /app
 CMD ["/app/shopping-sessions"]
