@@ -604,31 +604,48 @@ impl Block {
                 for extra in 0..N {
                     *out.add(count + extra) = u32::MAX;
                 }
-                bad.push(u32::MAX - 64);
+                let line_ends = std::slice::from_raw_parts(ends, lines);
                 let mut sep_at = 0usize;
-                for &stop in std::slice::from_raw_parts(ends, lines) {
-                    let start = line;
-                    line = stop + 1;
-                    while *bad.get_unchecked(bad_at) + 64 <= start {
-                        bad_at += 1;
-                    }
-                    let clean = *bad.get_unchecked(bad_at) > stop;
-                    if *out.add(sep_at + N - 1) == stop && clean {
-                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
-                        sep_at += N;
-                        continue;
-                    }
-                    while *out.add(sep_at) < stop {
-                        sep_at += 1;
-                    }
-                    sep_at += 1;
-                    if !clean {
-                        if let Some(found) = Self::split_line::<N>(buf, start as usize) {
-                            visit(buf, start, &found);
+                // Quote-free and validly quoted windows still need an arity
+                // check, but have no suspect chunks to look up for each row.
+                if bad_at == bad.len() {
+                    for &stop in line_ends {
+                        let start = line;
+                        line = stop + 1;
+                        if *out.add(sep_at + N - 1) == stop {
+                            visit(buf, start, &*out.add(sep_at).cast::<[u32; N]>());
+                            sep_at += N;
+                        } else {
+                            while *out.add(sep_at) < stop { sep_at += 1; }
+                            sep_at += 1;
                         }
                     }
+                } else {
+                    bad.push(u32::MAX - 64);
+                    for &stop in line_ends {
+                        let start = line;
+                        line = stop + 1;
+                        while *bad.get_unchecked(bad_at) + 64 <= start {
+                            bad_at += 1;
+                        }
+                        let clean = *bad.get_unchecked(bad_at) > stop;
+                        if *out.add(sep_at + N - 1) == stop && clean {
+                            visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                            sep_at += N;
+                            continue;
+                        }
+                        while *out.add(sep_at) < stop {
+                            sep_at += 1;
+                        }
+                        sep_at += 1;
+                        if !clean {
+                            if let Some(found) = Self::split_line::<N>(buf, start as usize) {
+                                visit(buf, start, &found);
+                            }
+                        }
+                    }
+                    bad.pop();
                 }
-                bad.pop();
                 // Separators of the line still open move to the front.
                 kept = count - sep_at;
                 std::ptr::copy(out.add(sep_at), out, kept);
