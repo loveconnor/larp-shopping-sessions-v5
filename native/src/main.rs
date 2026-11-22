@@ -1076,6 +1076,9 @@ struct Sessions<'a> {
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
+    // The low eight bits of the assist totals are contiguous by day.
+    // Wraps carry into the full-width totals owned by this worker.
+    assist_low: Vec<u8>,
     /// Clicks of each campaign inside the current 7-day reach.
     reach: Vec<u32>,
     place: Vec<u32>,
@@ -1162,8 +1165,14 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
+            let n = self.reach.len();
+            let today = &mut self.assist_low[day as usize * n..][..n];
             for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+                let low = &mut today[campaign as usize];
+                *low = low.wrapping_add(1);
+                if *low == 0 {
+                    self.totals[campaign as usize * days + day as usize][3] += 256;
+                }
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1379,6 +1388,7 @@ fn session_worker(
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
+        assist_low: vec![0; campaigns * shared.days],
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
         active: Vec::new(),
@@ -1579,6 +1589,11 @@ fn session_worker(
     let wrote = sessions.writer.is_some();
     if let Some(writer) = sessions.writer.take() {
         writer.finish()?;
+    }
+    for (day, today) in sessions.assist_low.chunks_exact(campaigns).enumerate() {
+        for (campaign, &low) in today.iter().enumerate() {
+            sessions.totals[campaign * shared.days + day][3] += i64::from(low);
+        }
     }
     Ok((sessions.totals, wrote))
 }
