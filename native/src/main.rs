@@ -1107,6 +1107,27 @@ impl Sessions<'_> {
             let mut purchased = false;
             let first = at;
             while at < events.len() {
+                // Sorted endpoints prove all eight rows continue this session.
+                // Only the sparse purchase lanes need category accounting.
+                #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
+                if at + 8 <= events.len() && (events[at+7] >> 32) - previous <= SESSION_GAP {
+                    use std::arch::x86_64::*;
+                    let raw=unsafe {_mm512_loadu_si512(events.as_ptr().add(at).cast())};
+                    let mut buys=unsafe {_mm512_test_epi64_mask(raw,_mm512_set1_epi64(0xff_ffff))};
+                    purchased |= buys != 0;
+                    while buys != 0 {
+                        let value=events[at+buys.trailing_zeros() as usize];
+                        buys &= buys-1;
+                        let price=value & 0xff_ffff;
+                        let category=((value>>24)&255) as usize;
+                        if self.sums[category]==0 {self.touched.push(category as u8);}
+                        self.sums[category]+=price;
+                        revenue+=price;
+                    }
+                    previous=events[at+7]>>32;
+                    at+=8;
+                    continue;
+                }
                 let value = events[at];
                 let time = value >> 32;
                 if time - previous > SESSION_GAP {
