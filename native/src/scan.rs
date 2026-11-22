@@ -544,6 +544,9 @@ impl Block {
             // 1 while a field that opened with a quote in an earlier chunk has
             // its closing separator still to come.
             let mut carry = 0u64;
+            // The byte before the first input row is a newline.
+            let mut previous_seps = 1u64 << 63;
+            let mut previous_quotes = 0u64;
             while at < end {
                 if seps.capacity() < kept + WINDOW * 64 + 128 {
                     // The separators kept from the last window move with the buffer.
@@ -570,28 +573,22 @@ impl Block {
                         newline &= valid;
                         quote &= valid;
                     }
-                    let before = *p.sub(1);
-                    // A quote just before the chunk can close a field at its first byte.
-                    if (quote | carry) != 0 || before == b'"' {
-                        let after = *p.add(64);
-                        let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
-                        let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
-                        let quote_before = (quote << 1) | u64::from(before == b'"');
-                        let opening = quote & sep_before;
-                        let closing = quote & sep_after;
-                        // Both masks are subsets of quote. A quote with
-                        // neither boundary or both boundaries is invalid.
-                        let misplaced = quote ^ opening ^ closing;
-                        // Each opening seeds a carry into the following
-                        // delimiter. Bit zero is also seeded if the field
-                        // was opened in the preceding 64-byte chunk.
+                    let before_quote = previous_quotes >> 63;
+                    if (quote | carry | before_quote) != 0 {
+                        let opening = quote & ((sep << 1) | (previous_seps >> 63));
+                        let closing = quote & (sep >> 1);
+                        // Decide the last byte when its right neighbor is known.
+                        let misplaced = (quote ^ opening ^ closing) & (u64::MAX >> 1);
+                        let bad_boundary = before_quote & !((previous_seps >> 62) ^ sep);
                         let (sum, over) = (!sep).overflowing_add(opening | carry);
-                        let wrong = misplaced | ((sum ^ quote_before) & sep);
+                        let close_quotes = (quote << 1) | before_quote;
                         carry = u64::from(over);
-                        if wrong != 0 {
+                        if misplaced | bad_boundary | ((sum ^ close_quotes) & sep) != 0 {
                             bad.push(at);
                         }
                     }
+                    previous_seps = sep;
+                    previous_quotes = quote;
                     #[cfg(target_arch = "x86_64")]
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
