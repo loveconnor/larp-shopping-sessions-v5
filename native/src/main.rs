@@ -1365,6 +1365,51 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+/// Sort short, eight-millisecond-aligned histories using lane indices for their payloads.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+unsafe fn sort_short_aligned(values: &mut [u64]) -> bool {
+    use std::arch::x86_64::*;
+    if !(5..=8).contains(&values.len()) { return false; }
+    unsafe {
+        let p = values.as_mut_ptr();
+        let tail = _mm256_cmpgt_epi64(
+            _mm256_set1_epi64x((values.len() - 4) as i64),
+            _mm256_setr_epi64x(0, 1, 2, 3),
+        );
+        let a = _mm256_loadu_si256(p.cast());
+        let b = _mm256_maskload_epi64(p.add(4).cast(), tail);
+        // Each timestamp divisible by eight has room for its source lane.
+        // Event payloads travel by that index, including purchases at tied times.
+        let times = _mm256_castps_si256(_mm256_shuffle_ps::<0xdd>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+        if _mm256_testz_si256(times, _mm256_set1_epi32(7)) == 0 { return false; }
+        let payload = _mm256_castps_si256(_mm256_shuffle_ps::<0x88>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+        let b = _mm256_or_si256(b, _mm256_andnot_si256(tail, _mm256_set1_epi64x(-1)));
+        let padded = _mm256_castps_si256(_mm256_shuffle_ps::<0xdd>(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)));
+        let mut v = _mm256_or_si256(padded, _mm256_setr_epi32(0,1,2,3,4,5,6,7));
+        macro_rules! compare {
+            ($other:expr, $lanes:literal) => {{
+                let other = $other;
+                v = _mm256_blend_epi32::<$lanes>(_mm256_min_epu32(v, other), _mm256_max_epu32(v, other));
+            }};
+        }
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0x66);
+        compare!(_mm256_shuffle_epi32::<0x4e>(v), 0x3c);
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0x5a);
+        compare!(_mm256_permute2x128_si256::<0x01>(v, v), 0xf0);
+        compare!(_mm256_shuffle_epi32::<0x4e>(v), 0xcc);
+        compare!(_mm256_shuffle_epi32::<0xb1>(v), 0xaa);
+        let sorted_times = _mm256_permutevar8x32_epi32(times, v);
+        let sorted_payload = _mm256_permutevar8x32_epi32(payload, v);
+        let low = _mm256_unpacklo_epi32(sorted_payload, sorted_times);
+        let high = _mm256_unpackhi_epi32(sorted_payload, sorted_times);
+        let first = _mm256_permute2x128_si256::<0x20>(low, high);
+        let last = _mm256_permute2x128_si256::<0x31>(low, high);
+        _mm256_storeu_si256(p.cast(), first);
+        _mm256_maskstore_epi64(p.add(4).cast(), tail, last);
+    }
+    true
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1565,7 +1610,9 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                if !unsafe { sort_short_aligned(mine) } { mine.sort_unstable(); }
+                #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), all(target_arch = "x86_64", target_feature = "avx512f"))))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
