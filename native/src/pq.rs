@@ -411,7 +411,20 @@ impl Writer {
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
-                Kind::Date | Kind::Int32 | Kind::Int64 => {
+                Kind::Int64 => {
+                    #[cfg(target_endian = "little")]
+                    let bytes = unsafe {
+                        // All rows are live i64 values, already in Parquet's PLAIN byte order.
+                        std::slice::from_raw_parts(column.ints.as_ptr().cast::<u8>(), column.ints.len() * 8)
+                    };
+                    #[cfg(target_endian = "big")]
+                    let bytes = {
+                        for &value in &column.ints { body.extend_from_slice(&value.to_le_bytes()); }
+                        &body[..]
+                    };
+                    Self::page(&mut self.out, bytes, rows, false, 0);
+                }
+                Kind::Date | Kind::Int32 => {
                     delta_binary_packed(&mut body, &column.ints);
                     Self::page(&mut self.out, &body, rows, false, 5);
                 }
@@ -476,7 +489,7 @@ impl Writer {
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
                     Kind::Date | Kind::Int32 => (1, &[5]),
-                    Kind::Int64 => (2, &[5]),
+                    Kind::Int64 => (2, &[0]),
                 };
                 meta.begin(0);
                 meta.i64(2, chunk.offset as i64);
