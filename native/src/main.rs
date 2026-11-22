@@ -637,7 +637,8 @@ struct EventSource {
     names: Vec<[u8; 33]>,
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+#[inline(never)]
+fn parse_event_group<const FORMAT:usize>(shared: &Shared, buf:*const u8, rows:&[(u32,[u32;7])], copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -652,7 +653,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
+    for &(start,ref seps) in rows { unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
@@ -664,7 +665,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         } else {
             let id = keys::pack(p, n);
             if id == 0 {
-                return;
+                continue;
             }
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
@@ -672,7 +673,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (p, n) = field(3);
         let ingest = ts::ingest(p, n, dates);
         if ingest == ts::BAD {
-            return;
+            continue;
         }
         let (name,n) = field(1);
         let deferred = n == 33 && shared.defer_long_events;
@@ -680,7 +681,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
+        let at = ts::parse(p, if FORMAT==0 {n} else {FORMAT}, dates);
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -722,8 +723,37 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 queued = 0;
             }
         }
-    });
+    }}
     drain(&lookups[..queued]);
+}
+
+fn parse_events(shared:&Shared,block:&Block,copy:u64,dates:&mut ts::Dates,out:&mut EventSource) {
+    const BATCH:usize=48;
+    let mut groups=[[(0u32,[0u32;7]);BATCH];4];
+    let mut counts=[0usize;4];
+    let mut source=std::ptr::null();
+    let mut flush=|i,buf,rows:&[(u32,[u32;7])]|{
+        match i {
+            0=>parse_event_group::<20>(shared,buf,rows,copy,dates,out),
+            1=>parse_event_group::<13>(shared,buf,rows,copy,dates,out),
+            2=>parse_event_group::<25>(shared,buf,rows,copy,dates,out),
+            _=>parse_event_group::<0>(shared,buf,rows,copy,dates,out),
+        }
+    };
+    block.raw_lines::<7>(|buf,start,seps| unsafe {
+        source=buf;
+        let n=scan::field(buf,start,seps,2).1;
+        let i=match n {20=>0,13=>1,25=>2,_=>3};
+        groups[i][counts[i]]=(start,*seps);
+        counts[i]+=1;
+        if counts[i]==BATCH {
+            flush(i,buf,&groups[i]);
+            counts[i]=0;
+        }
+    });
+    for i in 0..4 {
+        if counts[i]!=0 {flush(i,source,&groups[i][..counts[i]]);}
+    }
 }
 
 struct ClickSource {
