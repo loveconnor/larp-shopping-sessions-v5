@@ -368,6 +368,7 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
+        let mut overflowed = vec![false; count];
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
@@ -380,7 +381,17 @@ impl Links {
                     group.values[lane] = person;
                     break;
                 }
+                overflowed[at] = true;
                 at = (at + 1) & (count - 1);
+            }
+        }
+        // Encode the spill flag in the order of two key/value pairs. Distinct
+        // keys in a full group can always represent either ordering. A group
+        // containing empty slots has never spilled and can use ascending order.
+        for (group, spill) in groups.iter_mut().zip(overflowed) {
+            if (group.keys[2] > group.keys[3]) != spill {
+                group.keys.swap(2, 3);
+                group.values.swap(2, 3);
             }
         }
         Self { slots: groups, shift, empty: aliases == 0 }
@@ -414,7 +425,7 @@ impl Links {
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
                 return group.values[lane];
             }
-            if group.keys[3] == 0 { return key; }
+            if group.keys[2] <= group.keys[3] { return key; }
             slot = (slot + 1) & mask;
         }
     }
