@@ -811,7 +811,8 @@ fn parse_clicks(
     }
 }
 
-fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
+type ReadyBlocks=std::sync::Mutex<std::sync::mpsc::Receiver<(usize,Block)>>;
+fn parse_worker(shared: &Shared, worker: usize, ready:&ReadyBlocks, free:&std::sync::mpsc::Sender<Block>) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
     if worker == 0 {
         // The other threads wait on this table, so a failure must not leave them waiting.
@@ -827,13 +828,16 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
-    while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
-        block.load(&shared.files[work.file], work.start, work.end)?;
+    loop {
+        let item=ready.lock().unwrap().recv();
+        let Ok((index,block))=item else {break;};
+        let work=&shared.work[index];
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
+        let _=free.send(block);
     }
     Ok((events, clicks))
 }
@@ -1506,14 +1510,32 @@ fn main() -> io::Result<()> {
     let shared = &shared;
     let setup = began.elapsed();
 
+    let (free_tx,free_rx)=std::sync::mpsc::channel();
+    let free_rx=std::sync::Mutex::new(free_rx);
+    let (ready_tx,ready_rx)=std::sync::mpsc::channel();
+    let ready_rx=ReadyBlocks::new(ready_rx);
+    for _ in 0..2*threads+2{free_tx.send(Block::new()).unwrap();}
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<io::Result<Vec<_>>>()
+        let mut readers=Vec::new();
+        for _ in 0..threads.min(2) {
+            let (output,free)=(ready_tx.clone(),&free_rx);
+            readers.push(scope.spawn(move || ->io::Result<()> {
+                loop {
+                    let index=shared.next.fetch_add(1,Ordering::Relaxed);
+                    let Some(work)=shared.work.get(index) else {break;};
+                    let mut block=free.lock().unwrap().recv().unwrap();
+                    block.load(&shared.files[work.file],work.start,work.end)?;
+                    output.send((index,block)).unwrap();
+                }
+                Ok(())
+            }));
+        }
+        drop(ready_tx);
+        let (ready,free)=(&ready_rx,&free_tx);
+        let handles:Vec<_>=(0..threads).map(|t|scope.spawn(move || parse_worker(shared,t,ready,free))).collect();
+        let result=handles.into_iter().map(|h|h.join().unwrap()).collect::<io::Result<Vec<_>>>();
+        for reader in readers{reader.join().unwrap()?;}
+        result
     })?;
     let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();

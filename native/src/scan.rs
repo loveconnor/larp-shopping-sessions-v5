@@ -96,6 +96,10 @@ fn fetch(target: *const u8) {
     let _ = target;
 }
 
+// A block moves between the reader and parser under exclusive ownership.
+// Its base points into its owned allocation or a source mapping that lives
+// until every scoped reader and parser has joined.
+unsafe impl Send for Block {}
 pub struct Block {
     buf: Vec<u8>,
     base: *const u8,
