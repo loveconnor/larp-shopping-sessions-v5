@@ -190,9 +190,9 @@ impl<T: Copy> Buckets<T> {
 #[repr(C, packed(4))]
 struct Parsed {
     id: u64,
-    user: u64,
-    /// Full UTC ingestion time, including copies ingested before the window.
-    ingest: i64,
+    user: u32,
+    /// Whole seconds near the window, or a tagged index into the source clock array.
+    ingest: u32,
     /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
@@ -532,6 +532,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
+    exact_times: Vec<i64>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
 }
@@ -548,7 +549,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::ordinal(keys::finish_long_user(name,mixed)); }
+            unsafe { (*dest).user = keys::ordinal(keys::finish_long_user(name,mixed)) as u32; }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -569,6 +570,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             (id, id.wrapping_mul(MIX))
         };
         let (p, n) = field(3);
+        let whole = n == 20 && *p.add(19) == b'Z';
         let ingest = ts::ingest(p, n, dates);
         if ingest == ts::BAD {
             return;
@@ -605,10 +607,19 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
+        let seconds = ingest / 1000 - window_start / 1000 + (1 << 30);
+        let clock = if (whole || ingest % 1000 == 0) && (0..1i64 << 31).contains(&seconds) {
+            seconds as u32
+        } else {
+            let index = u32::try_from(out.exact_times.len()).unwrap();
+            assert!(index < 1 << 31);
+            out.exact_times.push(ingest);
+            index | (1 << 31)
+        };
         let record = Parsed {
             id,
-            user,
-            ingest,
+            user: user as u32,
+            ingest: clock,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
@@ -722,7 +733,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { exact_times: Vec::new(), buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -797,7 +808,15 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            if (*record).ingest < (*other).ingest {
+                            let (a,b)=((*record).ingest,(*other).ingest);
+                            let earlier=if (a|b) < (1<<31) { a < b } else {
+                                let decode=|clock:u32,source:usize| {
+                                    if clock < (1<<31) {(i64::from(clock)-(1<<30)+shared.window_start/1000)*1000}
+                                    else {sources[source].exact_times[(clock & 0x7fff_ffff) as usize]}
+                                };
+                                decode(a,owners[index]) < decode(b,owners[(seen >> OFFSET_BITS) as usize])
+                            };
+                            if earlier {
                                 (*other).ts = DEAD;
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
@@ -812,13 +831,13 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                        links.prefetch((*base.add(offset + ahead)).user as u64);
                     }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = links.person(record.user as u64);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
