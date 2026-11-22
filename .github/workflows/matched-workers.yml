@@ -1,7 +1,7 @@
-name: Verify final candidates against scored entry and an identical control
+name: Verify finalists with one worker per available hardware thread
 on:
   push:
-    branches: [bench/controlled-finalists]
+    branches: [bench/matched-workers]
 permissions:
   contents: read
 jobs:
@@ -12,15 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 288109}
-          - {events: 60000000, format: current, seed: 288109}
-          - {events: 20000000, format: current, seed: 515359}
-          - {events: 60000000, format: current, seed: 515359}
+          - {events: 20000000, format: current, seed: 902281}
+          - {events: 60000000, format: current, seed: 902281}
+          - {events: 20000000, format: current, seed: 342799}
+          - {events: 60000000, format: current, seed: 342799}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: 9ef2724e35e729e16d5ae4ee909e61a68c0acb92
+      RANKED: 46fc4d2d43b3d07cca0e4b1876c605e3a67c9525
       CANDIDATE: 2182f2fd4c92f5fa44fbe9202cfe90533644b3db
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +64,7 @@ jobs:
           cpuset = ",".join(map(str, cpus))
           labels = ["ranked", "candidate", "control"]
           samples = {label: [] for label in labels}
-          print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
+          print(f"Native CPUs {cpuset}; one software worker per available vCPU; 12 GiB/no swap", flush=True)
           scratch = root / "scratch"
           scratch.mkdir(mode=0o777)
           scratch.chmod(0o777)
@@ -84,7 +84,7 @@ jobs:
                       "--read-only", "--user", "1000:1000", "--cap-drop", "ALL",
                       "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
                       "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
-                      "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
+                      "-e", "HOME=/scratch", "-e", f"NCPU={len(cpus)}", "-e", "MEM_GB=24",
                       "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label]
                   cid = subprocess.check_output(args, text=True).strip()
                   try:
