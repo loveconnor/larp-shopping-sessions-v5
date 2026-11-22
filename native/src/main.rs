@@ -953,6 +953,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
                     let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut stride = 1usize;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
@@ -991,7 +992,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             }
                             break;
                         }
-                        slot = (slot + 1) & mask;
+                        // Triangular offsets visit every slot of a power-of-two
+                        // table. The first collision still probes its neighbor.
+                        slot = (slot + stride) & mask;
+                        stride += 1;
                     }
                 }
             }
