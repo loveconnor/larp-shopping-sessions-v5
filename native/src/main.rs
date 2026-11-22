@@ -1480,7 +1480,7 @@ fn main() -> io::Result<()> {
 
     // Extra readers share the same CPU budget and overlap blocking preads
     // and page faults. In-memory phases keep one worker per available CPU.
-    let readers = (threads + threads / 2).min(32);
+    let readers = (2 * threads).min(32);
     let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..readers)
             .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
