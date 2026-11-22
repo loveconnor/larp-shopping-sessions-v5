@@ -103,7 +103,14 @@ impl<T: Copy> Buckets<T> {
     }
 
     #[inline(always)]
-    fn push(&mut self, part: usize, value: T) -> *mut T {
+    fn push(&mut self, part:usize, value:T)->*mut T {
+        let at=self.reserve_slot(part);
+        unsafe {at.write(value);}
+        at
+    }
+
+    #[inline(always)]
+    fn reserve_slot(&mut self, part: usize) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -114,7 +121,6 @@ impl<T: Copy> Buckets<T> {
             // into its cache while other partitions are receiving records.
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
-            at.write(value);
             *slot = at.add(1);
             at
         }
@@ -188,7 +194,7 @@ impl<T: Copy> Buckets<T> {
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
-#[repr(C, packed(4))]
+#[repr(C, align(32))]
 struct Parsed {
     id: u64,
     user: u64,
@@ -762,7 +768,16 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let dest=out.buckets.reserve_slot((partition_hash>>id_shift) as usize);
+        #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+        {
+            use std::arch::x86_64::*;
+            let clocks=u64::from(record.ingest) | (u64::from(record.ts)<<32);
+            let words=_mm256_set_epi64x(i64::from(record.payload),clocks as i64,record.user as i64,record.id as i64);
+            _mm256_store_si256(dest.cast(),words);
+        }
+        #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
+        dest.write(record);
         if deferred {
             lookups[queued] = (name,dest,mixed);
             queued += 1;
