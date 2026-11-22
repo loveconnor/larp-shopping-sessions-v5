@@ -1,4 +1,4 @@
-name: Compare fresh and selectively updated execution profiles on identical test data
+name: Compare two matched-profile builds of dominant-partition grouping on identical test data
 on:
   push:
     branches: [bench/profile-crossover]
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 605179}
-          - {events: 60000000, format: current, seed: 605179}
-          - {events: 20000000, format: current, seed: 384733}
-          - {events: 60000000, format: current, seed: 384733}
+          - {events: 20000000, format: current, seed: 255709}
+          - {events: 60000000, format: current, seed: 255709}
+          - {events: 20000000, format: current, seed: 873649}
+          - {events: 60000000, format: current, seed: 873649}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      FRESH: 00a45e46002b8bdf14541a625eff939370846e38
-      SURGICAL: a34fe7d0c0b8492d58c57c8732b8db8982e4c464
+      FRESH: 60ddef3d6ccfbb871be089dad7e52447cd64c9b3
+      SURGICAL: a2ace9b98f89f865d2e9ad8ed3745977f3adf50f
     steps:
       - uses: actions/checkout@v4
         with:
