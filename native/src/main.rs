@@ -44,7 +44,7 @@ const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
 const GROUP_ROWS: usize = 1 << 17;
 /// How many records ahead to prefetch a links lookup.
-const AHEAD: usize = 16;
+const AHEAD: usize = 24;
 
 // ---------------------------------------------------------------- buckets
 
@@ -1034,7 +1034,7 @@ type Totals = [i64; 4];
 
 // Every pair in one bin is within a session gap. Between occupied bins,
 // comparing their exact extrema decides whether their sessions connect.
-const BIN_SHIFT: u32 = 20;
+const BIN_SHIFT: u32 = 19;
 const _: () = assert!((1u64 << BIN_SHIFT) <= SESSION_GAP);
 
 #[derive(Clone, Copy)]
