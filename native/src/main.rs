@@ -917,11 +917,10 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
-    let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
-    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
+    let person_bits = shared.person_bits;
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
@@ -997,14 +996,11 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             }
             for &(base, count) in &chunks {
                 for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = record.user;
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
@@ -1016,6 +1012,57 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         }
     }
     out
+}
+
+/// The hash used to partition raw users is also the hash used by the alias
+/// table. Resolve one contiguous range of that table at a time. Retain rows
+/// in their original storage whenever their canonical partition is the same.
+type KeptChunks = Vec<Vec<(usize,usize)>>;
+
+fn canonicalize(shared:&Shared, raw:&[Buckets<Event>], n:usize) -> (KeptChunks,Vec<Buckets<Event>>) {
+    let parts = 1usize << shared.person_bits;
+    let next = AtomicUsize::new(0);
+    let links = shared.links.get().unwrap();
+    let run = || {
+        let mut routed = Buckets::new(parts);
+        let mut chunks = Vec::new();
+        let mut kept_parts = Vec::new();
+        loop {
+            let part = next.fetch_add(1,Ordering::Relaxed);
+            if part >= parts { break; }
+            chunks.clear();
+            for source in raw { source.chunks(part,&mut chunks); }
+            let mut kept = Vec::with_capacity(chunks.len());
+            for &(base,count) in &chunks {
+                let mut len=0;
+                for i in 0..count {
+                    let event = unsafe { *base.add(i) };
+                    let person = links.person(event.person);
+                    let dest = person_part(person,shared.person_bits);
+                    let result = Event{person,value:event.value};
+                    if dest == part {
+                        if len != i || person != event.person {
+                            unsafe { base.add(len).write(result); }
+                        }
+                        len+=1;
+                    } else { routed.push(dest,result); }
+                }
+                if len>0 { kept.push((base as usize,len)); }
+            }
+            kept_parts.push((part,kept));
+        }
+        (kept_parts,routed)
+    };
+    let mut kept:KeptChunks=(0..parts).map(|_|Vec::new()).collect();
+    let moved = std::thread::scope(|scope| {
+        let handles:Vec<_>=(0..n).map(|_|scope.spawn(&run)).collect();
+        handles.into_iter().map(|h| {
+            let (results,routed) = h.join().unwrap();
+            for (i,list) in results { kept[i]=list; }
+            routed
+        }).collect()
+    });
+    (kept,moved)
 }
 
 // ---------------------------------------------------------------- phase 3
@@ -1291,6 +1338,7 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
+    kept: &KeptChunks,
     clicks: &[ClickSource],
     order: &[u32],
     next: &AtomicUsize,
@@ -1323,6 +1371,7 @@ fn session_worker(
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
+        event_chunks.extend(kept[part].iter().map(|&(p,n)|(p as *mut Event,n)));
         for source in events {
             source.chunks(part, &mut event_chunks);
         }
@@ -1684,16 +1733,14 @@ fn main() -> io::Result<()> {
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
+    let (kept, moved) = canonicalize(shared,&events,threads);
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
     let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
     let weight = |part: u32| {
-        events
-            .iter()
-            .map(|buckets| buckets.chunks[part as usize] as u64)
-            .sum::<u64>()
+        kept[part as usize].len() as u64 + moved.iter().map(|b| b.chunks[part as usize] as u64).sum::<u64>()
     };
     order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
     let order = &order;
@@ -1701,8 +1748,8 @@ fn main() -> io::Result<()> {
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
+                let (events, kept, clicks, next) = (&moved, &kept, &clicks, &next);
+                scope.spawn(move || session_worker(shared, events, kept, clicks, order, next, thread))
             })
             .collect();
         handles
@@ -1789,12 +1836,13 @@ fn main() -> io::Result<()> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
-            let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (events, moved, clicks, segments, next) = (&events, &moved, &clicks, &segments, &next);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
+                moved[thread].release();
                 clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
