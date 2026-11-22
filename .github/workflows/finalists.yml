@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["403241,527053,679051", "961991,263909,352173"]
+        seed_list: ["405799,570233,734709", "825601,604721,311137", "674971,296227,552169", "847697,428779,219133"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 44f665bb243d84b7744586b5406ab06bf2878bb9
+      CANDIDATE: 5c85f9fad2efdec48ab64255fecdb25320a87935
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,6 +36,16 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
+          cat > "$RUNNER_TEMP/which-engine.c" <<'EOF'
+          #include <stdio.h>
+          int main(void) {
+              puts(__builtin_cpu_supports("x86-64-v4") ? (__builtin_cpu_supports("avx512vbmi2") ? "wide" : "n4") : (__builtin_cpu_supports("x86-64-v3") ? "v3" : "base"));
+          }
+          EOF
+          cc "$RUNNER_TEMP/which-engine.c" -o "$RUNNER_TEMP/which-engine"
+          level=$("$RUNNER_TEMP/which-engine")
+          echo "Selected CPU engine $level"
+          sha256sum "$RUNNER_TEMP/ranked/shopping-sessions.$level" "$RUNNER_TEMP/candidate/shopping-sessions.$level"
           docker tag ranked control
       - name: Generate fresh data
         run: |
