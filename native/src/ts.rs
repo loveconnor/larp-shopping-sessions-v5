@@ -34,6 +34,7 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// The epoch day of each `YYYY-MM-DD` seen, by its day of month: a dataset
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
+    ascii_day: [(u64,u32,i64);256],
     month: [u64; 100],
     midnight: [i64; 100],
 }
@@ -41,6 +42,7 @@ pub struct Dates {
 impl Dates {
     pub fn new() -> Self {
         Self {
+            ascii_day: [(0,0,0);256],
             month: [0; 100],
             midnight: [0; 100],
         }
@@ -111,46 +113,25 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
 unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe {
         use std::arch::x86_64::*;
-        let raw = load64(p); // YYYY-MM-
-        // "-MM-DDTHH:MM:SS" and one byte the caller checks.
-        let text = _mm_loadu_si128(p.add(4) as *const __m128i);
-        let template = _mm_setr_epi8(
-            b'-' as i8, 0x30, 0x30, b'-' as i8, 0x30, 0x30, b'T' as i8, 0x30, 0x30, b':' as i8, 0x30, 0x30, b':' as i8,
-            0x30, 0x30, 0,
-        );
-        let most = _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
-        // Digits become 0..=9 and separators 0; anything else is over `most`.
-        let digits = _mm_xor_si128(text, template);
-        let over = _mm_subs_epu8(digits, most);
-        let pairs = _mm_shuffle_epi8(
-            digits,
-            _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1),
-        );
-        // 16-bit day, hour, minute, second.
-        let parts = _mm_maddubs_epi16(pairs, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
-        let late = _mm_cmpgt_epi16(parts, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0));
-        let wrong = _mm_or_si128(over, late);
-        if _mm_testz_si128(wrong, wrong) == 0 {
-            return BAD;
-        }
-        // 32-bit hour * 3600, then minute * 60 + second.
-        let sums = _mm_cvtsi128_si64(_mm_madd_epi16(parts, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0))) as u64;
-        let second = ((sums & 0xFFFF_FFFF) + (sums >> 32)) as i64;
-        let day = (_mm_cvtsi128_si32(parts) & 0xFFFF) as i64;
-        let slot = day as usize;
-        let midnight = if *dates.month.get_unchecked(slot) == raw {
-            *dates.midnight.get_unchecked(slot)
-        } else {
-            let days = civil_day(raw, day);
-            if days == BAD {
-                return BAD;
-            }
-            dates.month[slot] = raw;
-            let midnight = days * 86_400;
-            dates.midnight[slot] = midnight;
-            midnight
-        };
-        midnight + second
+        let raw=load64(p);
+        let suffix=load32(p.add(8)) & 0x00ff_ffff;
+        // The normal form keeps one slot per pair of ASCII day digits,
+        // independent of the decimal conversion of the time of day.
+        let slot=((suffix ^ (suffix >> 4)) & 255) as usize;
+        let saved=dates.ascii_day[slot];
+        let clock=load64(p.add(11)) ^ u64::from_le_bytes(*b"00:00:00");
+        let invalid=(clock.wrapping_add(0x7676_7f76_767f_7676)|clock)&HIGH;
+        let text=_mm_cvtsi64_si128(clock as i64);
+        let packed=_mm_shuffle_epi8(text,_mm_setr_epi8(0,1,3,4,6,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1));
+        let pairs=_mm_maddubs_epi16(packed,_mm_set1_epi16(0x010a));
+        let over=_mm_cmpgt_epi16(pairs,_mm_setr_epi16(23,59,59,0,0,0,0,0));
+        if invalid!=0 || _mm_movemask_epi8(over)!=0 {return BAD;}
+        let sum=_mm_madd_epi16(pairs,_mm_setr_epi16(3600,60,1,0,0,0,0,0));
+        let time=i64::from(_mm_cvtsi128_si32(_mm_add_epi32(sum,_mm_srli_si128::<4>(sum))));
+        if saved.0==raw && saved.1==suffix && raw!=0 {return saved.2+time;}
+        let seconds=civil_seconds_plain(p,dates);
+        if seconds != BAD {dates.ascii_day[slot]=(raw,suffix,seconds-time);}
+        seconds
     }
 }
 
