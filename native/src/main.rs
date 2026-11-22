@@ -1318,9 +1318,8 @@ fn main() -> io::Result<()> {
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
-    // Reuse worker read buffers on Linux to avoid establishing mappings
-    // for the entire input. SS_MAP=1 selects the mapped scanner.
-    let map = tune("SS_MAP", if cfg!(target_os = "linux") { 0 } else { 1 }) != 0;
+    // Workers scan mapped pages directly; file tails use padded read buffers.
+    let map = tune("SS_MAP", 1) != 0;
     let give_back = tune("SS_RELEASE", 1) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
