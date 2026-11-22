@@ -1150,10 +1150,11 @@ fn session_worker(
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
-    let mut table_keys: Vec<u64> = Vec::new();
-    let mut table_ids: Vec<u32> = Vec::new();
-    let mut persons: Vec<u64> = Vec::new();
-    let mut ends: Vec<u32> = Vec::new();
+    #[derive(Clone, Copy)]
+    struct Group { person:u64, end:u32, next:u32 }
+    let vacant=Group {person:0,end:0,next:NONE};
+    let mut groups:Vec<Group>=Vec::new();
+    let mut persons:Vec<usize>=Vec::new();
     let mut local: Vec<u32> = Vec::new();
     let mut values: Vec<u64> = Vec::new();
     let mut click_ends: Vec<u32> = Vec::new();
@@ -1172,59 +1173,44 @@ fn session_worker(
         }
 
         // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
-        let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
+        let capacity=(total/12+16).next_power_of_two();
+        let mask=capacity-1;
+        groups.clear();
+        groups.resize(capacity,vacant);
         persons.clear();
-        ends.clear();
         local.clear();
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
+                    loop {
+                        let g=*groups.get_unchecked(slot);
+                        if g.person==person {break;}
+                        if g.person==0 {
+                            groups.get_unchecked_mut(slot).person=person;
+                            persons.push(slot);
+                            break;
                         }
-                        if key == 0 {
-                            let id = persons.len() as u32;
-                            *table_keys.get_unchecked_mut(slot) = person;
-                            *table_ids.get_unchecked_mut(slot) = id;
-                            persons.push(person);
-                            ends.push(0);
-                            break id;
+                        if g.next==NONE {
+                            let fresh=groups.len();
+                            groups.get_unchecked_mut(slot).next=fresh as u32;
+                            groups.push(Group{person,end:0,next:NONE});
+                            persons.push(fresh);
+                            slot=fresh;
+                            break;
                         }
-                        slot = (slot + 1) & mask;
-                    };
-                    *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
+                        slot=g.next as usize;
                     }
+                    groups.get_unchecked_mut(slot).end+=1;
+                    local.push(slot as u32);
                 }
             }
             // `ends` holds counts; make it each person's first slot, then fill,
             // which leaves it at each person's end.
             let mut sum = 0u32;
-            for end in ends.iter_mut() {
+            for &id in &persons {
+                let end=&mut groups[id].end;
                 let count = *end;
                 *end = sum;
                 sum += count;
@@ -1235,7 +1221,7 @@ fn session_worker(
             let mut index = 0;
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
+                    let end = &mut groups.get_unchecked_mut(*local.get_unchecked(index) as usize).end;
                     *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
                     *end += 1;
                     index += 1;
@@ -1249,7 +1235,7 @@ fn session_worker(
             source.buckets.chunks(part, &mut click_chunks);
         }
         click_ends.clear();
-        click_ends.resize(persons.len(), 0);
+        click_ends.resize(groups.len(), 0);
         click_local.clear();
         let mut kept = 0usize;
         unsafe {
@@ -1257,15 +1243,11 @@ fn session_worker(
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            break NONE;
-                        }
-                        slot = (slot + 1) & mask;
+                    let id=loop {
+                        let g=*groups.get_unchecked(slot);
+                        if g.person==person {break slot as u32;}
+                        if g.next==NONE {break NONE;}
+                        slot=g.next as usize;
                     };
                     click_local.push(id);
                     if id != NONE {
@@ -1275,7 +1257,8 @@ fn session_worker(
                 }
             }
             let mut sum = 0u32;
-            for end in click_ends.iter_mut() {
+            for &id in &persons {
+                let end=&mut click_ends[id];
                 let count = *end;
                 *end = sum;
                 sum += count;
@@ -1310,8 +1293,9 @@ fn session_worker(
         }
 
         let (mut from, mut click_from) = (0usize, 0usize);
-        for (id, &person) in persons.iter().enumerate() {
-            let to = ends[id] as usize;
+        for &id in &persons {
+            let person=groups[id].person;
+            let to=groups[id].end as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
             if mine.len() > 2048 {
