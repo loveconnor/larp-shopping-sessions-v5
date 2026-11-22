@@ -12,13 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 856909}
+          - {events: 20000000, format: current, seed: 862079}
+          - {events: 60000000, format: current, seed: 862079}
+          - {events: 20000000, format: current, seed: 862099}
+          - {events: 60000000, format: current, seed: 862099}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 22a11e6d0bfff5f8779fa0fdbe8ef0f5c169e2e8
-      CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
+      CANDIDATE: 3b74f4fbfa088ae4eceaf976e9b63f8e6d2a9db2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,14 +30,18 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          mkdir "$RUNNER_TEMP/profile-src"
-          git archive "$RANKED" | tar -x -C "$RUNNER_TEMP/profile-src"
-          cd "$RUNNER_TEMP/profile-src"
-          sed -i '/^WORKDIR \/src/a ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none' Dockerfile
-          sed -i 's/install -y --no-install-recommends libjemalloc2/install -y --no-install-recommends libjemalloc2 google-perftools binutils/' Dockerfile
-          sed -i '1i#include <stdio.h>' native/platform/select-engine.c
-          sed -i 's/execv(path, argv);/puts(path); return 0;/' native/platform/select-engine.c
-          docker build -q -t sampled .
+          for label in ranked candidate; do
+            sha=$CANDIDATE
+            if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            mkdir "$RUNNER_TEMP/$label-src"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
+            docker rm "$cid"
+          done
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
@@ -45,59 +52,74 @@ jobs:
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
-      - name: Sample native CPU time at source lines with the ranked allocator and engine
-        run: |
-          cd "$RUNNER_TEMP"
-          mkdir -p sampled-out profile
-          chmod 777 sampled-out profile
-          docker run --rm -v "$RUNNER_TEMP/data:/data:ro" -v "$RUNNER_TEMP/profile:/profile" \
-            -v "$RUNNER_TEMP/sampled-out:/output" -e NCPU=8 sampled sh -ec '
-              binary=$(/app/shopping-sessions)
-              test -x "$binary"
-              for trial in 1 2 3; do
-                CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 "$binary"
-              done
-              cp "$binary" /profile/engine
-              ls -lh /profile
-              test -x "$binary"
-              echo "Sampled engine $binary"
-              google-pprof --text --lines "$binary" /profile/cpu-* > /profile/lines.txt
-              google-pprof --text "$binary" /profile/cpu-* > /profile/functions.txt
-              head -65 /profile/lines.txt
-              head -45 /profile/functions.txt
-            '
-      - name: Resolve sampled instructions separately for each process address space
+      - name: Alternate fresh restricted runc containers and compare both complete output tables
         shell: python
         run: |
-          import collections, os, pathlib, re, struct, subprocess
-          d = pathlib.Path(os.environ["RUNNER_TEMP"]) / "profile"
-          counts = collections.Counter()
-          total = 0
-          for f in d.glob("cpu-*"):
-              data = f.read_bytes()
-              words = struct.iter_unpack("<Q",data[:len(data)//8*8])
-              for i in range(5): next(words)
-              leaves = []
-              while True:
-                  n, depth = next(words)[0], next(words)[0]
-                  ips = [next(words)[0] for i in range(depth)]
-                  if ips == [0]: break
-                  leaves.append((n,ips[0]))
-              segments = [(int(a,16),int(b,16),int(off,16)) for a,b,off in re.findall(rb"(?m)^([a-f0-9]+)-([a-f0-9]+) r-xp ([a-f0-9]+) .*?/app/shopping-sessions[^\n]*",data)]
-              assert segments, f
-              for n,ip in leaves:
-                  total += n
-                  for a,b,off in segments:
-                      if a <= ip < b: counts[ip-a+off] += n
-          ips = list(counts)
-          locs = subprocess.check_output(["addr2line","-e",str(d/"engine")],input="".join(f"{ip:x}\n" for ip in ips),text=True).splitlines()
-          grouped = collections.Counter()
-          for ip,loc in zip(ips,locs): grouped[loc]+=counts[ip]
-          result = "\n".join(f"{n:5} {100*n/total:5.1f}%  {loc}" for loc,n in grouped.most_common(50))
-          print(f"{sum(counts.values())}/{total} leaf samples in the pipeline executable\n"+result)
-          (d/"hot-lines.txt").write_text(result)
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: native-cpu-samples
-          path: ${{ runner.temp }}/profile/
+          import datetime, json, os, pathlib, shutil, statistics, subprocess
+          import duckdb
+
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          cpus = sorted(os.sched_getaffinity(0))[:8]
+          cpuset = ",".join(map(str, cpus))
+          labels = ["ranked", "candidate"]
+          samples = {label: [] for label in labels}
+          print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
+          scratch = root / "scratch"
+          scratch.mkdir(mode=0o777)
+          scratch.chmod(0o777)
+          for round_number in range(6):
+              for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  output = root / f"{label}-out-{round_number}"
+                  output.mkdir()
+                  output.chmod(0o777)
+                  args = ["docker", "create", "--runtime", "runc", "--cpuset-cpus", cpuset,
+                      "--memory", "12g", "--memory-swap", "12g", "--network", "none",
+                      "--read-only", "--user", "1000:1000", "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+                      "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
+                      "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
+                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label]
+                  cid = subprocess.check_output(args, text=True).strip()
+                  try:
+                      subprocess.run(["docker", "start", "-a", cid], check=True)
+                      state = json.loads(subprocess.check_output(["docker", "inspect", cid]))[0]["State"]
+                      assert state["ExitCode"] == 0 and not state["OOMKilled"], state
+                      def stamp(value):
+                          return datetime.datetime.fromisoformat(value[:26] + "+00:00")
+                      seconds = (stamp(state["FinishedAt"]) - stamp(state["StartedAt"])).total_seconds()
+                      if round_number:
+                          samples[label].append(seconds)
+                      print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
+                  finally:
+                      subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
+          for table in ("user_daily", "campaign_daily"):
+              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-5/{table}/*.parquet')" for label in labels]
+              for lhs, rhs in ((a,b),(b,a)):
+                  assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
+          for label in labels:
+              m = statistics.median(samples[label])
+              print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+
+      - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: matrix.events == 20000000 && matrix.format == 'current'
+        run: |
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/starter-polars.zip"
+          curl --retry 3 -fsSLO "$track/dev-answer.zip"
+          unzip -q starter-polars.zip
+          echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
+          unzip -q dev-answer.zip
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in candidate; do
+            for fixture in starter-polars/fixtures/*/; do
+              rm -rf verify-out
+              mkdir -p verify-out
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
+            done
+            rm -rf verify-out
+            mkdir -p verify-out
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
+          done
