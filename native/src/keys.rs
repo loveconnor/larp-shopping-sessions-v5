@@ -185,18 +185,17 @@ pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
         use std::arch::x86_64::{_bzhi_u64, _pext_u64};
         const LOW: u64 = 0x7F7F_7F7F_7F7F_7F7F;
         const HIGH: u64 = 0x8080_8080_8080_8080;
-        if len == 0 {
-            return 0;
-        }
-        if len <= 9 {
-            // The first eight bytes, with those past the end cleared.
-            let x = _bzhi_u64(u64::from_le((p as *const u64).read_unaligned()), len as u32 * 8);
-            // 0x80 in every byte that is 1..=127: wanted in each byte of the ID.
-            let plain = (x & LOW).wrapping_add(LOW) & !x & HIGH;
-            let ninth = if len == 9 { *p.add(8) } else { 1 };
-            if plain == _bzhi_u64(HIGH, len as u32 * 8) && ninth.wrapping_sub(1) < 127 {
-                let ninth = if len == 9 { ninth as u64 } else { 0 };
-                return (_pext_u64(x.swap_bytes(), LOW) << 7) | ninth;
+        if len == 9 {
+            let x = u64::from_le((p as *const u64).read_unaligned());
+            let ninth = *p.add(8);
+            if (x & LOW).wrapping_add(LOW) & !x & HIGH == HIGH && ninth.wrapping_sub(1) < 127 {
+                return (_pext_u64(x.swap_bytes(), LOW) << 7) | u64::from(ninth);
+            }
+        } else if len <= 8 {
+            let bits = len as u32 * 8;
+            let x = _bzhi_u64(u64::from_le((p as *const u64).read_unaligned()), bits);
+            if (x & LOW).wrapping_add(LOW) & !x & HIGH == _bzhi_u64(HIGH, bits) {
+                return _pext_u64(x.swap_bytes(), LOW) << 7;
             }
         }
         intern(std::slice::from_raw_parts(p, len))
