@@ -38,6 +38,8 @@ const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
 const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+const UNMIX: u64 = 0xf1de83e19937733d;
+const _: () = assert!(MIX.wrapping_mul(UNMIX) == 1);
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
@@ -377,7 +379,7 @@ impl Links {
                 let group = &mut groups[at];
                 if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
                     group.keys[lane] = key;
-                    group.values[lane] = person;
+                    group.values[lane] = person.wrapping_mul(MIX);
                     break;
                 }
                 at = (at + 1) & (count - 1);
@@ -395,11 +397,13 @@ impl Links {
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
+        // Carry the reversible hash through partitioning and grouping.
+        let mixed = key.wrapping_mul(MIX);
         if self.empty {
-            return key;
+            return mixed;
         }
         let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+        let mut slot = (mixed >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -414,7 +418,7 @@ impl Links {
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
                 return group.values[lane];
             }
-            if group.keys[3] == 0 { return key; }
+            if group.keys[3] == 0 { return mixed; }
             slot = (slot + 1) & mask;
         }
     }
@@ -630,7 +634,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
 
 #[inline(always)]
 fn person_part(person: u64, bits: u32) -> usize {
-    (person.wrapping_mul(MIX) >> (64 - bits)) as usize
+    (person >> (64 - bits)) as usize
 }
 
 const LONG_EVENT: u64 = 3 << 62;
@@ -1100,7 +1104,7 @@ impl Sessions<'_> {
             )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        writer.keyed(0, person, |name| keys::unpack(person, name));
+        writer.keyed(0, person, |name| keys::unpack(person.wrapping_mul(UNMIX), name));
         writer.int(1, shared.first_day + day as i64);
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);
@@ -1424,7 +1428,7 @@ fn session_worker(
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut slot = (person >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
                         if key == person {
@@ -1450,7 +1454,7 @@ fn session_worker(
                         table_ids.clear();
                         table_ids.resize(capacity, 0);
                         for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
+                            let mut slot = (person >> 24) as usize & mask;
                             while table_keys[slot] != 0 {
                                 slot = (slot + 1) & mask;
                             }
@@ -1495,7 +1499,7 @@ fn session_worker(
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut slot = (person >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
                         if key == person {
