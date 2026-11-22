@@ -655,10 +655,49 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+/// Opaque event names are appended once but can be compared until dedup
+/// finishes. Fixed pages keep those bytes stationary as the name count grows.
+#[derive(Default)]
+struct NamePages {
+    pages: Vec<Box<[std::mem::MaybeUninit<[u8; 33]>]>>,
+    next: usize,
+}
+impl NamePages {
+    const SHIFT: u32 = 13;
+    const SIZE: usize = 1 << Self::SHIFT;
+
+    #[cold]
+    fn grow(&mut self) {
+        self.pages.push(Box::<[[u8;33]]>::new_uninit_slice(Self::SIZE));
+    }
+
+    #[inline(always)]
+    fn push(&mut self, name: [u8;33]) -> u32 {
+        let index = self.next;
+        let slot = index & (Self::SIZE - 1);
+        if slot == 0 { self.grow(); }
+        // Exactly one page is added at every page boundary.
+        unsafe { self.pages.last_mut().unwrap_unchecked().get_unchecked_mut(slot).write(name); }
+        self.next += 1;
+        u32::try_from(index).expect("too many opaque names in one worker")
+    }
+}
+impl std::ops::Index<usize> for NamePages {
+    type Output = [u8;33];
+    #[inline(always)]
+    fn index(&self, index:usize) -> &Self::Output {
+        assert!(index < self.next);
+        unsafe {
+            self.pages.get_unchecked(index >> Self::SHIFT)
+                .get_unchecked(index & (Self::SIZE-1)).assume_init_ref()
+        }
+    }
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: NamePages,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -707,8 +746,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let index = out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -777,7 +815,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
 
 struct ClickSource {
     buckets: Buckets<Click>,
-    names: Vec<[u8; 33]>,
+    names: NamePages,
     worker: usize,
 }
 
@@ -816,8 +854,7 @@ fn parse_clicks(
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
-            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-            out.names.push(*p.cast::<[u8; 33]>());
+            let index = out.names.push(*p.cast::<[u8; 33]>());
             LONG_EVENT | (out.worker as u64) << 32 | index as u64
         } else {
             keys::pack(p, n)
@@ -897,10 +934,10 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
-        names: Vec::new(),
+        names: NamePages::default(),
         overflow_times: Vec::new(),
     };
-    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
+    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: NamePages::default(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
