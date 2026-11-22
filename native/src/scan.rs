@@ -225,6 +225,27 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
 unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) -> usize {
     unsafe {
         let count = bits.count_ones() as usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        if UNROLL == 7 {
+            // Deposit zeroes into the first four matching positions so the
+            // fifth offset can be decoded independently of the first four.
+            let mut tail = std::arch::x86_64::_pdep_u64(!15u64, bits);
+            for at in 0..4 {
+                *out.add(at) = base + bits.trailing_zeros();
+                bits &= bits.wrapping_sub(1);
+            }
+            for at in 4..7 {
+                *out.add(at) = base + tail.trailing_zeros();
+                tail &= tail.wrapping_sub(1);
+            }
+            let mut at = 7;
+            while tail != 0 {
+                *out.add(at) = base + tail.trailing_zeros();
+                tail &= tail.wrapping_sub(1);
+                at += 1;
+            }
+            return count;
+        }
         for at in 0..UNROLL {
             *out.add(at) = base + bits.trailing_zeros();
             bits &= bits.wrapping_sub(1);
@@ -713,6 +734,29 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seven_offset_decoder_matches_scalar_positions() {
+        let mut random = 0x13fc_b692_a85d_7201u64;
+        for step in 0..70_000u32 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let bits = match step % 4 {
+                0 => random & random.rotate_left(7) & random.rotate_left(17),
+                1 => u64::MAX.checked_shl(step % 65).unwrap_or(0),
+                2 => random | random.rotate_left(31),
+                _ => random,
+            };
+            let base = step * 64;
+            let mut actual = [u32::MAX; 72];
+            let n = unsafe { flatten::<7>(bits, base, actual.as_mut_ptr()) };
+            let expected: Vec<_> = (0..64).filter(|i| bits & (1 << i) != 0)
+                .map(|i| base + i).collect();
+            assert_eq!(&actual[..n], expected);
+            assert_eq!(actual[n.max(7)], u32::MAX);
+        }
+    }
 
     fn collect<const N: usize>(block: &Block, slow: bool) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
