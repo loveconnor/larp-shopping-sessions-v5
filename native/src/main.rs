@@ -942,6 +942,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         }
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
+        // Most partitions have ample spare locator bits. Keep the table at
+        // four bytes per slot and reject unrelated keys before fetching rows.
+        // Oversized partitions retain the original full-width locator.
+        let tag_mask = if chunks.len() <= 1 << (24 - OFFSET_BITS) { 0xff00_0000 } else { 0 };
         table.clear();
         table.resize(capacity, NONE);
         unsafe {
@@ -952,13 +956,21 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let hash = hash_key.wrapping_mul(MIX);
+                    let tag = (hash as u32).rotate_left(24) & tag_mask;
+                    let tagged_entry = tag | entry;
+                    let mut slot = (hash >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
+                            *table.get_unchecked_mut(slot) = tagged_entry;
                             break;
                         }
+                        if seen & tag_mask != tag {
+                            slot = (slot + 1) & mask;
+                            continue;
+                        }
+                        let seen = seen & !tag_mask;
                         let other = chunks
                             .get_unchecked((seen >> OFFSET_BITS) as usize)
                             .0
@@ -985,7 +997,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             };
                             if earlier {
                                 (*other).ts = DEAD;
-                                *table.get_unchecked_mut(slot) = entry;
+                                *table.get_unchecked_mut(slot) = tagged_entry;
                             } else {
                                 (*record).ts = DEAD;
                             }
