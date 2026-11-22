@@ -1768,9 +1768,24 @@ fn main() -> io::Result<()> {
     let parse = began.elapsed();
 
     let next = AtomicUsize::new(0);
+    let mut segments = Vec::new();
+    if give_back {
+        for (file, source) in shared.files.iter().enumerate() {
+            for start in (0..source.size).step_by(SEGMENT as usize) {
+                segments.push((file, start, (start + SEGMENT).min(source.size)));
+            }
+        }
+    }
+    let next_segment = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|_| scope.spawn(|| {
+                let events = dedup_worker(shared, &parsed_events, &next);
+                while let Some(&(file, start, end)) = segments.get(next_segment.fetch_add(1, Ordering::Relaxed)) {
+                    shared.files[file].release(start, end);
+                }
+                events
+            }))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
@@ -1865,30 +1880,16 @@ fn main() -> io::Result<()> {
 
     // Nothing reads any of this any more. Give it back from every thread at
     // once: left to the kernel, it is freed on one thread at exit, on the clock.
-    let mut segments = Vec::new();
-    for (file, source) in shared.files.iter().enumerate() {
-        let mut start = 0;
-        while start < source.size {
-            segments.push((file, start, (start + SEGMENT).min(source.size)));
-            start += SEGMENT;
-        }
-    }
-    if !give_back {
-        segments.clear();
-    }
-    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
-            let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (events, clicks) = (&events, &clicks);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
                 clicks[thread].buckets.release();
-                while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    shared.files[file].release(start, end);
-                }
+
             });
         }
         if let Some(links) = shared.links.get().filter(|_| give_back) {
