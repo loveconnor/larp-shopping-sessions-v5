@@ -606,14 +606,15 @@ struct EventSource {
     names: Vec<[u8; 33]>,
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+#[inline(always)]
+unsafe fn decode_event(shared: &Shared, buf: *const u8, start: u32, seps: &[u32; 7], copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
+
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
@@ -673,7 +674,38 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             payload,
         };
         out.buckets.push((partition_hash >> id_shift) as usize, record);
+}
+
+fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    // Group nearby rows with similar ID and timestamp widths before decoding.
+    // Equality and dedup order are determined from the full input fields.
+    const BATCH: usize = 16;
+    let mut rows = [[[0u32; 8]; BATCH]; 16];
+    let mut counts = [0usize; 16];
+    let mut data = std::ptr::null();
+    let mut drain = |buf: *const u8, rows: &[[u32; 8]]| {
+        for row in rows {
+            unsafe { decode_event(shared, buf, row[0], row[1..].try_into().unwrap(), copy, dates, out) }
+        }
+    };
+    block.raw_lines::<7>(|buf, start, seps| {
+        data = buf;
+        let time_len = seps[2] - seps[1] - 1;
+        let time = match time_len { 20 | 22 => 0, 13 | 15 => 1, 25 | 27 => 2, _ => 3 };
+        let class = time * 4 + 2 * usize::from(seps[0] - start > 24) + usize::from(seps[1] - seps[0] > 24);
+        let count = &mut counts[class];
+        let row = &mut rows[class][*count];
+        row[0] = start;
+        row[1..].copy_from_slice(seps);
+        *count += 1;
+        if *count == BATCH {
+            drain(buf, &rows[class]);
+            *count = 0;
+        }
     });
+    for (group, count) in rows.iter().zip(counts) {
+        drain(data, &group[..count]);
+    }
 }
 
 struct ClickSource {
