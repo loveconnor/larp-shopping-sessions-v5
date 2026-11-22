@@ -1,0 +1,101 @@
+diff --git a/native/src/main.rs b/native/src/main.rs
+index 4b7bb4e..ad2a7b0 100644
+--- a/native/src/main.rs
++++ b/native/src/main.rs
+@@ -1331,6 +1331,53 @@ unsafe fn sort_short_times(values: &mut [u64]) {
+     write(24,finish(_mm512_max_epu64(ah,bh)));
+ }
+ 
++#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
++#[inline]
++unsafe fn merge_short_histories(values: &mut [u64]) {
++    use std::arch::x86_64::*;
++    debug_assert!((33..=64).contains(&values.len()));
++    let (left, right) = values.split_at_mut(32);
++    unsafe {
++        sort_short_times(left);
++        sort_short_times(right);
++        let reverse = _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0);
++        let split = |a, b| (_mm512_min_epu64(a, b), _mm512_max_epu64(a, b));
++        let lanes = |offset| (0xffu16 >> (8 - right.len().saturating_sub(offset).min(8))) as u8;
++        let mut low = [_mm512_setzero_si512(); 4];
++        let mut high = low;
++        for i in 0..4 {
++            let a = _mm512_loadu_si512(left.as_ptr().add(8 * i).cast());
++            let offset = 8 * (3 - i);
++            let b = _mm512_mask_loadu_epi64(_mm512_set1_epi64(-1), lanes(offset),
++                right.as_ptr().wrapping_add(offset).cast());
++            (low[i], high[i]) = split(a, _mm512_permutexvar_epi64(reverse, b));
++        }
++        // Each half is bitonic. The first two stages compare registers
++        // sixteen and eight positions apart, then each vector merges locally.
++        let merge = |v: [__m512i; 4]| {
++            let (a, c) = split(v[0], v[2]);
++            let (b, d) = split(v[1], v[3]);
++            let (a, b) = split(a, b);
++            let (c, d) = split(c, d);
++            [a, b, c, d].map(|v| {
++                let w = _mm512_permutexvar_epi64(_mm512_setr_epi64(4,5,6,7,0,1,2,3), v);
++                let v = _mm512_mask_max_epu64(_mm512_min_epu64(v,w),0xf0,v,w);
++                let w = _mm512_permutexvar_epi64(_mm512_setr_epi64(2,3,0,1,6,7,4,5), v);
++                let v = _mm512_mask_max_epu64(_mm512_min_epu64(v,w),0xcc,v,w);
++                let w = _mm512_permutexvar_epi64(_mm512_setr_epi64(1,0,3,2,5,4,7,6), v);
++                _mm512_mask_max_epu64(_mm512_min_epu64(v,w),0xaa,v,w)
++            })
++        };
++        let masks: [u8; 4] = std::array::from_fn(|i| lanes(i * 8));
++        for (i, v) in merge(low).into_iter().enumerate() {
++            _mm512_storeu_si512(left.as_mut_ptr().add(i * 8).cast(), v);
++        }
++        for (i, v) in merge(high).into_iter().enumerate() {
++            _mm512_mask_storeu_epi64(right.as_mut_ptr().wrapping_add(i * 8).cast(), masks[i], v);
++        }
++    }
++}
++
+ #[cfg(all(target_arch="x86_64",target_feature="avx512f"))]
+ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+     use std::arch::x86_64::*;
+@@ -1339,6 +1386,7 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+         if n>=5 {unsafe {sort_short_times(values)}} else {values.sort_unstable();}
+         return;
+     }
++    if n <= 64 { unsafe { merge_short_histories(values) }; return; }
+     if depth==0 { values.sort_unstable(); return; }
+     let (a,b,c)=(values[0],values[n/2],values[n-1]);
+     let pivot=a.min(b).max(a.max(b).min(c));
+@@ -1365,6 +1413,34 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
+     sort_medium_times(right,r,depth-1);
+ }
+ 
++#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512f"))]
++#[test]
++fn merged_histories_match_unsigned_sort() {
++    let mut seed = 0x71b13d05a289ef43u64;
++    for n in 0..=520 {
++        for mode in 0..8 {
++            let mut guarded = vec![u64::MAX - 3; n + 2];
++            let values = &mut guarded[1..=n];
++            for (i, value) in values.iter_mut().enumerate() {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                *value = match mode {
++                    0 => seed, 1 => seed & 3, 2 => u64::MAX,
++                    3 => i as u64, 4 => (n - i) as u64,
++                    5 => (i % 2) as u64 * u64::MAX,
++                    6 => (i.abs_diff(n / 2)) as u64, _ => seed.rotate_left(i as u32),
++                };
++            }
++            let mut reference = values.to_vec();
++            reference.sort_unstable();
++            sort_medium_times(values, &mut vec![0; n], 12);
++            assert_eq!(values, reference, "length={n} mode={mode}");
++            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
++        }
++    }
++}
++
+ fn session_worker(
+     shared: &Shared,
+     events: &[Buckets<Event>],
