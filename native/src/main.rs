@@ -687,6 +687,12 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi2"))]
+    if block.packable_offsets() { return parse_events_inner::<true>(shared,block,copy,dates,out); }
+    parse_events_inner::<false>(shared,block,copy,dates,out);
+}
+
+fn parse_events_inner<const PACKED:bool>(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -701,8 +707,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
-        let field = |at: usize| scan::field(buf, start, seps, at);
+    let mut visit = |buf:*const u8, start:u32, seps:&[u32;7]| unsafe {
+        let field = |at: usize| {
+            if PACKED {
+                let end=seps[at];
+                let raw_start=if at==0 {start} else {(seps[at-1]>>1)+1};
+                let q=end&1;
+                (buf.add((raw_start+q) as usize),((end>>1)-raw_start-2*q) as usize)
+            } else {scan::field(buf,start,seps,at)}
+        };
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
@@ -771,7 +784,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 queued = 0;
             }
         }
-    });
+    };
+    #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi2"))]
+    if PACKED { block.packed_event_lines(&mut visit); }
+    if !PACKED { block.raw_lines::<7>(&mut visit); }
     drain(&lookups[..queued]);
 }
 

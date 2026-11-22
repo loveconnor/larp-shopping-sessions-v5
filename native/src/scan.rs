@@ -272,6 +272,32 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     n
 }
 
+#[cfg(all(target_arch="x86_64",target_feature="avx512vbmi2"))]
+#[inline(always)]
+unsafe fn packed_positions(bits:u64,closing:u64,base:u32,out:*mut u32)->usize {
+    use std::arch::x86_64::*;
+    const OFFSETS:[u8;64]={
+        let mut a=[0;64]; let mut i=0;
+        while i<64 {a[i]=(2*i) as u8;i+=1;} a
+    };
+    let n=bits.count_ones() as usize;
+    if n>16 {
+        let mut remaining=bits;
+        for i in 0..n {
+            let pos=remaining.trailing_zeros();
+            *out.add(i)=((base+pos)<<1) | (((closing>>pos)&1) as u32);
+            remaining &= remaining-1;
+        }
+        return n;
+    }
+    let offset=_mm512_loadu_si512(OFFSETS.as_ptr().cast());
+    let codes=_mm512_mask_add_epi8(offset,closing,offset,_mm512_set1_epi8(1));
+    let packed=_mm512_maskz_compress_epi8(bits,codes);
+    let positions=_mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
+    _mm512_storeu_si512(out.cast(),_mm512_add_epi32(_mm512_set1_epi32((base<<1) as i32),positions));
+    n
+}
+
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
 
@@ -625,6 +651,122 @@ impl Block {
                     if !clean {
                         if let Some(found) = Self::split_line::<N>(buf, start as usize) {
                             visit(buf, start, &found);
+                        }
+                    }
+                }
+                bad.pop();
+                // Separators of the line still open move to the front.
+                kept = count - sep_at;
+                std::ptr::copy(out.add(sep_at), out, kept);
+            }
+        }
+    }
+
+    pub fn packable_offsets(&self)->bool { self.end < (1usize<<31) }
+
+    #[cfg(all(target_arch="x86_64",target_feature="avx512vbmi2"))]
+    #[inline(always)]
+    pub fn packed_event_lines(&self, mut visit: impl FnMut(*const u8, u32, &[u32; 7])) {
+        const N:usize=7;
+        let buf = self.base;
+        let (own_end, end) = (self.own_end, self.end);
+        unsafe {
+            let head = std::slice::from_raw_parts(buf, own_end.min(end));
+            let Some(first) = head.iter().position(|&byte| byte == b'\n') else {
+                return;
+            };
+            if first + 1 >= end {
+                return;
+            }
+            let end = end as u32;
+            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            // Starts of chunks that break a quote rule; the last is a sentinel.
+            let mut bad: Vec<u32> = Vec::new();
+            let mut bad_at = 0usize;
+            let mut kept = 0usize;
+            let mut line = first as u32 + 1;
+            let mut at = line;
+            // 1 while a field that opened with a quote in an earlier chunk has
+            // its closing separator still to come.
+            let mut carry = 0u64;
+            while at < end {
+                if seps.capacity() < kept + WINDOW * 64 + 128 {
+                    // The separators kept from the last window move with the buffer.
+                    seps.set_len(kept);
+                    seps.reserve(WINDOW * 64 + 128);
+                }
+                let mut count = kept;
+                let mut lines = 0usize;
+                let out = seps.as_mut_ptr();
+                let ends = newlines.as_mut_ptr();
+                let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
+                while at < stop_at {
+                    let p = buf.add(at as usize);
+                    fetch(p.wrapping_add(READ_AHEAD));
+                    let classified = wide_classes(p);
+                    let (mut sep, mut newline, mut quote) = classified;
+                    let left = end - at;
+                    if left < 64 {
+                        let valid = (1u64 << left) - 1;
+                        sep &= valid;
+                        newline &= valid;
+                        quote &= valid;
+                    }
+                    let before = *p.sub(1);
+                    // A quote just before the chunk can close a field at its first byte.
+                    if (quote | carry) != 0 || before == b'"' {
+                        let after = *p.add(64);
+                        let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
+                        let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
+                        let quote_before = (quote << 1) | u64::from(before == b'"');
+                        let opening = quote & sep_before;
+                        let closing = quote & sep_after;
+                        // Both masks are subsets of quote. A quote with
+                        // neither boundary or both boundaries is invalid.
+                        let misplaced = quote ^ opening ^ closing;
+                        // Each opening seeds a carry into the following
+                        // delimiter. Bit zero is also seeded if the field
+                        // was opened in the preceding 64-byte chunk.
+                        let (sum, over) = (!sep).overflowing_add(opening | carry);
+                        let wrong = misplaced | ((sum ^ quote_before) & sep);
+                        carry = u64::from(over);
+                        if wrong != 0 {
+                            bad.push(at);
+                        }
+                    }
+                    let previous_quote = (quote<<1) | u64::from(before==b'"');
+                    let positions = packed_positions(sep,previous_quote,at,out.add(count));
+                    count += positions;
+                    lines += flatten::<2>(newline, at, ends.add(lines));
+                    at += 64;
+                }
+                // Sentinels: a line's separators are found by position.
+                for extra in 0..N {
+                    *out.add(count + extra) = u32::MAX;
+                }
+                bad.push(u32::MAX - 64);
+                let mut sep_at = 0usize;
+                for &stop in std::slice::from_raw_parts(ends, lines) {
+                    let start = line;
+                    line = stop + 1;
+                    while *bad.get_unchecked(bad_at) + 64 <= start {
+                        bad_at += 1;
+                    }
+                    let clean = *bad.get_unchecked(bad_at) > stop;
+                    if (*out.add(sep_at + N - 1) >> 1) == stop && clean {
+                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                        sep_at += N;
+                        continue;
+                    }
+                    while (*out.add(sep_at) >> 1) < stop {
+                        sep_at += 1;
+                    }
+                    sep_at += 1;
+                    if !clean {
+                        if let Some(found) = Self::split_line::<N>(buf, start as usize) {
+                            let encoded = found.map(|end| (end<<1) | u32::from(*buf.add(end as usize-1)==b'"'));
+                            visit(buf,start,&encoded);
                         }
                     }
                 }
