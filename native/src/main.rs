@@ -1105,20 +1105,17 @@ impl Sessions<'_> {
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);
         writer.int(4, revenue as i64);
-        let mut top: Option<usize> = None;
+        let mut top = None;
+        let mut highest = 0;
         for &category in &self.touched {
-            let category = category as usize;
-            top = match top {
-                Some(best) if self.sums[best] > self.sums[category] => Some(best),
-                Some(best) if self.sums[best] == self.sums[category] && best < category => Some(best),
-                _ => Some(category),
-            };
-        }
-        for &category in &self.touched {
-            self.sums[category as usize] = 0;
+            let revenue = std::mem::take(&mut self.sums[category as usize]);
+            if revenue > highest || (revenue == highest && Some(category) < top) {
+                highest = revenue;
+                top = Some(category);
+            }
         }
         self.touched.clear();
-        writer.category(5, top.map(|category| category as u8));
+        writer.category(5, top);
         writer.end_row();
         Ok(())
     }
