@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: 4660d6bba6b7c627eefa5e71657394b46149d23d
+      CANDIDATE: 4ff952b430901e77ad1c807354fe46c04d167aad
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,10 +27,10 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked candidate; do
+          for label in ranked candidate v4; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=ff00d8e964580fe98a7819ac0120a3eb41e61fc1; fi
+            if [ "$label" = v4 ]; then sha=4660d6bba6b7c627eefa5e71657394b46149d23d; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -47,7 +47,7 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 520777 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 76281 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -61,14 +61,13 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          cases = {"ranked": {}, "candidate": {}, "id128": {"SS_ID_BITS": "7"}, "id256": {"SS_ID_BITS": "8"}, "id512": {"SS_ID_BITS":"9"}, "people256": {"SS_PERSON_BITS":"8"}, "people4096": {"SS_PERSON_BITS":"12"}}
-          labels = list(cases)
+          labels = ["ranked", "candidate", "v4"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
-              for round_number in range(4):
+              for round_number in range(6):
                   order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
                   for label in order:
                       output = root / (label + "-out")
@@ -76,9 +75,9 @@ jobs:
                           shutil.rmtree(output)
                       output.mkdir()
                       env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
-                                 SCRATCH_DIR=str(scratch), NCPU=str(budget), **cases[label])
+                                 SCRATCH_DIR=str(scratch), NCPU=str(budget))
                       start = time.perf_counter()
-                      subprocess.run([str(root / ("ranked" if label == "ranked" else "candidate") / "shopping-sessions")], env=env, check=True)
+                      subprocess.run([str(root / label / "shopping-sessions")], env=env, check=True)
                       seconds = time.perf_counter() - start
                       print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
                       if round_number:
