@@ -32,7 +32,7 @@ const SESSION_GAP: u64 = 1_800_000;
 /// Bytes of CSV a thread takes at a time.
 const BLOCK: u64 = 1 << 19;
 /// Bytes of a links file read at a time.
-const LINK_BLOCK: u64 = 1 << 19;
+const LINK_BLOCK: u64 = 1 << 18;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
@@ -846,7 +846,7 @@ fn parse_clicks(
         });
         if deferred {
             queued.push((name, hash, index));
-            if queued.len() == 16 { drain(&mut queued,pending); }
+            if queued.len() == 32 { drain(&mut queued,pending); }
         }
     });
     drain(&mut queued,pending);
