@@ -110,18 +110,28 @@ pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
         .wrapping_mul(0x9e3779b97f4a7c15)
 }
 
-#[inline(always)]
-pub unsafe fn prepare_long_user(p: *const u8) -> u64 {
-    let mixed = long_name_mix(unsafe { &*p.cast::<[u8; 33]>() });
-    let slots = USER_SLOTS.get().unwrap();
-    crate::prefetch(&slots[(mixed >> 24) as usize & (slots.len()-1)]);
-    mixed
-}
-#[inline(always)]
-pub unsafe fn finish_long_user(p: *const u8, mixed: u64) -> u64 {
-    unsafe { fixed_user_mixed(p,USER_SLOTS.get().unwrap(),mixed) }
-}
+#[derive(Clone, Copy)]
+pub struct LongUsers(&'static [UserSlot]);
 
+impl LongUsers {
+    /// The shared table is installed during setup. Reused diagnostic copies
+    /// bypass the deferred long-name path and can retain the empty slice.
+    pub fn current() -> Self {
+        Self(USER_SLOTS.get().copied().unwrap_or_default())
+    }
+
+    #[inline(always)]
+    pub unsafe fn prepare(self, p: *const u8) -> u64 {
+        let mixed = long_name_mix(unsafe { &*p.cast::<[u8; 33]>() });
+        crate::prefetch(&self.0[(mixed >> 24) as usize & (self.0.len() - 1)]);
+        mixed
+    }
+
+    #[inline(always)]
+    pub unsafe fn finish(self, p: *const u8, mixed: u64) -> u64 {
+        unsafe { fixed_user_mixed(p, self.0, mixed) }
+    }
+}
 #[inline(always)]
 unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
     unsafe { fixed_user_mixed(p, slots, long_name_mix(&*p.cast::<[u8; 33]>())) }

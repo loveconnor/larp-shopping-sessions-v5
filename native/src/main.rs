@@ -589,6 +589,7 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 // ---------------------------------------------------------------- phase 1
 
 fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize) -> io::Result<Vec<(u64, u64)>> {
+    let fixed = keys::LongUsers::current();
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     for path in shared.link_files.iter().skip(worker).step_by(threads) {
         let source = Source::open(path, true)?;
@@ -600,7 +601,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
             let mut queued = Vec::with_capacity(32);
             let drain = |queued: &mut Vec<(*const u8, u64, usize, bool)>, pairs: &mut Vec<(u64,u64)>| {
                 for (name, hash, row, right) in queued.drain(..) {
-                    let user = unsafe { keys::finish_long_user(name, hash) };
+                    let user = unsafe { fixed.finish(name, hash) };
                     if right { pairs[row].1 = user; } else { pairs[row].0 = user; }
                 }
             };
@@ -611,7 +612,7 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
                 let row = pairs.len();
                 let mut user = |p,n,is_right| {
                     if n == 33 && shared.defer_long_events {
-                        queued.push((p, keys::prepare_long_user(p), row, is_right));
+                        queued.push((p, fixed.prepare(p), row, is_right));
                         1
                     } else { keys::pack_user(p,n) }
                 };
@@ -687,6 +688,7 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    let fixed = keys::LongUsers::current();
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -698,7 +700,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+            unsafe { (*dest).user = fixed.finish(name,mixed); }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -725,7 +727,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         }
         let (name,n) = field(1);
         let deferred = n == 33 && shared.defer_long_events;
-        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
+        let mixed = if deferred { fixed.prepare(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
@@ -803,13 +805,14 @@ fn parse_clicks(
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
 ) {
+    let fixed = keys::LongUsers::current();
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
     let mut queued = Vec::with_capacity(16);
     let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
         for (name, hash, index) in queued.drain(..) {
-            pending[index].user = unsafe { keys::finish_long_user(name,hash) };
+            pending[index].user = unsafe { fixed.finish(name,hash) };
         }
     };
     block.raw_lines::<4>(|buf, start, seps| unsafe {
@@ -824,7 +827,7 @@ fn parse_clicks(
         };
         let (name, n) = field(1);
         let deferred = n == 33 && shared.defer_long_events;
-        let hash = if deferred { keys::prepare_long_user(name) } else { 0 };
+        let hash = if deferred { fixed.prepare(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         if id == 0 || user == 0 {
             return;
