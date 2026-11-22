@@ -23,7 +23,7 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
     if [ "$TARGETARCH" = amd64 ]; then \
         for level in base v3 v4 wide; do \
             cpu=x86-64-$level; profile=v5; features=; \
-            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=v4 ;; esac; \
+            case "$level" in base) cpu=x86-64 ;; v4) profile=v4 ;; wide) cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide ;; esac; \
             RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
