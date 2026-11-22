@@ -177,6 +177,24 @@ fn name(key: u64) -> &'static [u8] {
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
 }
 
+/// Pack two nine-byte ASCII IDs after a shared validation of both words.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+pub unsafe fn pair_nine(a: *const u8, b: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let x = unsafe { a.cast::<u64>().read_unaligned() };
+    let y = unsafe { b.cast::<u64>().read_unaligned() };
+    let words = _mm_set_epi64x(y as i64,x as i64);
+    // Signed positive bytes are precisely the supported range 1..=127.
+    let valid = _mm_movemask_epi8(_mm_cmpgt_epi8(words,_mm_setzero_si128())) == 65535;
+    let (last_a, last_b) = unsafe { (*a.add(8), *b.add(8)) };
+    if valid && last_a.wrapping_sub(1) < 127 && last_b.wrapping_sub(1) < 127 {
+        const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        Some(((_pext_u64(x.swap_bytes(),LOW)<<7)|u64::from(last_a),
+              (_pext_u64(y.swap_bytes(),LOW)<<7)|u64::from(last_b)))
+    } else { None }
+}
+
 /// The key of the `len` bytes at `p`. At least 9 bytes must be readable at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]
