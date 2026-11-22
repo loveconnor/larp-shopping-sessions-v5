@@ -1,66 +1,40 @@
-name: Check processor-specific release binaries against the published answers
+name: Compare sorting real shopper histories by length
 on:
   push:
-    branches: [bench/family-release-correctness]
+    branches: [bench/real-history-sorters]
 permissions:
   contents: read
 jobs:
-  verify:
+  compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        host: [1, 2, 3, 4]
+        seed: [459983, 546503, 697091, 814189, 905991, 382781]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build the three exact candidate images
+      - name: Identify AVX-512 sort engines
         run: |
           lscpu | grep -E '^Model name:|^CPU family:|^Model:'
-          for item in profile:846a15a7bd3eda7a2a04581f25b48087093b42ea sorter:1426671a3250e5dcb5342c29ea6238942350685f combined:225f705d906a98cafac0117242ab8c80d7838659; do
-            label=${item%%:*}
-            sha=${item#*:}
-            mkdir "$RUNNER_TEMP/$label-src" "$RUNNER_TEMP/$label"
-            git archive "$sha" | tar -xC "$RUNNER_TEMP/$label-src"
-            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
-            cid=$(docker create "$label")
-            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
-            docker rm "$cid"
-          done
-      - name: Run each release selector and every supported new engine on 36 fixtures and the official dev answer
+          if grep -qw avx512bw /proc/cpuinfo; then echo 'CAPABLE=yes' >> "$GITHUB_ENV"; fi
+      - name: Generate independent data and collect real unsorted timestamp histories
+        if: env.CAPABLE == 'yes'
         run: |
+          python "$GITHUB_WORKSPACE/.github/workflows/history_sort.py"
           cd "$RUNNER_TEMP"
-          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
-          curl --retry 3 -fsSLO "$track/starter-polars.zip"
-          curl --retry 3 -fsSLO "$track/dev-answer.zip"
-          unzip -q starter-polars.zip
-          echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
-          unzip -q dev-answer.zip
-          curl --retry 3 -fsSLO "$track/generator.zip"
+          curl --retry 3 -fsSLo generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
-          python -m pip install --quiet duckdb==1.4.5
-          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          executables=()
-          for label in profile sorter combined; do
-            executables+=("$RUNNER_TEMP/$label/shopping-sessions")
-            if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
-              executables+=("$RUNNER_TEMP/$label/shopping-sessions.p19")
-            fi
-          done
-          printf 'Checking executable %s\n' "${executables[@]}"
-          for exe in "${executables[@]}"; do
-            for fixture in starter-polars/fixtures/*/; do
-              rm -rf verify-out
-              mkdir -p verify-out
-              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "$exe"
-              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
-            done
-            rm -rf verify-out
-            mkdir -p verify-out
-            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "$exe"
-            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
-          done
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed ${{ matrix.seed }} --events 20000000 --clicks 5000000 --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+          mkdir histories output
+          docker run --rm -v "$RUNNER_TEMP:/study" -w /study -e DATA_DIR=/study/data -e OUTPUT_DIR=/study/output -e HISTORIES=/study/histories -e NCPU=8 rust:1.90-slim-bookworm cargo run --release --locked --manifest-path candidate/native/Cargo.toml
+      - name: Compare four native sorters on the identical captured counts and values
+        if: env.CAPABLE == 'yes'
+        run: |
+          cd "$RUNNER_TEMP"
+          cp "$GITHUB_WORKSPACE/.github/workflows/history_sort.rs" .
+          docker run --rm -v "$RUNNER_TEMP:/study" -w /study rust:1.90-slim-bookworm sh -c 'rustc --edition 2024 -Awarnings -O -Ctarget-cpu=x86-64-v4 history_sort.rs -o /tmp/compare && /tmp/compare'
