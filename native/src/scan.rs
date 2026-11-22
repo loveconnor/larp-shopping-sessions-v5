@@ -34,6 +34,7 @@ pub struct Source {
     pub size: u64,
     map: *const u8,
     guarded_tail: bool,
+    warmed: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for Source {}
@@ -50,7 +51,7 @@ impl Source {
         if size > 0 {
             unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, 2) };
         }
-        let mut source = Self { file, size, map: std::ptr::null(), guarded_tail: false };
+        let mut source = Self { file, size, map: std::ptr::null(), guarded_tail: false, warmed: false.into() };
         if map {
             source.map_input();
         }
@@ -393,9 +394,11 @@ impl Block {
         if !source.map.is_null() && end + SLACK as u64 <= source.size {
             self.base = unsafe { source.map.add(start as usize) };
             #[cfg(target_os = "linux")]
-            unsafe {
-                let from = self.base as usize & !4095;
-                madvise(from as *mut _, self.base as usize + own + 4096 - from, 22);
+            if !source.warmed.load(std::sync::atomic::Ordering::Relaxed)
+                && !source.warmed.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                // Populate small file mappings in one call while peers can
+                // independently parse any ranges that are already resident.
+                unsafe { madvise(source.map as *mut _,source.size as usize,22); }
             }
             let tail = unsafe { std::slice::from_raw_parts(self.base.add(own), SLACK - 4 * PAD) };
             if let Some(at) = tail.iter().position(|&byte| byte == b'\n') {
