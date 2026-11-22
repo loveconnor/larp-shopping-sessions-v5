@@ -623,6 +623,9 @@ fn read_links(shared: &Shared, block: &mut Block, worker: usize, threads: usize)
             drain(&mut queued, &mut pairs);
             start = end;
         }
+        // All deferred endpoints have been interned and the pair IDs are
+        // owned. The worker can release this file's resident mapping now.
+        source.release(0, size);
     }
     pairs.retain(|&(a,b)| a != 0 && b != 0 && a != b);
     Ok(pairs)
