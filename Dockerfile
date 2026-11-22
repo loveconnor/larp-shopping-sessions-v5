@@ -24,7 +24,8 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
         for level in v3 v4 wide; do \
             cpu=x86-64-v4; profile=v4; features=; \
             case "$level" in v3) cpu=x86-64-v3; profile=v5 ;; wide) features="-C target-feature=+avx512vbmi,+avx512vbmi2" ;; esac; \
-            RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
+            tune=skylake; if [ "$level" = v4 ]; then tune=skylake-avx512; elif [ "$level" = wide ]; then tune=icelake-server; fi; \
+            RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Ztune-cpu=$tune -C linker=$linker -C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" \
               cargo build --locked --release --target "$target" || exit 1; \
             cp "target/$target/release/shopping-sessions" "/app/shopping-sessions.$level" || exit 1; \
         done && "$linker" -O2 platform/select-engine.c -o /app/shopping-sessions; \
