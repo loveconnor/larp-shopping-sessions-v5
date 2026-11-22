@@ -405,6 +405,11 @@ impl Block {
         }
         if source.guarded_tail && end + SLACK as u64 > source.size {
             let base = unsafe { source.map.add(start as usize) };
+            #[cfg(target_os = "linux")]
+            if own >= 65536 {
+                let from = base as usize & !4095;
+                unsafe { madvise(from as *mut _, base as usize + own - from, 22); }
+            }
             let remaining = (source.size - end) as usize;
             let tail = unsafe { std::slice::from_raw_parts(base.add(own), remaining) };
             let length = tail.iter().position(|&b| b == b'\n').map(|i| own + i + 1)
