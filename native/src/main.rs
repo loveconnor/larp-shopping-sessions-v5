@@ -1084,6 +1084,46 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    /// A time span of at most one inactivity gap proves that every record
+    /// belongs to a single session, in any order.
+    fn one_session(&mut self, person:u64, start:u64, events:&[u64], touches:&[Touch], sources:&[ClickSource]) -> io::Result<()> {
+        let day = ((start+self.shared.day_offset)/DAY as u64) as usize;
+        let mut revenue = 0;
+        for &v in events {
+            let price = v & 0xff_ffff;
+            if price != 0 {
+                let cat = ((v >> 24) & 255) as usize;
+                if self.sums[cat] == 0 { self.touched.push(cat as u8); }
+                self.sums[cat] += price;
+                revenue += price;
+            }
+        }
+        let mut latest: Option<&Touch> = None;
+        for touch in touches {
+            let time = u64::from(touch.ts);
+            if time < start || time > start + WEEK as u64 { continue; }
+            let campaign = touch.campaign as usize;
+            if self.reach[campaign] == 0 {
+                self.reach[campaign] = 1;
+                self.active.push(touch.campaign);
+            }
+            if latest.is_none_or(|best| touch.ts > best.ts || (touch.ts == best.ts &&
+                click_order(touch.id,best.id,sources,self.shared.defer_long_events).is_lt())) {
+                latest=Some(touch);
+            }
+        }
+        for c in self.active.drain(..) {
+            self.totals[c as usize*self.shared.days+day][3]+=1;
+            self.reach[c as usize]=0;
+        }
+        let credited = latest.map_or(0,|touch|touch.campaign as usize);
+        let sums = &mut self.totals[credited*self.shared.days+day];
+        sums[0]+=1;
+        sums[1]+=i64::from(revenue != 0);
+        sums[2]+=revenue as i64;
+        self.row(person,day as u32,1,events.len() as u32,revenue)
+    }
+
     /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let days = self.shared.days;
@@ -1474,6 +1514,20 @@ fn session_worker(
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
+            if mine.len() <= 15 {
+                let (mut min,mut max) = (u64::MAX,0);
+                for &v in mine.iter() {
+                    min = min.min(v);
+                    max = max.max(v);
+                }
+                let first = min >> 32;
+                if (max >> 32) - first <= SESSION_GAP {
+                    sessions.one_session(person,first,mine,&touches[click_from..click_to],clicks)?;
+                    from = to;
+                    click_from = click_to;
+                    continue;
+                }
+            }
             if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
             } else {
