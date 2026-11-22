@@ -1173,6 +1173,26 @@ impl Sessions<'_> {
         (low, high)
     }
 
+    /// All event pairs are within the session gap once their extrema are.
+    /// The earliest event sets the day and click window, including across midnight.
+    fn single_session(&mut self, person: u64, start: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
+        let day = ((start + self.shared.day_offset) / DAY as u64) as u32;
+        let mut revenue = 0;
+        for &value in events {
+            let price = value & 0xff_ffff;
+            if price != 0 {
+                let category = ((value >> 24) & 255) as usize;
+                if self.sums[category] == 0 { self.touched.push(category as u8); }
+                self.sums[category] += price;
+                revenue += price;
+            }
+        }
+        self.credit(clicks, (0, 0), start, day, revenue, revenue != 0);
+        self.row(person, day, 1, events.len() as u32, revenue)?;
+        for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
+        Ok(())
+    }
+
     fn person_binned(&mut self, person: u64, events: &[u64], clicks: &[Touch], scratch: &mut TimeBins) -> io::Result<()> {
         for &value in events {
             let ts = (value >> 32) as u32;
@@ -1556,6 +1576,20 @@ fn session_worker(
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+            }
+            if mine.len() <= 32 {
+                let (mut first, mut last) = (u64::MAX, 0u64);
+                for &value in mine.iter() {
+                    first = first.min(value);
+                    last = last.max(value);
+                }
+                let start = first >> 32;
+                if (last >> 32) - start <= SESSION_GAP {
+                    sessions.single_session(person, start, mine, reached)?;
+                    from = to;
+                    click_from = click_to;
+                    continue;
+                }
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
