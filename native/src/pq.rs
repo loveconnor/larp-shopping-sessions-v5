@@ -379,9 +379,26 @@ impl Writer {
                     let bits = width(column.runs.len() as u64 - 1).max(1);
                     let wide = bits.div_ceil(8) as usize;
                     body.push(bits as u8);
-                    for (index, &run) in column.runs.iter().enumerate() {
-                        varint(&mut body, (run as u64) << 1);
-                        body.extend_from_slice(&(index as u32).to_le_bytes()[..wide]);
+                    // Most user runs fit a one-byte RLE header. Emit that header
+                    // and the little-endian dictionary index together.
+                    fn write_runs<const BYTES: usize>(body: &mut Vec<u8>, runs: &[u32]) {
+                        body.reserve((1 + BYTES) * runs.len());
+                        for (index, &run) in runs.iter().enumerate() {
+                            if run < 64 {
+                                let pair = ((index as u64) << 8) | u64::from(run << 1);
+                                body.extend_from_slice(&pair.to_le_bytes()[..1 + BYTES]);
+                            } else {
+                                varint(body, u64::from(run) << 1);
+                                body.extend_from_slice(&(index as u32).to_le_bytes()[..BYTES]);
+                            }
+                        }
+                    }
+                    match wide {
+                        1 => write_runs::<1>(&mut body, &column.runs),
+                        2 => write_runs::<2>(&mut body, &column.runs),
+                        3 => write_runs::<3>(&mut body, &column.runs),
+                        4 => write_runs::<4>(&mut body, &column.runs),
+                        _ => unreachable!(),
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
