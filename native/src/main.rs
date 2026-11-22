@@ -64,13 +64,14 @@ const OFFSET_BITS: u32 = 9;
 struct Buckets<T: Copy> {
     /// Where each partition's next record goes.
     next: Vec<*mut T>,
-    /// Each partition's newest chunk, and how many chunks it has.
-    head: Vec<u32>,
+    /// Each partition's first and last chunks, and how many chunks it has.
+    first: Vec<u32>,
+    last: Vec<u32>,
     chunks: Vec<u32>,
     slabs: Vec<Vec<u8>>,
-    /// Every chunk's first record, and the chunk before it in its partition.
+    /// Every chunk's first record, and the next chunk in that partition.
     bases: Vec<*mut T>,
-    previous: Vec<u32>,
+    following: Vec<u32>,
     /// Chunks carved from our own slabs so far.
     carved: usize,
     /// Donated memory, each stretch a whole aligned chunk.
@@ -92,11 +93,12 @@ impl<T: Copy> Buckets<T> {
         Self {
             // A position that reads as a full chunk, so the first push grows.
             next: vec![Self::FILL as *mut T; parts],
-            head: vec![NONE; parts],
+            first: vec![NONE; parts],
+            last: vec![NONE; parts],
             chunks: vec![0; parts],
             slabs: Vec::new(),
             bases: Vec::new(),
-            previous: Vec::new(),
+            following: Vec::new(),
             carved: 0,
             spare: Vec::new(),
         }
@@ -153,8 +155,13 @@ impl<T: Copy> Buckets<T> {
         };
         let chunk = self.bases.len() as u32;
         self.bases.push(base);
-        self.previous.push(self.head[part]);
-        self.head[part] = chunk;
+        self.following.push(NONE);
+        if self.last[part] == NONE {
+            self.first[part] = chunk;
+        } else {
+            self.following[self.last[part] as usize] = chunk;
+        }
+        self.last[part] = chunk;
         self.chunks[part] += 1;
         base
     }
@@ -169,20 +176,53 @@ impl<T: Copy> Buckets<T> {
 
     /// Appends every chunk of `part` to `out` as (first record, count).
     fn chunks(&self, part: usize, out: &mut Vec<(*mut T, usize)>) {
-        let mut chunk = self.head[part];
-        if chunk == NONE {
-            return;
-        }
-        let base = self.bases[chunk as usize];
-        out.push((base, unsafe { self.next[part].offset_from(base) } as usize));
-        loop {
-            chunk = self.previous[chunk as usize];
-            if chunk == NONE {
-                break;
-            }
-            out.push((self.bases[chunk as usize], Self::CAPACITY));
+        let mut chunk = self.first[part];
+        while chunk != NONE {
+            let base = self.bases[chunk as usize];
+            let following = self.following[chunk as usize];
+            let count = if following == NONE {
+                unsafe { self.next[part].offset_from(base) as usize }
+            } else {
+                Self::CAPACITY
+            };
+            out.push((base, count));
+            chunk = following;
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn partition_chunks_visit_every_row_in_append_order() {
+    fn check<const WORDS: usize>() {
+        let mut buckets = Buckets::<[u32; WORDS]>::new(7);
+        let n = 4 * Buckets::<[u32; WORDS]>::CAPACITY + 1;
+        let mut expected = vec![Vec::new(); 7];
+        let mut addresses = Vec::new();
+        for i in 0..n {
+            for part in [0, 2, 5] {
+                let value = (i * 7 + part) as u32;
+                addresses.push((buckets.push(part, [value; WORDS]), value));
+                expected[part].push(value);
+            }
+        }
+        for (ptr, value) in addresses {
+            unsafe { assert_eq!((*ptr)[0], value); (*ptr)[WORDS - 1] = !value; }
+        }
+        for (part, wanted) in expected.into_iter().enumerate() {
+            let mut chunks = Vec::new();
+            buckets.chunks(part, &mut chunks);
+            let mut values = Vec::new();
+            for (base, count) in chunks {
+                for row in unsafe { std::slice::from_raw_parts(base, count) } {
+                    assert_eq!(row[WORDS - 1], !row[0]);
+                    values.push(row[0]);
+                }
+            }
+            assert_eq!(values, wanted);
+        }
+    }
+    check::<4>(); check::<6>(); check::<7>(); check::<8>();
 }
 
 // ---------------------------------------------------------------- records
