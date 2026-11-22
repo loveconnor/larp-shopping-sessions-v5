@@ -1,62 +1,33 @@
-name: Compare ranked Shopping Sessions entry
+name: Collect native v4 branch profiles
 on:
   push:
     branches: [larp/compare-ranked]
 permissions:
   contents: read
 jobs:
-  compare:
+  profile:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {events: 20000000, format: current}
-    env:
-      FORMAT: ${{ matrix.format }}
-      EVENTS: ${{ matrix.events }}
-      RANKED: bcda580b0ee9a3258a03c10c5f789fd3487adf59
-      CANDIDATE: e113993b83eb1bdbee910601b6750fd17b90ebd2
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check CPU and build the two submission images
+      - name: Generate v5 training input and collect LLVM counters
         run: |
-          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked; do
-            sha=$CANDIDATE
-            if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = sizing ]; then sha=af5fb050f273f23452a8a1023c52d8a38f4ce407; fi
-            mkdir "$RUNNER_TEMP/$label-src"
-            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
-            sed -i '/^COPY native/i ENV CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=1' "$RUNNER_TEMP/$label-src/Dockerfile"
-            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
-            cid=$(docker create "$label")
-            docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
-            docker rm "$cid"
-          done
-      - name: Generate fresh data
-        run: |
+          grep -qw avx512bw /proc/cpuinfo
           cd "$RUNNER_TEMP"
-          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
-          curl --retry 3 -fsSLO "$track/generator.zip"
+          curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
-          cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 350907 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
-          python -m pip install --quiet duckdb==1.4.5
-      - name: Sample the scored pipeline on native hardware
-        run: |
-          cd "$RUNNER_TEMP"
-          perfbin=$(find -L /usr/lib -name perf -type f 2>/dev/null | head -1)
-          if [ -z "$perfbin" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y linux-tools-generic >/dev/null
-            perfbin=$(find -L /usr/lib -name perf -type f | head -1)
-          fi
-          mkdir prof-out
-          sudo env DATA_DIR="$PWD/data" OUTPUT_DIR="$PWD/prof-out" NCPU="$(nproc)" "$perfbin" record -e cpu-clock -F 997 -o perf.data -- "$PWD/ranked"
-          sudo "$perfbin" report --stdio -i perf.data --no-children --percent-limit 0.5 | sed -n "1,90p"
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 530774 --events 10000000 --clicks 2500000 --threads "$(nproc)" --output "$RUNNER_TEMP/train"
+          mkdir "$RUNNER_TEMP/profile"
+          docker run --rm -v "$GITHUB_WORKSPACE/native:/src:ro" -v "$RUNNER_TEMP:/work" rust:1.90-slim-bookworm sh -ec '
+            cp -a /src /tmp/native
+            cd /tmp/native
+            RUSTFLAGS="-C target-cpu=x86-64-v4 -Cprofile-generate=/work/profile" cargo build --release --locked --target x86_64-unknown-linux-gnu
+            NCPU=4 DATA_DIR=/work/train OUTPUT_DIR=/work/out target/x86_64-unknown-linux-gnu/release/shopping-sessions
+            rustup component add llvm-tools-preview
+            "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" merge --sparse /work/profile/*.profraw -o /work/profile/v4.profdata
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v4-counters
+          path: ${{ runner.temp }}/profile/v4.profdata
