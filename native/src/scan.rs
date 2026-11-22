@@ -472,17 +472,10 @@ impl Block {
     /// exactly which are wrong.
     #[inline(always)]
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
-        #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
-            return unsafe { self.raw_wide(visit) };
-        }
-        self.raw_indexed::<N, false>(visit)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512bw,avx512vbmi2")]
-    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
-        self.raw_indexed::<N, true>(visit)
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
+        { self.raw_indexed::<N, true>(visit) }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vbmi2")))]
+        { self.raw_indexed::<N, false>(visit) }
     }
 
     #[inline(always)]
