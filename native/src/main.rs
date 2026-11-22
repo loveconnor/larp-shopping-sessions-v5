@@ -1463,6 +1463,11 @@ fn merge_clock_runs(left: &[u64], right: &[u64], tmp: &mut [u64]) {
 fn sort_medium_times(values: &mut [u64], tmp: &mut [u64]) {
     const RUN: usize = 128;
     let n = values.len();
+    if n <= 64 {
+        if n < 5 { values.sort_unstable(); }
+        else { unsafe { sort_up_to_64(values); } }
+        return;
+    }
     if n <= RUN { sort_initial_run(values); return; }
     for run in values.chunks_mut(RUN) { sort_initial_run(run); }
     let scratch = &mut tmp[..n];
