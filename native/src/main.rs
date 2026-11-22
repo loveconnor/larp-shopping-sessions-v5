@@ -1076,17 +1076,20 @@ impl Sessions<'_> {
 
 /// Sorts many events of one person by their `ts` (the top 32 bits): three
 /// counting passes of 11 bits. Whales have a million events each.
-fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
-    scratch.clear();
-    scratch.resize(values.len(), 0);
+fn sort_by_time<'a, T: Copy>(values: &'a mut [T], scratch: &'a mut Vec<T>, time: impl Fn(T) -> u32) -> &'a mut [T] {
+    if scratch.len() < values.len() {
+        scratch.resize(values.len(), values[0]);
+    }
     let mut histograms = [[0u32; 2048]; 3];
     for &value in values.iter() {
-        histograms[0][(value >> 32) as usize & 2047] += 1;
-        histograms[1][(value >> 43) as usize & 2047] += 1;
-        histograms[2][(value >> 54) as usize] += 1;
+        let ts = time(value) as usize;
+        histograms[0][ts & 2047] += 1;
+        histograms[1][(ts >> 11) & 2047] += 1;
+        histograms[2][ts >> 22] += 1;
     }
-    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for (shift, counts) in [32, 43, 54].into_iter().zip(&mut histograms) {
+    let n = values.len();
+    let (mut from, mut to) = (&mut values[..], &mut scratch[..n]);
+    for (shift, counts) in [0, 11, 22].into_iter().zip(&mut histograms) {
         let mut sum = 0;
         for count in counts.iter_mut() {
             let here = *count;
@@ -1094,14 +1097,14 @@ fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
             sum += here;
         }
         for &value in from.iter() {
-            let slot = &mut counts[(value >> shift) as usize & 2047];
+            let slot = &mut counts[(time(value) >> shift) as usize & 2047];
             to[*slot as usize] = value;
             *slot += 1;
         }
         std::mem::swap(&mut from, &mut to);
     }
     // Three passes: the sorted values are in the scratch buffer.
-    to.copy_from_slice(from);
+    from
 }
 
 fn session_worker(
@@ -1136,6 +1139,7 @@ fn session_worker(
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
     let mut scratch: Vec<u64> = Vec::new();
+    let mut click_scratch = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1290,15 +1294,35 @@ fn session_worker(
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
+            let mine = if mine.len() > 2048 {
+                sort_by_time(mine, &mut scratch, |v| (v >> 32) as u32)
             } else {
                 mine.sort_unstable();
-            }
+                mine
+            };
             let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
+            let reached = if reached.len() > 2048 {
+                let sorted = sort_by_time(reached, &mut click_scratch, |touch| touch.ts);
+                // Credit uses the smallest ID at a tied timestamp. Assists use
+                // all campaigns, so only the first member needs to be ordered.
+                let mut i = 0;
+                while i < sorted.len() {
+                    let start = i;
+                    let mut best = i;
+                    i += 1;
+                    while i < sorted.len() && sorted[i].ts == sorted[start].ts {
+                        if click_order(sorted[i].id, sorted[best].id, clicks, shared.defer_long_events).is_lt() {
+                            best = i;
+                        }
+                        i += 1;
+                    }
+                    if best != start { sorted.swap(start, best); }
+                }
+                sorted
+            } else {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
-            }
+                reached
+            };
             sessions.person(person, mine, reached)?;
             from = to;
             click_from = click_to;
