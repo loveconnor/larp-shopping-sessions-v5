@@ -130,6 +130,8 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
 unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
+    let prefix = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]);
+    let fixed = INTERNED | FIXED_USER | (u64::from(prefix) << 32);
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
@@ -141,7 +143,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
                 Ok(_) => {
                     unsafe { slot.name.get().write(*bytes); }
                     slot.tag.store(hash, Release);
-                    return INTERNED | FIXED_USER | at as u64;
+                    return fixed | at as u64;
                 }
                 Err(other) => tag = other,
             }
@@ -151,7 +153,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
             tag = slot.tag.load(Acquire);
         }
         if tag == hash && unsafe { *slot.name.get() == *bytes } {
-            return INTERNED | FIXED_USER | at as u64;
+            return fixed | at as u64;
         }
         at = (at + 1) & mask;
     }
@@ -170,7 +172,7 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
 
 fn name(key: u64) -> &'static [u8] {
     if key & FIXED_USER != 0 {
-        let slot = &USER_SLOTS.get().unwrap()[(key & !(INTERNED | FIXED_USER)) as usize];
+        let slot = &USER_SLOTS.get().unwrap()[key as u32 as usize];
         return unsafe { &*slot.name.get() };
     }
     let shard = (key & 255) as usize;
@@ -277,6 +279,21 @@ pub fn compare(a: u64, b: u64) -> Ordering {
     if (a | b) & INTERNED == 0 {
         a.cmp(&b)
     } else {
+        #[inline(always)]
+        fn prefix(key: u64) -> Option<u32> {
+            if key & INTERNED == 0 {
+                let first = ((key >> 56) & 127) as u32;
+                let second = ((key >> 49) & 127) as u32;
+                let third = ((key >> 42) & 127) as u32;
+                Some((first << 16) | (second << 8) | third)
+            } else if key & FIXED_USER != 0 {
+                Some((key >> 32) as u32 & 0x00ff_ffff)
+            } else { None }
+        }
+        if let (Some(left), Some(right)) = (prefix(a), prefix(b)) {
+            let cmp = left.cmp(&right);
+            if cmp != Ordering::Equal { return cmp; }
+        }
         compare_slow(a, b)
     }
 }
