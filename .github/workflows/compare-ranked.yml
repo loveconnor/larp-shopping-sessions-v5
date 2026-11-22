@@ -12,71 +12,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 813113}
-          - {events: 60000000, format: current, seed: 813113}
-          - {events: 20000000, format: current, seed: 813187}
+          - {events: 20000000, format: current, seed: 2026703}
+          - {events: 60000000, format: current, seed: 2026703}
+          - {events: 20000000, format: current, seed: 2026799}
+          - {events: 60000000, format: current, seed: 2026799}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: cc4c49a3794fecc6b9b155513ed427936df66f1b
-      CANDIDATE: 0305122403982f7be66266962ebfd9b8799c9eb3
+      CANDIDATE: 183c7fafc8bdc0507b1c2e0fd1bfc25f22e5a146
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Build available optimized engines
+      - name: Check CPU and build the two submission images
         run: |
-          set -eu
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          cd "$RUNNER_TEMP"
-          mkdir baseline
-          git -C "$GITHUB_WORKSPACE" archive "$RANKED" | tar -x -C baseline
-          docker build -q -t ranked baseline
-          mkdir -p engines
-          sed -e '1i#include <stdio.h>' -e 's/execv(path, argv);/puts(engine + 1); return 0;/' baseline/native/platform/select-engine.c > select.c
-          cc -O2 select.c -o select
-          engine=$(./select)
-          echo "Official dispatcher selected $engine"
-          if [ "$engine" = wide ]; then
-            arch=wide; cpu=x86-64-v4; features="-C target-feature=+avx512vbmi2"; profile=wide; tune=znver4
-            (cd baseline && patch -p1 < native/platform/wide.patch)
-          elif [ "$engine" = v4 ]; then
-            arch=v4; cpu=x86-64-v4; features=; profile=v4; tune=icelake-server
-          else
-            arch=v3; cpu=x86-64-v3; features=; profile=v5; tune=znver3
-          fi
-          echo "$arch" > arch
-          cid=$(docker create ranked)
-          docker cp "$cid:/app/shopping-sessions.$arch" engines/ranked
-          docker rm "$cid"
-          cp baseline/native/src/scan.rs pristine.rs
-          for spec in off-0-0 t0-256-1 t0-4096-1 t0-4096-8 t0-8192-32 t1-1024-1 t1-4096-1 t1-4096-8 t1-16384-16; do
-              mode=${spec%%-*}
-              rest=${spec#*-}
-              distance=${rest%-*}
-              spacing=${rest#*-}
-              python3 - "$mode" "$distance" "$spacing" <<'EDIT'
-          from pathlib import Path
-          import sys
-          mode,distance,spacing=sys.argv[1:]
-          s=Path('pristine.rs').read_text()
-          key='fetch(p.wrapping_add(READ_AHEAD));'
-          assert s.count(key)==1
-          if mode=='off':
-              s=s.replace(key,'')
-          else:
-              if mode=='t1':s=s.replace('_MM_HINT_T0','_MM_HINT_T1')
-              call=f'fetch(p.wrapping_add({distance}));'
-              if spacing!='1':call='if ((at-line_offset)/64)&'+str(int(spacing)-1)+'==0 {'+call+'}'
-              if spacing!='1':s=s.replace('let mut at = line;', 'let line_offset=line; let mut at = line;')
-              s=s.replace(key,call)
-          Path('baseline/native/src/scan.rs').write_text(s)
-          EDIT
-              docker run --rm -v "$RUNNER_TEMP/baseline/native:/src:ro" -v "$RUNNER_TEMP/engines:/out" -w /src       -e "RUSTFLAGS=-C target-cpu=$cpu $features -Cprofile-use=/src/profile/$profile.profdata" -e CARGO_TARGET_DIR=/tmp/target       rust:1.90-slim-bookworm sh -ec "cargo build --locked --release && cp /tmp/target/release/shopping-sessions /out/$spec"
+          for label in ranked candidate; do
+            sha=$CANDIDATE
+            if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
+            mkdir "$RUNNER_TEMP/$label-src"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
+            docker rm "$cid"
           done
-          ls -l engines
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
@@ -87,40 +52,74 @@ jobs:
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
             --seed "$SEED" --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
-      - name: Interleave compiler builds and compare their full outputs
+      - name: Alternate fresh restricted runc containers and compare both complete output tables
         shell: python
         run: |
-          import datetime,json,os,pathlib,random,statistics,subprocess
+          import datetime, json, os, pathlib, shutil, statistics, subprocess
           import duckdb
-          root=pathlib.Path(os.environ['RUNNER_TEMP'])
-          arch=(root/'arch').read_text().strip()
-          engines=sorted(p.name for p in (root/'engines').iterdir())
-          cpu=','.join(str(i) for i in sorted(os.sched_getaffinity(0))[:8])
-          samples={e:[] for e in engines}
-          from datetime import datetime as dt
-          def stamp(s):return dt.fromisoformat(s.removesuffix('Z')[:26]+'+00:00')
-          def run(e,round):
-              out=root/f'out-{e}';out.mkdir(exist_ok=True);out.chmod(0o777)
-              args=['docker','create','--cpuset-cpus',cpu,'--memory','12g','--memory-swap','12g','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','1000:1000','--tmpfs','/tmp:rw,size=64m','--tmpfs','/scratch:rw,mode=1777','-e','DATA_DIR=/data','-e','OUTPUT_DIR=/output','-e','SCRATCH_DIR=/scratch','-e','HOME=/scratch','-e','NCPU=8','-e','MEM_GB=24','-v',f'{root}/data:/data:ro','-v',f'{out}:/output','-v',f'{root}/engines/{e}:/app/shopping-sessions.{arch}:ro','ranked']
-              cid=subprocess.check_output(args,text=True).strip()
-              try:
-                  subprocess.run(['docker','start','-a',cid],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-                  st=json.loads(subprocess.check_output(['docker','inspect',cid]))[0]['State']
-                  assert st['ExitCode']==0 and not st['OOMKilled'],st
-                  elapsed=(stamp(st['FinishedAt'])-stamp(st['StartedAt'])).total_seconds()
-                  if round:samples[e].append(elapsed)
-                  print('SAMPLE',round,e,elapsed,flush=True)
-              finally:subprocess.run(['docker','rm','-f',cid],stdout=subprocess.DEVNULL)
-          def check(e):
-              for table in ('user_daily','campaign_daily'):
-                  a,b=[f"SELECT * FROM read_parquet('{root}/out-{v}/{table}/*.parquet')" for v in ('ranked',e)]
-                  for x,y in ((a,b),(b,a)):assert duckdb.sql(f'SELECT count(*) FROM ({x} EXCEPT ALL {y})').fetchone()[0]==0,e
-          run('ranked',0)
-          for rnd in range(5):
-              batch=engines.copy();random.Random(121+rnd).shuffle(batch)
-              for e in batch:
-                  run(e,rnd)
-                  if rnd==0 and e!='ranked':check(e)
-          ref=statistics.median(samples['ranked'])
-          for e in sorted(engines,key=lambda e:statistics.median(samples[e])):print('PREFETCH',arch,e,round(statistics.median(samples[e])/ref,4),flush=True)
 
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          cpus = sorted(os.sched_getaffinity(0))[:8]
+          cpuset = ",".join(map(str, cpus))
+          labels = ["ranked", "candidate"]
+          samples = {label: [] for label in labels}
+          print(f"Native CPUs {cpuset}; eight software workers; 12 GiB/no swap", flush=True)
+          scratch = root / "scratch"
+          scratch.mkdir(mode=0o777)
+          scratch.chmod(0o777)
+          for round_number in range(6):
+              for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  output = root / f"{label}-out-{round_number}"
+                  output.mkdir()
+                  output.chmod(0o777)
+                  args = ["docker", "create", "--runtime", "runc", "--cpuset-cpus", cpuset,
+                      "--memory", "12g", "--memory-swap", "12g", "--network", "none",
+                      "--read-only", "--user", "1000:1000", "--cap-drop", "ALL",
+                      "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+                      "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch",
+                      "-e", "HOME=/scratch", "-e", "NCPU=8", "-e", "MEM_GB=24",
+                      "-v", f"{root}/data:/data:ro", "-v", f"{output}:/output", "-v", f"{scratch}:/scratch", label]
+                  cid = subprocess.check_output(args, text=True).strip()
+                  try:
+                      subprocess.run(["docker", "start", "-a", cid], check=True)
+                      state = json.loads(subprocess.check_output(["docker", "inspect", cid]))[0]["State"]
+                      assert state["ExitCode"] == 0 and not state["OOMKilled"], state
+                      def stamp(value):
+                          return datetime.datetime.fromisoformat(value.removesuffix("Z")[:26] + "+00:00")
+                      seconds = (stamp(state["FinishedAt"]) - stamp(state["StartedAt"])).total_seconds()
+                      if round_number:
+                          samples[label].append(seconds)
+                      print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
+                  finally:
+                      subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
+          for table in ("user_daily", "campaign_daily"):
+              a, b = [f"SELECT * FROM read_parquet('{root}/{label}-out-5/{table}/*.parquet')" for label in labels]
+              for lhs, rhs in ((a,b),(b,a)):
+                  assert duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0] == 0
+          for label in labels:
+              m = statistics.median(samples[label])
+              print(f"RESULT {label} {m:.6f} s, ratio {m/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+
+      - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: matrix.events == 20000000 && matrix.format == 'current'
+        run: |
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/starter-polars.zip"
+          curl --retry 3 -fsSLO "$track/dev-answer.zip"
+          unzip -q starter-polars.zip
+          echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
+          unzip -q dev-answer.zip
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in candidate; do
+            for fixture in starter-polars/fixtures/*/; do
+              rm -rf verify-out
+              mkdir -p verify-out
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
+            done
+            rm -rf verify-out
+            mkdir -p verify-out
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label/shopping-sessions"
+            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
+          done
