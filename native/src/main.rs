@@ -1393,8 +1393,9 @@ fn session_worker(
     let mut ends: Vec<u32> = Vec::new();
     let mut local: Vec<u32> = Vec::new();
     let mut values: Vec<u64> = Vec::new();
-    let mut click_ends: Vec<u32> = Vec::new();
-    let mut click_local: Vec<u32> = Vec::new();
+    let mut first_touch: Vec<Touch> = Vec::new();
+    let mut last_extra: Vec<u32> = Vec::new();
+    let mut extra: Vec<(Touch, u32)> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     let mut scratch: Vec<u64> = Vec::new();
@@ -1487,10 +1488,12 @@ fn session_worker(
         for source in clicks {
             source.buckets.chunks(part, &mut click_chunks);
         }
-        click_ends.clear();
-        click_ends.resize(persons.len(), 0);
-        click_local.clear();
-        let mut kept = 0usize;
+        const EMPTY: Touch = Touch { id: 0, ts: 0, campaign: 0 };
+        first_touch.clear();
+        first_touch.resize(persons.len(), EMPTY);
+        last_extra.clear();
+        last_extra.resize(persons.len(), NONE);
+        extra.clear();
         unsafe {
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
@@ -1506,54 +1509,43 @@ fn session_worker(
                         }
                         slot = (slot + 1) & mask;
                     };
-                    click_local.push(id);
-                    if id != NONE {
-                        *click_ends.get_unchecked_mut(id as usize) += 1;
-                        kept += 1;
-                    }
-                }
-            }
-            let mut sum = 0u32;
-            for end in click_ends.iter_mut() {
-                let count = *end;
-                *end = sum;
-                sum += count;
-            }
-            if touches.len() < kept {
-                touches.resize(
-                    kept,
-                    Touch {
-                        id: 0,
-                        ts: 0,
-                        campaign: 0,
-                    },
-                );
-            }
-            let mut index = 0;
-            for &(base, count) in &click_chunks {
-                for offset in 0..count {
-                    let id = *click_local.get_unchecked(index);
-                    index += 1;
-                    if id != NONE {
-                        let click = *base.add(offset);
-                        let end = click_ends.get_unchecked_mut(id as usize);
-                        *touches.get_unchecked_mut(*end as usize) = Touch {
-                            id: click.id,
-                            ts: click.ts,
-                            campaign: click.campaign,
-                        };
-                        *end += 1;
+                    if id == NONE { continue; }
+                    let id = id as usize;
+                    let click = *base.add(offset);
+                    let touch = Touch { id: click.id, ts: click.ts, campaign: click.campaign };
+                    let first = first_touch.get_unchecked_mut(id);
+                    if first.campaign == 0 {
+                        *first = touch;
+                    } else {
+                        let head = last_extra.get_unchecked_mut(id);
+                        let index = u32::try_from(extra.len()).expect("too many clicks in a partition");
+                        extra.push((touch, *head));
+                        *head = index;
                     }
                 }
             }
         }
 
-        let (mut from, mut click_from) = (0usize, 0usize);
+        let mut from = 0usize;
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
-            let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            let reached = &mut touches[click_from..click_to];
+            let first = &mut first_touch[id];
+            let mut at = last_extra[id];
+            let reached = if at == NONE {
+                let count = usize::from(first.campaign != 0);
+                &mut std::slice::from_mut(first)[..count]
+            } else {
+                touches.clear();
+                touches.push(*first);
+                while at != NONE {
+                    let (touch, previous) = extra[at as usize];
+                    touches.push(touch);
+                    at = previous;
+                }
+                touches[1..].reverse();
+                &mut touches[..]
+            };
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
@@ -1573,7 +1565,6 @@ fn session_worker(
                 sessions.person_binned(person, mine, reached, bins)?;
             }
             from = to;
-            click_from = click_to;
         }
     }
     let wrote = sessions.writer.is_some();
