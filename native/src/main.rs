@@ -1367,11 +1367,6 @@ fn main() -> io::Result<()> {
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
-    let block = tune("SS_BLOCK", BLOCK).max(4096);
-    // Reuse worker read buffers on Linux to avoid establishing mappings
-    // for the entire input. SS_MAP=1 selects the mapped scanner.
-    let map = tune("SS_MAP", if cfg!(target_os = "linux") { 0 } else { 1 }) != 0;
-    let give_back = tune("SS_RELEASE", 1) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -1446,8 +1441,17 @@ fn main() -> io::Result<()> {
 
     let mut files = Vec::new();
     let mut work = Vec::new();
-    for (folder, events) in [("events", true), ("clicks", false)] {
-        for path in csv_files(&data.join(folder))? {
+    let inputs = [(csv_files(&data.join("events"))?, true), (csv_files(&data.join("clicks"))?, false)];
+    let mut total = 0;
+    for (paths, _) in &inputs {
+        for path in paths { total += path.metadata()?.len(); }
+    }
+    let large = total >= 4u64 << 30;
+    let block = tune("SS_BLOCK", if large { 1 << 21 } else { BLOCK }).max(4096);
+    let map = tune("SS_MAP", u64::from(large || !cfg!(target_os = "linux"))) != 0;
+    let give_back = tune("SS_RELEASE", u64::from(large)) != 0;
+    for (paths, events) in inputs {
+        for path in paths {
             let source = Source::open(&path, map)?;
             let size = source.size;
             // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
@@ -1488,7 +1492,7 @@ fn main() -> io::Result<()> {
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
         defer_long_events: copies == 1,
-        id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
+        id_bits: tune("SS_ID_BITS", partition_bits.min(if large { 12 } else { ID_BITS + 1 }) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
