@@ -164,6 +164,35 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
     }
 }
 
+/// Pack low dictionary-index bits from eight byte values per group.
+fn pack_categories(out: &mut Vec<u8>, indices: &[u8], bits: u32) {
+    debug_assert!((1..=8).contains(&bits));
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let mask = ((1u64 << bits) - 1) * 0x0101_0101_0101_0101;
+        out.reserve(indices.len().div_ceil(8) * bits as usize);
+        let emit = |out: &mut Vec<u8>, bytes: [u8; 8]| {
+            let word = unsafe { std::arch::x86_64::_pext_u64(u64::from_le_bytes(bytes), mask) };
+            out.extend_from_slice(&word.to_le_bytes()[..bits as usize]);
+        };
+        let mut chunks = indices.chunks_exact(8);
+        for chunk in &mut chunks {
+            emit(out, chunk.try_into().unwrap());
+        }
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let mut padded = [0; 8];
+            padded[..tail.len()].copy_from_slice(tail);
+            emit(out, padded);
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let padded = indices.iter().copied().map(u64::from).chain(std::iter::repeat(0));
+        pack(out, padded.take(indices.len().div_ceil(8) * 8), bits);
+    }
+}
+
 // Eight values at a fixed bit width always end on a byte boundary.
 #[inline(always)]
 fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) {
@@ -401,13 +430,7 @@ impl Writer {
                     let groups = column.bytes.len().div_ceil(8);
                     if groups > 0 {
                         varint(&mut body, ((groups as u64) << 1) | 1);
-                        let padded = column
-                            .bytes
-                            .iter()
-                            .map(|&index| index as u64)
-                            .chain(std::iter::repeat(0))
-                            .take(groups * 8);
-                        pack(&mut body, padded, bits);
+                        pack_categories(&mut body, &column.bytes, bits);
                     }
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
@@ -563,6 +586,23 @@ mod tests {
         }
         assert_eq!(at, bytes.len());
         out
+    }
+
+    #[test]
+    fn category_packing_agrees_with_bit_stream() {
+        for bits in 1..=8 {
+            for n in 0..=145 {
+                let values: Vec<_> = (0..n)
+                    .map(|i| ((i * 47 + n * 29) & ((1 << bits) - 1)) as u8)
+                    .collect();
+                let mut expected = vec![17];
+                let mut actual = expected.clone();
+                let padded = values.iter().copied().map(u64::from).chain(std::iter::repeat(0));
+                pack(&mut expected, padded.take(values.len().div_ceil(8) * 8), bits);
+                pack_categories(&mut actual, &values, bits);
+                assert_eq!(actual, expected, "width {bits}, count {n}");
+            }
+        }
     }
 
     #[test]
