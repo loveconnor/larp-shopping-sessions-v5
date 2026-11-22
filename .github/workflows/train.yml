@@ -1,0 +1,60 @@
+name: Train compiler counters for the exact streaming engine at practice and final scales
+on:
+  push:
+    branches: [bench/stream-engine-training]
+permissions:
+  contents: read
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [438053, 281455, 885719, 225269]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check whether the native processor supports the engine
+        run: |
+          lscpu | grep -E '^Model name:|^CPU family:'
+          if grep -qw avx512_vbmi2 /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then echo 'CAPABLE=yes' >> "$GITHUB_ENV"; fi
+      - name: Build the instrumented release engine
+        if: env.CAPABLE == 'yes'
+        run: |
+          cp -r native "$RUNNER_TEMP/native"
+          cd "$RUNNER_TEMP/native"
+          patch -p2 < platform/wide.patch
+          patch -p2 < platform/register-merge.patch
+          mkdir "$RUNNER_TEMP/profile"
+          docker run --rm -v "$RUNNER_TEMP:/work" -w /work/native -e 'RUSTFLAGS=-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+avx512vbmi2 -Cprofile-generate=/work/profile' rust:1.90-slim-bookworm cargo build --locked --release --target x86_64-unknown-linux-gnu
+      - name: Train on both input sizes and balance their contributions
+        if: env.CAPABLE == 'yes'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --retry 3 -fsSLo generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo build --locked --release --manifest-path generator/Cargo.toml
+          for rows in 20000000 60000000; do
+            seed=$(( ${{ matrix.seed }} + rows ))
+            generator/target/release/generate --seed "$seed" --events "$rows" --clicks "$(( rows / 4 ))" --threads "$(nproc)" --output data
+            mkdir "profile/$rows"
+            NCPU=8 LLVM_PROFILE_FILE="$RUNNER_TEMP/profile/$rows/%m.profraw" DATA_DIR="$RUNNER_TEMP/data" OUTPUT_DIR="$RUNNER_TEMP/out" native/target/x86_64-unknown-linux-gnu/release/shopping-sessions
+            rm -rf data out
+          done
+          docker run --rm -v "$RUNNER_TEMP/profile:/profiles" rust:1.90-slim-bookworm sh -ec '
+            rustup component add llvm-tools-preview
+            merger="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
+            for n in 20000000 60000000; do
+              "$merger" merge --sparse /profiles/$n/*.profraw -o /profiles/$n.profdata
+            done
+            "$merger" merge --sparse --weighted-input=3,/profiles/20000000.profdata /profiles/60000000.profdata -o /profiles/stream.profdata
+            "$merger" show /profiles/stream.profdata
+          '
+      - uses: actions/upload-artifact@v4
+        if: env.CAPABLE == 'yes'
+        with:
+          name: stream-counters-${{ matrix.seed }}
+          path: ${{ runner.temp }}/profile/stream.profdata
