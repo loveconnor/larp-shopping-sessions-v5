@@ -222,6 +222,40 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Decode two UTC clocks together when the event and ingestion date agree.
+/// Date cache misses and other timestamp formats use the full parser.
+#[inline(always)]
+pub unsafe fn event_times(event: *const u8, en: usize, ing: *const u8, n: usize, dates: &mut Dates) -> (i64, i64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if en == 20 && n == 20 && *event.add(19) == b'Z' && *ing.add(19) == b'Z' {
+        use std::arch::x86_64::*;
+        let prefix = load64(event);
+        let day_and_t = load32(event.add(8)) & 0xffffff;
+        let day = (day_and_t & 15) * 10 + ((day_and_t >> 8) & 15);
+        if prefix == load64(ing) && day_and_t == (load32(ing.add(8)) & 0xffffff)
+            && day_and_t & 0xfff0f0 == 0x543030 && day_and_t & 15 < 10
+            && (day_and_t >> 8) & 15 < 10 && dates.month[day as usize] == prefix && prefix != 0 {
+            let clocks = _mm_set_epi64x(load64(ing.add(11)) as i64, load64(event.add(11)) as i64);
+            let ascii = u64::from_le_bytes(*b"00:00:00") as i64;
+            let digits = _mm_xor_si128(clocks, _mm_set1_epi64x(ascii));
+            let max_digits = _mm_set1_epi64x(0x0909_0009_0900_0909);
+            let wrong = _mm_subs_epu8(digits, max_digits);
+            let packed = _mm_shuffle_epi8(digits, _mm_setr_epi8(0,1,3,4,6,7,-1,-1,8,9,11,12,14,15,-1,-1));
+            let pairs = _mm_maddubs_epi16(packed, _mm_set1_epi16(0x010a));
+            let ranges = _mm_setr_epi16(23,59,59,0,23,59,59,0);
+            if _mm_testz_si128(wrong, wrong) != 0 && _mm_movemask_epi8(_mm_cmpgt_epi16(pairs,ranges)) == 0 {
+                let sums = _mm_madd_epi16(pairs, _mm_setr_epi16(3600,60,1,0,3600,60,1,0));
+                let sums = _mm_hadd_epi32(sums,sums);
+                let midnight = dates.midnight[day as usize];
+                return ((midnight + i64::from(_mm_cvtsi128_si32(sums))) * 1000,
+                        (midnight + i64::from(_mm_extract_epi32::<1>(sums))) * 1000);
+            }
+        }
+    }
+    let ingest_time = ingest(ing, n, dates);
+    (parse(event, en, dates), ingest_time)
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
