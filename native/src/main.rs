@@ -104,6 +104,13 @@ impl<T: Copy> Buckets<T> {
 
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) -> *mut T {
+        let at = self.reserve_slot(part);
+        unsafe { at.write(value); }
+        at
+    }
+
+    #[inline(always)]
+    fn reserve_slot(&mut self, part: usize) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -114,7 +121,6 @@ impl<T: Copy> Buckets<T> {
             // into its cache while other partitions are receiving records.
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
-            at.write(value);
             *slot = at.add(1);
             at
         }
@@ -694,11 +700,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     const LOOKUPS: usize = 16;
-    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    let empty = Parsed { id: 0, user: 0, ingest: 0, ts: DEAD, payload: 0 };
+    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64, empty); LOOKUPS];
     let mut queued = 0;
-    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
-        for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+    let drain = |items: &[(*const u8, *mut Parsed, u64, Parsed)]| {
+        for &(name, dest, mixed, mut row) in items {
+            unsafe {
+                row.user = keys::finish_long_user(name, mixed);
+                dest.write(row);
+            }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -762,14 +772,20 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let dest = out.buckets.reserve_slot((partition_hash >> id_shift) as usize);
         if deferred {
-            lookups[queued] = (name,dest,mixed);
+            // Reserve in input order and let the destination and user lookup
+            // arrive in cache before writing the complete record once.
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            std::arch::asm!("prefetchw [{p}]", p = in(reg) dest, options(nostack, preserves_flags, readonly));
+            lookups[queued] = (name, dest, mixed, record);
             queued += 1;
             if queued == LOOKUPS {
                 drain(&lookups);
                 queued = 0;
             }
+        } else {
+            dest.write(record);
         }
     });
     drain(&lookups[..queued]);
