@@ -632,8 +632,67 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
+/// Neighboring ID partitions allocate short runs from the same pages.
+struct StripedRows {
+    counts:Vec<usize>,
+    active:Vec<usize>,
+    packs:Vec<Vec<usize>>,
+    slabs:Vec<Vec<u8>>,
+    carved:usize,
+}
+impl StripedRows {
+    const PACK:usize=8;
+    const RUN:usize=16;
+    const CAP:usize=CHUNK_BYTES/std::mem::size_of::<Parsed>();
+    const TILE:usize=Self::PACK*CHUNK_BYTES;
+    const N:usize=256;
+    fn new(parts:usize)->Self {
+        Self{counts:vec![0;parts],active:vec![0;parts],packs:vec![Vec::new();parts.div_ceil(Self::PACK)],
+             slabs:Vec::new(),carved:0}
+    }
+    #[cold]
+    fn activate(&mut self,part:usize,tile:usize){
+        let group=part/Self::PACK;
+        if self.packs[group].len()==tile{
+            if self.carved%Self::N==0{
+                let bytes=(Self::N+1)*Self::TILE;
+                let slab:Vec<u8>=Vec::with_capacity(bytes);
+                huge(slab.as_ptr(),bytes);
+                self.slabs.push(slab);
+            }
+            let base=(self.slabs.last().unwrap().as_ptr() as usize+Self::TILE-1)&!(Self::TILE-1);
+            self.packs[group].push(base+(self.carved%Self::N)*Self::TILE);
+            self.carved+=1;
+        }
+        self.active[part]=self.packs[group][tile];
+    }
+    #[inline(always)]
+    fn push(&mut self,part:usize,value:Parsed)->*mut Parsed{
+        let n=self.counts[part];
+        if n%Self::CAP==0{self.activate(part,n/Self::CAP);}
+        self.counts[part]=n+1;
+        let q=n%Self::CAP;
+        let offset=(q/Self::RUN*Self::PACK+part%Self::PACK)*Self::RUN+q%Self::RUN;
+        let addr=unsafe{(self.active[part] as *mut Parsed).add(offset)};
+        unsafe{addr.write(value);}
+        addr
+    }
+    fn chunks(&self,part:usize,out:&mut Vec<(*mut Parsed,usize)>){
+        let mut remain=self.counts[part];
+        for &tile in &self.packs[part/Self::PACK]{
+            if remain==0{break;}
+            let here=remain.min(Self::CAP);
+            for i in (0..here).step_by(Self::RUN){
+                let offset=(i/Self::RUN*Self::PACK+part%Self::PACK)*Self::RUN;
+                out.push((unsafe{(tile as *mut Parsed).add(offset)},(here-i).min(Self::RUN)));
+            }
+            remain-=here;
+        }
+    }
+    fn release(&self){for slab in &self.slabs{release(slab.as_ptr(),slab.capacity());}}
+}
 struct EventSource {
-    buckets: Buckets<Parsed>,
+    buckets: StripedRows,
     names: Vec<[u8; 33]>,
 }
 
@@ -823,7 +882,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: StripedRows::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -840,7 +899,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 
 // ---------------------------------------------------------------- phase 2
 
-fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
+fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize, done:&[AtomicUsize]) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
@@ -861,9 +920,18 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             owners.resize(chunks.len(), owner);
         }
         let total: usize = chunks.iter().map(|chunk| chunk.1).sum();
-        if total == 0 {
-            continue;
-        }
+        let group=part/StripedRows::PACK;
+        let donate=|out:&mut Buckets<Event>| {
+            let expected=(1usize<<shared.id_bits).min(StripedRows::PACK);
+            if done[group].fetch_add(1,Ordering::AcqRel)+1==expected{
+                for source in sources{
+                    for &tile in &source.buckets.packs[group]{
+                        for i in 0..StripedRows::PACK{out.donate((tile+i*CHUNK_BYTES) as *mut u8);}
+                    }
+                }
+            }
+        };
+        if total==0{donate(&mut out);continue;}
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
@@ -924,10 +992,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
-            // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
-                out.donate(base as *mut u8);
-            }
+            donate(&mut out);
         }
     }
     out
@@ -1519,9 +1584,10 @@ fn main() -> io::Result<()> {
     let parse = began.elapsed();
 
     let next = AtomicUsize::new(0);
+    let done:Vec<AtomicUsize>=(0..(1usize<<shared.id_bits).div_ceil(StripedRows::PACK)).map(|_| AtomicUsize::new(0)).collect();
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next)))
+            .map(|_| scope.spawn(|| dedup_worker(shared, &parsed_events, &next,&done)))
             .collect();
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
