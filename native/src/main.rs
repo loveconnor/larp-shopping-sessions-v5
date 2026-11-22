@@ -277,17 +277,16 @@ impl Dim {
     }
 }
 
-#[repr(C, align(64))]
+#[repr(C, align(32))]
 #[derive(Clone, Default)]
-struct AliasGroup {
-    keys: [u64; 4],
-    values: [u64; 4],
-}
+struct AliasGroup { entries: [u64; 4] }
 
-/// Only aliases need an entry. A missing key is already its canonical name.
 struct Links {
     slots: Vec<AliasGroup>,
+    names: Vec<u64>,
+    overflow: HashMap<u64, u64>,
     shift: u32,
+    ordinal_mask: u64,
     empty: bool,
 }
 
@@ -361,29 +360,45 @@ impl Links {
         }
         // Parents always have smaller indices. In ascending order their
         // canonical names have already been resolved, even along long chains.
+        let mut canonical = Vec::with_capacity(names.len()-aliases);
+        let mut ordinals = vec![0usize; names.len()];
         for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+            if id == up as usize {
+                canonical.push(names[id]);
+                ordinals[id] = canonical.len();
+            } else {
+                names[id] = names[up as usize];
+                ordinals[id] = ordinals[up as usize];
+            }
         }
-        let count = aliases.div_ceil(2).next_power_of_two().max(2);
-        let shift = 64 - count.trailing_zeros();
+        let count = aliases.div_ceil(2).max(canonical.len()+1).next_power_of_two().max(2);
+        let bits = count.trailing_zeros();
+        let shift = 64-bits;
         let mut groups = vec![AliasGroup::default(); count];
+        let mut overflow = HashMap::new();
+        let mut spilled = vec![false; count];
         huge(groups.as_ptr(), count);
         for [key, id] in slots {
             if key == 0 { continue; }
-            let person = names[id as usize];
+            let id = id as usize;
+            let person = names[id];
             if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
+            let hash = key.wrapping_mul(MIX);
+            let home = (hash >> shift) as usize;
+            let words = &mut groups[home].entries;
+            if let Some(lane) = words.iter().position(|&word| word == 0) {
+                // The home group encodes the rest of this bijective hash.
+                words[lane] = (hash << bits) | ordinals[id] as u64;
+            } else {
+                spilled[home] = true;
+                overflow.insert(key, person);
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        for (group, spill) in groups.iter_mut().zip(spilled) {
+            let words = &mut group.entries;
+            if words[3] != 0 && (words[0] > words[1]) != spill { words.swap(0,1); }
+        }
+        Self { slots: groups, names: canonical, overflow, shift, ordinal_mask: (count-1) as u64, empty: aliases == 0 }
     }
 
     #[inline(always)]
@@ -398,25 +413,64 @@ impl Links {
         if self.empty {
             return key;
         }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
-        loop {
-            let group = unsafe { self.slots.get_unchecked(slot) };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            unsafe {
-                use std::arch::x86_64::*;
-                let keys = _mm256_load_si256(group.keys.as_ptr().cast());
-                let matches = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(key as i64));
-                let found = _mm256_movemask_pd(_mm256_castsi256_pd(matches));
-                if found != 0 { return group.values[found.trailing_zeros() as usize]; }
-            }
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            if let Some(lane) = group.keys.iter().position(|&k| k == key) {
-                return group.values[lane];
-            }
-            if group.keys[3] == 0 { return key; }
-            slot = (slot + 1) & mask;
+        let hash = key.wrapping_mul(MIX);
+        let remainder = hash << (64-self.shift);
+        let words = &self.slots[(hash >> self.shift) as usize].entries;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let matched = unsafe {
+            use std::arch::x86_64::*;
+            let entries = _mm256_load_si256(words.as_ptr().cast());
+            let remainders = _mm256_andnot_si256(_mm256_set1_epi64x(self.ordinal_mask as i64), entries);
+            let equal = _mm256_cmpeq_epi64(remainders, _mm256_set1_epi64x(remainder as i64));
+            let matches = _mm256_movemask_pd(_mm256_castsi256_pd(equal));
+            if matches == 0 { None } else { Some(matches.trailing_zeros() as usize) }
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        let matched = words.iter().position(|word| word & !self.ordinal_mask == remainder);
+        if let Some(lane) = matched {
+            let ordinal = words[lane] & self.ordinal_mask;
+            if ordinal != 0 { return self.names[ordinal as usize-1]; }
+            // Empty lanes follow every occupied lane in a partially full home.
+            return key;
         }
+        if words[3] != 0 && words[0] > words[1] {
+            return self.overflow.get(&key).copied().unwrap_or(key);
+        }
+        key
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn quotient_aliases_handle_zero_remainders_and_full_home_groups() {
+    // Multiply by the inverse of MIX to construct exact home collisions
+    // without giving up bytewise numeric ordering of the short test keys.
+    let mut inverse = 1u64;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(MIX.wrapping_mul(inverse)));
+    }
+    assert_eq!(MIX.wrapping_mul(inverse), 1);
+    let names = |home: u64, count: usize| {
+        (0u64..).map(|r| ((home << 56) | r).wrapping_mul(inverse))
+            .filter(|&key| key > 1 && key < 1u64<<63).take(count).collect::<Vec<_>>()
+    };
+    let home = (1u64..254).find(|&h| (h<<56).wrapping_mul(inverse) < 1u64<<63).unwrap();
+    let crowded = names(home, 520);
+    let partial = names(home+1, 3);
+    let full = names(home+2, 5);
+    let mut pairs: Vec<_> = crowded[..500].iter().chain(&partial[..2]).chain(&full[..4]).map(|&k| (1,k)).collect();
+    pairs.extend_from_within(3..40);
+    let index = Links::build(&pairs);
+    assert_eq!(index.shift, 56);
+    assert!(!index.overflow.is_empty());
+    assert_eq!(crowded[0].wrapping_mul(MIX)<<8, 0);
+    for (_, key) in pairs { assert_eq!(index.person(key), 1); }
+    for &key in crowded[500..].iter().chain(&partial[2..]).chain(&full[4..]) {
+        assert_eq!(index.person(key), key);
+    }
+    for h in 0u64..256 {
+        let key = (h<<56).wrapping_mul(inverse);
+        if h != home && h != home+1 && h != home+2 { assert_eq!(index.person(key), key); }
     }
 }
 
