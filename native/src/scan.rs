@@ -273,7 +273,7 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
-const WINDOW: usize = 64;
+const WINDOW: usize = 96;
 
 /// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
 #[inline(always)]
@@ -597,7 +597,7 @@ impl Block {
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<7>(sep, at, out.add(count));
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
+                    lines += flatten::<1>(newline, at, ends.add(lines));
                     at += 64;
                 }
                 // Sentinels: a line's separators are found by position.
