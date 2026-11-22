@@ -73,7 +73,7 @@ index ce3aae9..7743174 100644
                  let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
 @@ -568,9 +567,44 @@ impl Block {
                      #[cfg(not(target_arch = "x86_64"))]
-                     let positions = flatten::<7>(sep, at, out.add(count));
+                     let positions = flatten::<8>(sep, at, out.add(count));
                      count += positions;
 -                    lines += flatten::<2>(newline, at, ends.add(lines));
 +                    if regular {
