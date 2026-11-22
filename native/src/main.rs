@@ -371,7 +371,7 @@ impl Links {
         for [key, id] in slots {
             if key == 0 { continue; }
             let person = names[id as usize];
-            if key == person { continue; }
+            if key == person || keys::store_canonical(key, person) { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
                 let group = &mut groups[at];
@@ -388,7 +388,7 @@ impl Links {
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty {
+        if !self.empty && !keys::prefetch_canonical_user(key) {
             prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
         }
     }
@@ -398,6 +398,7 @@ impl Links {
         if self.empty {
             return key;
         }
+        if let Some(person) = keys::canonical_user(key) { return person; }
         let mask = self.slots.len() - 1;
         let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
         loop {

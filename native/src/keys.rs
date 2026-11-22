@@ -83,11 +83,47 @@ const FIXED_USER: u64 = 1 << 61;
 struct UserSlot {
     tag: std::sync::atomic::AtomicU64,
     name: std::cell::UnsafeCell<[u8; 33]>,
+    canonical: std::sync::atomic::AtomicU64,
 }
 // Only the thread that claims an empty slot writes its name. All reads use
 // acquire publication or a key obtained from an already published slot.
 unsafe impl Sync for UserSlot {}
 static USER_SLOTS: std::sync::OnceLock<&'static [UserSlot]> = std::sync::OnceLock::new();
+
+const _: () = assert!(size_of::<UserSlot>() == 64);
+
+#[inline(always)]
+fn user_slot(key: u64) -> Option<&'static UserSlot> {
+    const TAG: u64 = INTERNED | FIXED_USER;
+    if key & TAG != TAG { return None; }
+    USER_SLOTS.get()?.get((key & !TAG) as usize)
+}
+
+/// Called by the one link builder before publishing the complete graph.
+pub fn store_canonical(key: u64, person: u64) -> bool {
+    if let Some(slot) = user_slot(key) {
+        slot.canonical.store(person, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+#[inline(always)]
+pub fn canonical_user(key: u64) -> Option<u64> {
+    user_slot(key).map(|slot| {
+        let person = slot.canonical.load(std::sync::atomic::Ordering::Relaxed);
+        if person == 0 { key } else { person }
+    })
+}
+
+#[inline(always)]
+pub fn prefetch_canonical_user(key: u64) -> bool {
+    if let Some(slot) = user_slot(key) {
+        crate::prefetch(slot);
+        return true;
+    }
+    false
+}
 
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {

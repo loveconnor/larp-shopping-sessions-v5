@@ -21,7 +21,7 @@ index 371b35d..89968a0 100644
 -            if key == 0 { continue; }
 -            let person = names[id as usize];
 +        for (key, person) in original.into_iter().zip(names) {
-             if key == person { continue; }
+             if key == person || keys::store_canonical(key, person) { continue; }
              let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
              loop {
 diff --git a/native/src/scan.rs b/native/src/scan.rs
