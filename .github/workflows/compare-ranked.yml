@@ -54,7 +54,7 @@ jobs:
                 CPUPROFILE=/profile/cpu-$trial CPUPROFILE_FREQUENCY=1000 LD_PRELOAD=libjemalloc.so.2:libprofiler.so.0 /app/shopping-sessions
               done
               ls -lh /profile
-              binary=$(strings /profile/cpu-1* | sed -n "s/.* \(/app/shopping-sessions\.[^ ]*\)$/\1/p" | head -1)
+              binary=$(strings /profile/cpu-1* | sed -n "s|.* \(/app/shopping-sessions\.[^ ]*\)$|\1|p" | head -1)
               test -x "$binary"
               echo "Sampled engine $binary"
               google-pprof --text --lines "$binary" /profile/cpu-* > /profile/lines.txt
