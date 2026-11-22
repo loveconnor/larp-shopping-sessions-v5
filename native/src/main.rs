@@ -409,8 +409,10 @@ impl Links {
                 // their four canonical values. Select a hit from the same load.
                 let all = _mm512_load_si512((group as *const AliasGroup).cast());
                 let found = _mm512_cmpeq_epi64_mask(all, _mm512_set1_epi64(key as i64)) & 15;
-                if found != 0 {
-                    let chosen = _mm512_maskz_compress_epi64(found << 4, all);
+                if found != 0 || group.keys[3] == 0 {
+                    // An empty selection keeps the original identity. Both
+                    // ordinary terminal outcomes return from the same lane.
+                    let chosen = _mm512_mask_compress_epi64(_mm512_set1_epi64(key as i64), found << 4, all);
                     return _mm_cvtsi128_si64(_mm512_castsi512_si128(chosen)) as u64;
                 }
             }
