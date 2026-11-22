@@ -1365,6 +1365,110 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+fn sort_medium_avx2(values: &mut [u64], depth: usize) {
+    use std::arch::x86_64::*;
+    const ORDER: [[i32; 8]; 16] = {
+        let mut table = [[0; 8]; 16];
+        let mut mask = 0;
+        while mask < 16 {
+            let mut lane = 0;
+            let mut low = 0;
+            let mut high = (mask as u32).count_ones() as usize;
+            while lane < 4 {
+                let target = if mask & (1 << lane) != 0 {
+                    low += 1;
+                    low - 1
+                } else {
+                    high += 1;
+                    high - 1
+                };
+                table[mask][2 * target] = 2 * lane as i32;
+                table[mask][2 * target + 1] = 2 * lane as i32 + 1;
+                lane += 1;
+            }
+            mask += 1;
+        }
+        table
+    };
+    if values.len() <= 32 || depth == 0 { values.sort_unstable(); return; }
+    let n = values.len();
+    let (a,b,c) = (values[0], values[n/2], values[n-1]);
+    let pivot = a.min(b).max(a.max(b).min(c));
+    let (mut low, mut high) = (0usize, n);
+    unsafe {
+        let ptr = values.as_mut_ptr();
+        let signed = _mm256_set1_epi64x(i64::MIN);
+        let bound = _mm256_set1_epi64x((pivot ^ (1 << 63)) as i64);
+        let mut held = _mm256_loadu_si256(ptr.cast());
+        let last = _mm256_loadu_si256(ptr.add(n - 4).cast());
+        let (mut first, mut end) = (4usize, n - 4);
+        while end - first >= 4 {
+            // The two held vectors leave eight holes. Read from the end
+            // needing more holes, so both four-lane writes avoid unread data.
+            let next = if first - low < 4 {
+                let v = _mm256_loadu_si256(ptr.add(first).cast());
+                first += 4;
+                v
+            } else {
+                end -= 4;
+                _mm256_loadu_si256(ptr.add(end).cast())
+            };
+            let smaller = _mm256_cmpgt_epi64(bound, _mm256_xor_si256(held, signed));
+            let mask = _mm256_movemask_pd(_mm256_castsi256_pd(smaller)) as usize;
+            let indices = _mm256_loadu_si256(ORDER[mask].as_ptr().cast());
+            let packed = _mm256_permutevar8x32_epi32(held, indices);
+            _mm256_storeu_si256(ptr.add(low).cast(), packed);
+            _mm256_storeu_si256(ptr.add(high - 4).cast(), packed);
+            let small = mask.count_ones() as usize;
+            low += small;
+            high -= 4 - small;
+            held = next;
+        }
+        let mut tail = [0u64; 11];
+        _mm256_storeu_si256(tail.as_mut_ptr().cast(), held);
+        _mm256_storeu_si256(tail.as_mut_ptr().add(4).cast(), last);
+        tail[8..8 + end - first].copy_from_slice(&values[first..end]);
+        for &v in &tail[..8 + end - first] {
+            if v < pivot { values[low] = v; low += 1; }
+            else { high -= 1; values[high] = v; }
+        }
+    }
+    debug_assert_eq!(low, high);
+    if low == 0 || low == n { values.sort_unstable(); return; }
+    let (left,right) = values.split_at_mut(low);
+    sort_medium_avx2(left, depth - 1);
+    sort_medium_avx2(right, depth - 1);
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+#[test]
+fn avx2_partition_matches_unsigned_sort() {
+    let mut seed = 0x71b13d05a289ef43u64;
+    for n in 0..=520 {
+        for mode in 0..8 {
+            let mut guarded = vec![u64::MAX - 3; n + 2];
+            let values = &mut guarded[1..=n];
+            for (i, value) in values.iter_mut().enumerate() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *value = match mode {
+                    0 => seed, 1 => seed & 3, 2 => u64::MAX,
+                    3 => i as u64, 4 => (n - i) as u64,
+                    5 => (i % 2) as u64 * u64::MAX,
+                    6 => (i.abs_diff(n / 2)) as u64, _ => seed.rotate_left(i as u32),
+                };
+            }
+            let mut reference = values.to_vec();
+            reference.sort_unstable();
+            sort_medium_avx2(values, 12);
+            assert_eq!(values, reference, "length={n} mode={mode}");
+            assert_eq!((guarded[0], guarded[n + 1]), (u64::MAX - 3, u64::MAX - 3));
+        }
+    }
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1565,7 +1669,9 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                sort_medium_avx2(mine, 12);
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
