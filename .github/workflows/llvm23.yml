@@ -8,12 +8,12 @@ jobs:
   profile:
     strategy:
       matrix:
-        seed: [278801, 196727, 553637, 832387]
+        seed: [143711, 937819, 608329, 380887]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 5710da2ca810bfe56d386d12ed6e7f8e641b3e2a
+          ref: 5280e1d01e1dda4f1a818842cc00a753b26bcd42
       - name: Generate v5 training input and collect LLVM counters
         run: |
           lscpu | grep -E "^Model name|^CPU\(s\)"
