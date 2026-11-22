@@ -42,7 +42,7 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 const DEAD: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
-const GROUP_ROWS: usize = 1 << 17;
+const GROUP_ROWS: usize = 1 << 15;
 /// How many records ahead to prefetch a links lookup.
 const AHEAD: usize = 16;
 
