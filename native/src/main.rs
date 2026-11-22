@@ -1132,15 +1132,6 @@ impl Sessions<'_> {
             // A click's `ts` counts from 7 days before the events' zero, so
             // the clicks in reach are those with start <= ts <= start + 7 days.
             let limit = start + WEEK as u64;
-            while high < clicks.len() && clicks[high].ts as u64 <= limit {
-                let campaign = clicks[high].campaign as usize;
-                if self.reach[campaign] == 0 {
-                    self.place[campaign] = self.active.len() as u32;
-                    self.active.push(campaign as u32);
-                }
-                self.reach[campaign] += 1;
-                high += 1;
-            }
             while low < high && (clicks[low].ts as u64) < start {
                 let campaign = clicks[low].campaign as usize;
                 self.reach[campaign] -= 1;
@@ -1153,6 +1144,23 @@ impl Sessions<'_> {
                     }
                 }
                 low += 1;
+            }
+            // A click entirely between two attribution windows contributes
+            // to neither. Skip it before touching any campaign counters.
+            if low == high {
+                while high < clicks.len() && (clicks[high].ts as u64) < start {
+                    high += 1;
+                }
+                low = high;
+            }
+            while high < clicks.len() && clicks[high].ts as u64 <= limit {
+                let campaign = clicks[high].campaign as usize;
+                if self.reach[campaign] == 0 {
+                    self.place[campaign] = self.active.len() as u32;
+                    self.active.push(campaign as u32);
+                }
+                self.reach[campaign] += 1;
+                high += 1;
             }
             if high > low {
                 let latest = clicks[high - 1].ts;
