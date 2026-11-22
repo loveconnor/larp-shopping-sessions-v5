@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["443837,528877,797623", "228869,112759,938257"]
+        seed_list: ["588781,998551,458567", "228859,434459,761683"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: a927dcb040767a04391c75291694f511d9ecbdc6
+      CANDIDATE: dac9aa7b68aa7a37ab4da73766debe90d26049f9
     steps:
       - uses: actions/checkout@v4
         with:
