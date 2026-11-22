@@ -243,7 +243,7 @@ pub fn write_plain_name(key: u64, out: &mut Vec<u8>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     if key & INTERNED == 0 {
         let length = 9 - (key.trailing_zeros() / 7) as usize;
-        let first = std::arch::x86_64::_pdep_u64(key >> 7, 0x7f7f_7f7f_7f7f_7f7f);
+        let first = unsafe { std::arch::x86_64::_pdep_u64(key >> 7, 0x7f7f_7f7f_7f7f_7f7f) };
         let mut entry = [0u8; 13];
         entry[..4].copy_from_slice(&(length as u32).to_le_bytes());
         entry[4..12].copy_from_slice(&first.to_be_bytes());
