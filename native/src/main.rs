@@ -1008,9 +1008,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
-            }
-            // Every record of this bucket has been read: its chunks are free.
-            for &(base, _) in &chunks {
+                // Deduplication finished before this scan. No winner lookup can
+                // read the source chunk again, so later output may reuse it now.
                 out.donate(base as *mut u8);
             }
         }
