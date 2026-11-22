@@ -655,10 +655,51 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     }
 }
 
+// Input mappings stay alive until attribution finishes. Keep exact names in
+// those files and copy only names read from unmapped files or oversized input.
+#[derive(Default)]
+struct LongIds {
+    regions: Vec<usize>,
+    copied: Vec<[u8; 33]>,
+}
+
+impl LongIds {
+    fn register_block(&mut self, block: &Block) -> Option<u32> {
+        let (base, bytes) = block.mapped_span();
+        let pieces = bytes.div_ceil(65536);
+        if base.is_null() || self.regions.len() + pieces > 32768 {
+            return None;
+        }
+        let first = (self.regions.len() as u32) << 16;
+        self.regions.extend((0..pieces).map(|i| base.wrapping_add(i * 65536) as usize));
+        Some(first)
+    }
+
+    #[inline(always)]
+    fn save(&mut self, bytes: &[u8; 33], block: &Block, region: Option<u32>) -> u32 {
+        if let Some(region) = region {
+            return region + block.offset(bytes.as_ptr()) as u32;
+        }
+        let index = self.copied.len();
+        assert!(index < (1 << 31));
+        self.copied.push(*bytes);
+        index as u32 | (1 << 31)
+    }
+
+    #[inline(always)]
+    fn get(&self, index: u32) -> &[u8; 33] {
+        if index >> 31 != 0 {
+            return &self.copied[(index & 0x7fff_ffff) as usize];
+        }
+        let base = self.regions[(index >> 16) as usize];
+        unsafe { &*((base + (index & 65535) as usize) as *const [u8; 33]) }
+    }
+}
+
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: LongIds,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -687,6 +728,7 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+    let region = out.names.register_block(block);
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -707,8 +749,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
             let fingerprint = event_fingerprint(bytes);
-            let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            let index = out.names.save(bytes, block, region);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
@@ -777,7 +818,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
 
 struct ClickSource {
     buckets: Buckets<Click>,
-    names: Vec<[u8; 33]>,
+    names: LongIds,
     worker: usize,
 }
 
@@ -787,7 +828,7 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
     }
     fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
         if key & LONG_EVENT == LONG_EVENT {
-            &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
+            sources[((key & !LONG_EVENT) >> 32) as usize].names.get(key as u32)
         } else {
             keys::bytes(key, scratch)
         }
@@ -803,6 +844,7 @@ fn parse_clicks(
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
 ) {
+    let region = out.names.register_block(block);
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
@@ -816,8 +858,7 @@ fn parse_clicks(
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = if n == 33 && shared.defer_long_events {
-            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
-            out.names.push(*p.cast::<[u8; 33]>());
+            let index = out.names.save(&*p.cast::<[u8; 33]>(), block, region);
             LONG_EVENT | (out.worker as u64) << 32 | index as u64
         } else {
             keys::pack(p, n)
@@ -897,10 +938,10 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
     }
     let mut events = EventSource {
         buckets: Buckets::new(1 << shared.id_bits),
-        names: Vec::new(),
+        names: LongIds::default(),
         overflow_times: Vec::new(),
     };
-    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
+    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: LongIds::default(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
@@ -968,8 +1009,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             // Equal fingerprints select candidates. Only the full bytes
                             // decide whether these two records are duplicates.
                             id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
+                                && sources[owners[index]].names.get(id as u32)
+                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names.get(other_id as u32)
                         } else {
                             id == other_id
                         };

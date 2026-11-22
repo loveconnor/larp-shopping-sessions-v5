@@ -104,6 +104,7 @@ pub struct Block {
     buf: Vec<u8>,
     base: *const u8,
     own_end: usize,
+    mapped_start: *const u8,
     /// One past the newline that ends our last line; 128 bytes after it are readable.
     end: usize,
 }
@@ -350,9 +351,13 @@ impl Block {
             buf: Vec::new(),
             base: std::ptr::null(),
             own_end: 0,
+            mapped_start: std::ptr::null(),
             end: 0,
         }
     }
+
+    pub fn mapped_span(&self) -> (*const u8, usize) { (self.mapped_start,self.end) }
+    pub fn offset(&self, field: *const u8) -> usize { field as usize - self.base as usize }
 
     fn reserve(&mut self, data: usize) {
         let need = PAD + data + 1 + 4 * PAD;
@@ -365,6 +370,7 @@ impl Block {
     pub fn load(&mut self, source: &Source, start: u64, end: u64) -> io::Result<()> {
         let own = (end - start) as usize;
         self.own_end = own;
+        self.mapped_start = if source.map.is_null() {std::ptr::null()} else {unsafe {source.map.add(start as usize)}};
         if !source.map.is_null() && end + SLACK as u64 <= source.size {
             self.base = unsafe { source.map.add(start as usize) };
             #[cfg(target_os = "linux")]
@@ -712,12 +718,14 @@ mod tests {
         let mut buf = vec![0u8; PAD + data.len() + 4 * PAD + 64];
         buf[PAD..PAD + data.len()].copy_from_slice(&data);
         let block = Block {
+            mapped_start: std::ptr::null(),
             buf,
             base: std::ptr::null(),
             own_end: own,
             end,
         };
         let block = Block {
+            mapped_start: std::ptr::null(),
             base: unsafe { block.buf.as_ptr().add(PAD) },
             ..block
         };
