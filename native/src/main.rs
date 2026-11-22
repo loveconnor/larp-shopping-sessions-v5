@@ -703,6 +703,29 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
+        #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+        {
+            let (a,na)=field(0);
+            let (b,nb)=field(1);
+            let (kind,nk)=field(4);
+            let word=u32::from_le(kind.cast::<u32>().read_unaligned());
+            if (na==9) & (nb==9) & (nk==4) & ((word==VIEW)|(word==CART)) {
+                if let Some((id,user))=keys::pair_nine(a,b) {
+                    let (q,nq)=field(3);
+                    let received=ts::ingest(q,nq,dates);
+                    if received==ts::BAD {return;}
+                    let (q,nq)=field(2);
+                    let time=ts::parse(q,nq,dates);
+                    let live=field(5).1>0 && time>=window_start && time<window_end && received-time<=DAY;
+                    let key=id^copy;
+                    out.buckets.push((key.wrapping_mul(MIX)>>id_shift) as usize,Parsed{
+                        id:key,user:user^copy,ingest:encode_ingest(received,window_start-DAY,&mut out.overflow_times),
+                        ts:if live {(time-window_start) as u32} else {DEAD},payload:0,
+                    });
+                    return;
+                }
+            }
+        }
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
