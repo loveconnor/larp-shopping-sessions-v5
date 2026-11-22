@@ -36,6 +36,26 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 pub struct Dates {
     month: [u64; 100],
     midnight: [i64; 100],
+    ingest_months: [IngestMonth; 2],
+}
+
+#[derive(Clone, Copy)]
+struct IngestMonth {
+    prefix: u64,
+    before_month: i64,
+    last_day: i64,
+}
+
+impl IngestMonth {
+    #[cold]
+    fn refresh(&mut self, raw: u64) -> bool {
+        let first = civil_day(raw, 1);
+        if first == BAD { return false; }
+        let mut last_day = 31;
+        while civil_day(raw, last_day) == BAD { last_day -= 1; }
+        *self = Self { prefix: raw, before_month: (first - 1) * 86_400, last_day };
+        true
+    }
 }
 
 impl Dates {
@@ -44,6 +64,7 @@ impl Dates {
             // No valid UTF-8 field can contain 0xff. NUL bytes are legal in CSV.
             month: [u64::MAX; 100],
             midnight: [0; 100],
+            ingest_months: [IngestMonth { prefix: u64::MAX, before_month: 0, last_day: 0 }; 2],
         }
     }
 }
@@ -210,33 +231,43 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
         if len != 20 || *p.add(19) != b'Z' {
             return parse(p, len, dates);
         }
-        #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
-        {
-            use std::arch::x86_64::*;
-            let raw=load64(p);
-            let ascii=_mm_loadu_si128(p.add(8).cast());
-            let order=_mm_setr_epi8(0,1,3,4,6,7,9,10,-1,-1,-1,-1,-1,-1,-1,-1);
-            let digits=_mm_and_si128(_mm_shuffle_epi8(ascii,order),_mm_set1_epi8(15));
-            let pairs=_mm_maddubs_epi16(digits,_mm_set1_epi16(0x010a));
-            let day=_mm_extract_epi16::<0>(pairs) as usize;
-            if day>=dates.month.len() || dates.month[day]!=raw {return parse(p,len,dates);}
-            let sum=_mm_madd_epi16(pairs,_mm_setr_epi16(0,3600,60,1,0,0,0,0));
-            let second=_mm_cvtsi128_si32(_mm_add_epi32(sum,_mm_srli_si128::<4>(sum)));
-            (dates.midnight[day]+i64::from(second))*1000
-        }
-        #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
-        {
-        let pair = |i: usize| {
-            let v = u16::from_le((p.add(i) as *const u16).read_unaligned());
-            i64::from((v & 15) * 10 + ((v >> 8) & 15))
-        };
-        let day = pair(8) as usize;
         let raw = load64(p);
-        if day >= dates.month.len() || dates.month[day] != raw {
-            return parse(p, len, dates);
-        }
-        (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
-        }
+        // Adjacent months fall in different slots, including December/January.
+        let month = &mut dates.ingest_months[((raw >> 48) & 1) as usize];
+        if month.prefix != raw && !month.refresh(raw) { return BAD; }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let (day, seconds) = {
+            use std::arch::x86_64::*;
+            let ascii = _mm_loadu_si128(p.add(8).cast());
+            let template = _mm_setr_epi8(48,48,84,48,48,58,48,48,58,48,48,0,0,0,0,0);
+            let upper = _mm_setr_epi8(9,9,0,9,9,0,9,9,0,9,9,-1,-1,-1,-1,-1);
+            let wrong = _mm_subs_epu8(_mm_xor_si128(ascii, template), upper);
+            let order = _mm_setr_epi8(0,1,3,4,6,7,9,10,-1,-1,-1,-1,-1,-1,-1,-1);
+            let digits = _mm_and_si128(_mm_shuffle_epi8(ascii, order), _mm_set1_epi8(15));
+            let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+            let late = _mm_cmpgt_epi16(pairs, _mm_setr_epi16(99,23,59,59,0,0,0,0));
+            let invalid = _mm_or_si128(wrong, late);
+            if _mm_testz_si128(invalid, invalid) == 0 { return BAD; }
+            let day = i64::from(_mm_extract_epi16::<0>(pairs));
+            let parts = _mm_madd_epi16(pairs, _mm_setr_epi16(24, 1, 60, 1, 0, 0, 0, 0));
+            let hours = _mm_cvtsi128_si32(parts);
+            let seconds = _mm_extract_epi32::<1>(parts);
+            (day, i64::from(hours * 3600 + seconds))
+        };
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        let (day, seconds) = {
+            let pair = |i: usize| {
+                let digits = u16::from_le(p.add(i).cast::<u16>().read_unaligned());
+                i64::from((digits & 15) * 10 + ((digits >> 8) & 15))
+            };
+            if *p.add(10) != b'T' || *p.add(13) != b':' || *p.add(16) != b':'
+                || [8,9,11,12,14,15,17,18].into_iter().any(|i| !(*p.add(i)).is_ascii_digit())
+                || pair(11) > 23 || pair(14) > 59 || pair(17) > 59 { return BAD; }
+            let day = pair(8);
+            (day, (day * 24 + pair(11)) * 3600 + pair(14) * 60 + pair(17))
+        };
+        if day < 1 || day > month.last_day { return BAD; }
+        (month.before_month + seconds) * 1000
     }
 }
 
@@ -459,6 +490,35 @@ mod tests {
             assert_eq!(ts("2026-1x-03T23:58:10Z"), BAD);
             assert_eq!(ts("2026-10-00T23:58:10Z"), BAD);
             assert_eq!(ts("2026-10-03T23:58:10Z"), 1_791_071_890_000);
+        }
+    }
+
+    #[test]
+    fn month_relative_ingestion_matches_strict_dates() {
+        let mut dates = Dates::new();
+        let mut reference = Dates::new();
+        let mut verify = |text: &[u8]| {
+            let mut buf = [0u8; 64];
+            buf[..text.len()].copy_from_slice(text);
+            unsafe {
+                assert_eq!(ingest(buf.as_ptr(), text.len(), &mut dates),
+                    parse(buf.as_ptr(), text.len(), &mut reference), "{text:?}");
+            }
+        };
+        for day in 0..=32 {
+            for year in [0, 1900, 1969, 2000, 2027, 2028, 9999] {
+                for month in 0..=13 {
+                    verify(format!("{year:04}-{month:02}-{day:02}T23:59:58Z").as_bytes());
+                }
+            }
+        }
+        let original = *b"2028-02-29T23:59:58Z";
+        for i in 0..original.len() {
+            for byte in 0..=255 {
+                let mut text = original;
+                text[i] = byte;
+                verify(&text);
+            }
         }
     }
 
