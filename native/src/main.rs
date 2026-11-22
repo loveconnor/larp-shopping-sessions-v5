@@ -196,8 +196,6 @@ struct Parsed {
     ingest: u32,
     /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
-    /// 0, or for a purchase its category in the top 8 bits and price below.
-    payload: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -656,6 +654,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 }
 
 struct EventSource {
+    details: Vec<u64>,
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
@@ -684,6 +683,24 @@ fn decode_ingest(encoded: u32, origin: i64, overflow: &[i64]) -> i64 {
     } else {
         overflow[(encoded ^ OVERFLOW_TIME) as usize]
     }
+}
+
+/// Keep the common non-purchase record at 24 bytes. Both uncommon fields
+/// are retained together for purchases and clocks outside the inline range.
+#[inline(always)]
+fn pack_details(ingest: u32, payload: u32, details: &mut Vec<u64>) -> u32 {
+    if ingest < OVERFLOW_TIME && payload == 0 {
+        return ingest;
+    }
+    let index = details.len();
+    assert!(index < OVERFLOW_TIME as usize);
+    details.push((u64::from(ingest) << 32) | u64::from(payload));
+    OVERFLOW_TIME | index as u32
+}
+
+#[inline(always)]
+fn detail_ingest(code: u32, source: &EventSource) -> u32 {
+    if code < OVERFLOW_TIME { code } else { (source.details[(code ^ OVERFLOW_TIME) as usize] >> 32) as u32 }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -758,9 +775,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
+            ingest: pack_details(encode_ingest(ingest, window_start - DAY, &mut out.overflow_times), payload, &mut out.details),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
         };
         let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
         if deferred {
@@ -899,6 +915,7 @@ fn parse_worker(shared: &Shared, worker: usize, threads: usize, shards: &LinkSha
         buckets: Buckets::new(1 << shared.id_bits),
         names: Vec::new(),
         overflow_times: Vec::new(),
+        details: Vec::new(),
     };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
@@ -980,8 +997,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                                 a < b
                             } else {
                                 let origin = shared.window_start - DAY;
-                                decode_ingest(a, origin, &sources[owners[index]].overflow_times)
-                                    < decode_ingest(b, origin, &sources[owners[(seen >> OFFSET_BITS) as usize]].overflow_times)
+                                let left = &sources[owners[index]];
+                                let right = &sources[owners[(seen >> OFFSET_BITS) as usize]];
+                                decode_ingest(detail_ingest(a, left), origin, &left.overflow_times)
+                                    < decode_ingest(detail_ingest(b, right), origin, &right.overflow_times)
                             };
                             if earlier {
                                 (*other).ts = DEAD;
@@ -995,7 +1014,8 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
+            for (chunk, &(base, count)) in chunks.iter().enumerate() {
+                let details = &sources[owners[chunk]].details;
                 for offset in 0..count {
                     if offset + ahead < count {
                         links.prefetch((*base.add(offset + ahead)).user);
@@ -1005,7 +1025,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         continue;
                     }
                     let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    let payload = if record.ingest < OVERFLOW_TIME { 0 } else {
+                        details[(record.ingest ^ OVERFLOW_TIME) as usize] as u32
+                    };
+                    let value = ((record.ts as u64) << 32) | u64::from(payload);
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
