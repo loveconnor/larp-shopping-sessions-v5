@@ -1042,31 +1042,31 @@ struct TimeBin {
     first: u32,
     last: u32,
     events: u32,
-    category_bits: [u64; 4],
+    other: u32,
+    // Upper 56 bits hold revenue from the first purchased category.
+    // A bin has at most u32::MAX events, each priced in 24 bits.
+    primary: u64,
 }
 
 impl Default for TimeBin {
     fn default() -> Self {
-        Self { first: u32::MAX, last: 0, events: 0, category_bits: [0; 4] }
+        Self { first: u32::MAX, last: 0, events: 0, other: 0, primary: 0 }
     }
 }
 
 struct TimeBins {
     bins: Vec<TimeBin>,
     occupied: Vec<u64>,
-    revenue: Vec<u64>,
-    categories: usize,
+    other_purchases: Vec<(u32, u32)>,
 }
 
 impl TimeBins {
     fn new(shared: &Shared) -> Self {
         let count = ((shared.window_end - shared.window_start) as usize).div_ceil(1 << BIN_SHIFT);
-        let categories = shared.categories.len();
         Self {
             bins: vec![TimeBin::default(); count],
             occupied: vec![0; count.div_ceil(64)],
-            revenue: vec![0; count * categories],
-            categories,
+            other_purchases: Vec::new(),
         }
     }
 }
@@ -1184,10 +1184,16 @@ impl Sessions<'_> {
             scratch.occupied[index / 64] |= 1 << (index % 64);
             let payload = value as u32;
             if payload != 0 {
-                let category = (payload >> 24) as usize;
+                let category = u64::from(payload >> 24);
                 let price = u64::from(payload & 0xff_ffff);
-                scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
+                if bin.primary == 0 {
+                    bin.primary = (price << 8) | category;
+                } else if bin.primary & 255 == category {
+                    bin.primary += price << 8;
+                } else {
+                    scratch.other_purchases.push((payload, bin.other));
+                    bin.other = u32::try_from(scratch.other_purchases.len()).expect("purchase list length");
+                }
             }
         }
         let mut cursor = (0, 0);
@@ -1216,20 +1222,24 @@ impl Sessions<'_> {
                 }
                 day_events += bin.events;
                 last = bin.last;
-                for (word, &occupied_categories) in bin.category_bits.iter().enumerate() {
-                    let mut categories = occupied_categories;
-                    while categories != 0 {
-                        let category = word * 64 + categories.trailing_zeros() as usize;
-                        categories &= categories - 1;
-                        let amount = std::mem::take(&mut scratch.revenue[index * scratch.categories + category]);
+                if bin.primary != 0 {
+                    let mut apply = |category: usize, amount: u64| {
                         if self.sums[category] == 0 { self.touched.push(category as u8); }
                         self.sums[category] += amount;
                         day_revenue += amount;
                         revenue += amount;
+                    };
+                    apply((bin.primary & 255) as usize, bin.primary >> 8);
+                    let mut link = bin.other;
+                    while link != 0 {
+                        let (payload, previous) = scratch.other_purchases[(link - 1) as usize];
+                        apply((payload >> 24) as usize, u64::from(payload & 0xff_ffff));
+                        link = previous;
                     }
                 }
             }
         }
+        scratch.other_purchases.clear();
         self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
         for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
