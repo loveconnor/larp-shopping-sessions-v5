@@ -1777,15 +1777,24 @@ fn main() -> io::Result<()> {
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
-    // Biggest person buckets first, so a whale's is never the last one running.
-    let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
-    let weight = |part: u32| {
-        events
-            .iter()
-            .map(|buckets| buckets.chunks[part as usize] as u64)
-            .sum::<u64>()
-    };
-    order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
+    // Start expensive partitions first. Count the click sorting work too.
+    // Traverse ordinary partitions in index order to reuse nearby metadata.
+    let parts = 1usize << shared.person_bits;
+    let mut costs = vec![0u64; parts];
+    for source in &events {
+        for (cost, &chunks) in costs.iter_mut().zip(&source.chunks) {
+            *cost += u64::from(chunks);
+        }
+    }
+    for source in &clicks {
+        for (cost, &chunks) in costs.iter_mut().zip(&source.buckets.chunks) {
+            if *cost != 0 { *cost += 2 * u64::from(chunks); }
+        }
+    }
+    let cutoff = 2 * costs.iter().sum::<u64>().div_ceil(parts as u64);
+    let mut order: Vec<u32> = (0..parts as u32).filter(|&part| costs[part as usize] > cutoff).collect();
+    order.sort_unstable_by_key(|&part| std::cmp::Reverse(costs[part as usize]));
+    order.extend((0..parts as u32).filter(|&part| (1..=cutoff).contains(&costs[part as usize])));
     let order = &order;
     let next = AtomicUsize::new(0);
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
