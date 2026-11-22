@@ -1,7 +1,7 @@
-name: Compare the current release, two AMD-specific changes, and their combination
+name: Compare the current release, three Intel scheduler targets
 on:
   push:
-    branches: [bench/stream-profile-schedule]
+    branches: [bench/intel-stream-scheduling]
 permissions:
   contents: read
 jobs:
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["346590,298636,626778", "850484,671218,339842", "919705,199465,220123", "426182,824944,138033", "688075,232616,786424", "244079,460341,139490"]
+        seed_list: ["790801,938510,925487", "482785,714684,603389", "797420,513484,339899", "202319,723495,961114", "645975,582259,177381", "934803,542626,908934"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
-      RANKED: bf5e73ec8064377d11ba8fcab23369d983df9efa
-      CANDIDATE: c1f4dc0dc82197f71ea4bec36722688e2c7cf73f
+      RANKED: 567939bcd88a63e39e62c4c803d57d67c0333d00
+      CANDIDATE: 8e387b447b390100f97cc7b75f163271d3a70fa3
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
           mkdir "$probe"
           git show "${CANDIDATE}:native/platform/select-engine.c" > "$probe/selector.c"
           cc -Os -static "$probe/selector.c" -o "$probe/selector"
-          for engine in base v3 v4 n4 wide p19; do
+          for engine in base v3 v4 n4 wide istr p19; do
             cat > "$probe/selector.$engine" <<'EOF'
           #!/bin/sh
           echo "${0##*.}"
@@ -39,14 +39,14 @@ jobs:
           echo "Actual selector chose $selected"
           echo "SELECTED=$selected" >> "$GITHUB_ENV"
       - name: Build the four release images and verify every fallback executable
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'istr'
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           for label in ranked candidate sorter combined; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = sorter ]; then sha=faf7a64332db78809a950daf53ca0326d906e420; fi
-            if [ "$label" = combined ]; then sha=5085884a63d3e70c2a7bdd9702d058d1315dc5d2; fi
+            if [ "$label" = sorter ]; then sha=1d74ae07422dd1e70d67fa0ce33f6800f8a3823e; fi
+            if [ "$label" = combined ]; then sha=0a32ecba5dd6f199dd0f1f904f07ebabd4691039; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -56,14 +56,14 @@ jobs:
             docker rm "$cid"
           done
           lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
-          for engine in base v3 v4 n4 wide; do
+          for engine in base v3 v4 n4 wide p19; do
             for label in candidate sorter combined; do
               cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/$label/shopping-sessions.$engine"
             done
           done
           docker tag ranked control
       - name: Generate fresh data
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'istr'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
@@ -73,5 +73,5 @@ jobs:
           cargo build --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml"
           python -m pip install --quiet duckdb==1.4.5
       - name: Measure the mean of the three per-dataset medians
-        if: env.SELECTED == 'p19'
+        if: env.SELECTED == 'istr'
         run: python "$GITHUB_WORKSPACE/.github/workflows/final_rehearsal.py"
