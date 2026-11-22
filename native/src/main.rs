@@ -303,13 +303,13 @@ impl Links {
 
         fn find(parent: &mut [u32], mut at: u32) -> u32 {
             loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
-                }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
+                let encoded = parent[at as usize];
+                if encoded == 0 { return at; }
+                let up = encoded - 1;
+                let grandparent = parent[up as usize];
+                if grandparent == 0 { return up; }
+                parent[at as usize] = grandparent;
+                at = grandparent - 1;
             }
         }
 
@@ -341,7 +341,7 @@ impl Links {
         }
         // Join. The smaller number is the root, so no cycle can form.
         let mut aliases = 0usize;
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
+        let mut parent = vec![0u32; names.len()];
         for (at, &[a, b]) in numbered.iter().enumerate() {
             if let Some(&[c, d]) = numbered.get(at + 8) {
                 prefetch(&parent[c as usize]);
@@ -353,7 +353,8 @@ impl Links {
                 aliases += 1;
                 let root = a.min(b) as usize;
                 let child = a.max(b) as usize;
-                parent[child] = root as u32;
+                // Zero is a root. A parent always precedes its child, so adding one fits.
+                parent[child] = root as u32 + 1;
                 if keys::compare(names[child], names[root]) == Order::Less {
                     names[root] = names[child];
                 }
@@ -362,7 +363,7 @@ impl Links {
         // Parents always have smaller indices. In ascending order their
         // canonical names have already been resolved, even along long chains.
         for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+            if up != 0 { names[id] = names[(up - 1) as usize]; }
         }
         let count = aliases.div_ceil(2).next_power_of_two().max(2);
         let shift = 64 - count.trailing_zeros();
@@ -416,6 +417,54 @@ impl Links {
             }
             if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
+        }
+    }
+}
+
+
+#[cfg(test)]
+#[test]
+fn canonical_links_match_connected_components_with_random_edge_order() {
+    const N: usize = 1536;
+    let names: Vec<_> = (0..N).map(|i| format!("u{:04}", (i * 463) % N)).collect();
+    let keys: Vec<_> = names.iter().map(|s| {
+        let mut bytes = s.as_bytes().to_vec();
+        bytes.resize(bytes.len() + 64, 0);
+        unsafe { keys::pack(bytes.as_ptr(), s.len()) }
+    }).collect();
+    let mut state = 947_153u64;
+    let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as usize };
+    for _ in 0..8 {
+        let mut graph = vec![Vec::new(); N];
+        let mut edges = Vec::new();
+        let mut join = |a: usize, b: usize| {
+            graph[a].push(b);
+            graph[b].push(a);
+            edges.push((keys[a], keys[b]));
+        };
+        for i in 1..767 { join(i - 1, i); }
+        for i in 0..3000 {
+            let a = 800 + next() % 700;
+            let b = (a / 20) * 20 + next() % 20;
+            join(a, b);
+            if i % 5 == 0 { join(b, a); join(a, a); }
+        }
+        for i in (1..edges.len()).rev() { edges.swap(i, next() % (i + 1)); }
+        let links = Links::build(&edges);
+        let mut seen = vec![false; N];
+        for start in 0..N {
+            if seen[start] { continue; }
+            let mut component = Vec::new();
+            let mut todo = vec![start];
+            seen[start] = true;
+            while let Some(id) = todo.pop() {
+                component.push(id);
+                for &other in &graph[id] {
+                    if !seen[other] { seen[other] = true; todo.push(other); }
+                }
+            }
+            let best = *component.iter().min_by_key(|&&id| &names[id]).unwrap();
+            for id in component { assert_eq!(links.person(keys[id]), keys[best]); }
         }
     }
 }

@@ -12,7 +12,7 @@ index 371b35d..89968a0 100644
 +        let original = names.clone();
          // Join. The smaller number is the root, so no cycle can form.
          let mut aliases = 0usize;
-         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
+         let mut parent = vec![0u32; names.len()];
 @@ -364,9 +368,7 @@ impl Links {
          let shift = 64 - count.trailing_zeros();
          let mut groups = vec![AliasGroup::default(); count];
