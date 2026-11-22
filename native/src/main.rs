@@ -53,7 +53,7 @@ const AHEAD: usize = 16;
 /// one pointer, and 2048 of them stay in the L1 cache.
 const CHUNK_BYTES: usize = 8192;
 /// Chunks per slab.
-const SLAB: usize = 1 << 13;
+const SLAB: usize = 1 << 10;
 /// The dedup table packs a record's offset in its chunk into this many bits.
 const OFFSET_BITS: u32 = 9;
 

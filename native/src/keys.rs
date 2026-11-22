@@ -133,7 +133,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
-    for _ in 0..12 {
+    for _ in 0..8 {
         let slot = &slots[at];
         let mut tag = slot.tag.load(Acquire);
         if tag == 0 {
