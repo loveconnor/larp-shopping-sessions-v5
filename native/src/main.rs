@@ -32,7 +32,7 @@ const SESSION_GAP: u64 = 1_800_000;
 /// Bytes of CSV a thread takes at a time.
 const BLOCK: u64 = 1 << 19;
 /// Bytes of a links file read at a time.
-const LINK_BLOCK: u64 = 1 << 19;
+const LINK_BLOCK: u64 = 1 << 20;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 10;
@@ -317,7 +317,7 @@ impl Links {
         // pass will touch a few steps on, since every touch is a cache miss.
         let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
         for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
+            if let Some(&(c, d)) = pairs.get(at + 16) {
                 prefetch(&slots[home(c)]);
                 prefetch(&slots[home(d)]);
             }
@@ -343,7 +343,7 @@ impl Links {
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
         for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
+            if let Some(&[c, d]) = numbered.get(at + 24) {
                 prefetch(&parent[c as usize]);
                 prefetch(&parent[d as usize]);
             }
