@@ -252,6 +252,25 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     n
 }
 
+// Each set bit marks a newline in the stream of separators. The rank gives
+// the exact field count without materializing a second list of byte offsets.
+#[inline(always)]
+fn newline_ranks(separators: u64, newlines: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe { std::arch::x86_64::_pext_u64(newlines, separators) }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut result = 0;
+        let mut bits = newlines;
+        while bits != 0 {
+            let before = (bits & bits.wrapping_neg()) - 1;
+            result |= 1 << (separators & before).count_ones();
+            bits &= bits - 1;
+        }
+        result
+    }
+}
+
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
 
@@ -499,7 +518,7 @@ impl Block {
             }
             let end = end as u32;
             let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
-            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            let mut line_words = [0u64; WINDOW + 1];
             // Starts of chunks that break a quote rule; the last is a sentinel.
             let mut bad: Vec<u32> = Vec::new();
             let mut bad_at = 0usize;
@@ -516,9 +535,9 @@ impl Block {
                     seps.reserve(WINDOW * 64 + 128);
                 }
                 let mut count = kept;
-                let mut lines = 0usize;
+                let mut pending_lines = 0u64;
+                let mut words = 0;
                 let out = seps.as_mut_ptr();
-                let ends = newlines.as_mut_ptr();
                 let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
                 while at < stop_at {
                     let p = buf.add(at as usize);
@@ -567,8 +586,15 @@ impl Block {
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
+                    let ordinal = (count - kept) & 63;
+                    let ranks = newline_ranks(sep, newline);
+                    pending_lines |= ranks << ordinal;
+                    if ordinal + positions >= 64 {
+                        line_words[words] = pending_lines;
+                        words += 1;
+                        pending_lines = (ranks >> 1) >> (63 - ordinal);
+                    }
                     count += positions;
-                    lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
                 }
                 // Sentinels: a line's separators are found by position.
@@ -577,27 +603,31 @@ impl Block {
                 }
                 bad.push(u32::MAX - 64);
                 let mut sep_at = 0usize;
-                for &stop in std::slice::from_raw_parts(ends, lines) {
+                line_words[words] = pending_lines;
+                for (word, &line_bits) in line_words[..=words].iter().enumerate() {
+                  let mut bits = line_bits;
+                  while bits != 0 {
+                    let end_index = kept + word * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let stop = *out.add(end_index);
                     let start = line;
                     line = stop + 1;
                     while *bad.get_unchecked(bad_at) + 64 <= start {
                         bad_at += 1;
                     }
                     let clean = *bad.get_unchecked(bad_at) > stop;
-                    if *out.add(sep_at + N - 1) == stop && clean {
+                    if end_index + 1 == sep_at + N && clean {
                         visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
                         sep_at += N;
                         continue;
                     }
-                    while *out.add(sep_at) < stop {
-                        sep_at += 1;
-                    }
-                    sep_at += 1;
+                    sep_at = end_index + 1;
                     if !clean {
                         if let Some(found) = Self::split_line::<N>(buf, start as usize) {
                             visit(buf, start, &found);
                         }
                     }
+                  }
                 }
                 bad.pop();
                 // Separators of the line still open move to the front.
