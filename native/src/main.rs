@@ -335,6 +335,10 @@ impl Links {
             }
             numbered.push(index);
         }
+        // The hash index is only needed while numbering. Retain the original
+        // keys densely for the final alias table, then free the sparse index.
+        drop(slots);
+        let original = names.clone();
         // Join. The smaller number is the root, so no cycle can form.
         let mut aliases = 0usize;
         let mut parent: Vec<u32> = (0..names.len() as u32).collect();
@@ -364,9 +368,7 @@ impl Links {
         let shift = 64 - count.trailing_zeros();
         let mut groups = vec![AliasGroup::default(); count];
         huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
+        for (key, person) in original.into_iter().zip(names) {
             if key == person { continue; }
             let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
             loop {
