@@ -292,98 +292,69 @@ struct Links {
 }
 
 impl Links {
-    fn build(pairs: &[(u64, u64)]) -> Self {
-        let capacity = (pairs.len() * 3).next_power_of_two().max(16);
-        let mask = capacity - 1;
-        let shift = 64 - capacity.trailing_zeros();
-        let mut slots = vec![[0u64; 2]; capacity];
-        huge(slots.as_ptr(), capacity);
-        let mut names: Vec<u64> = Vec::new();
-        let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
+    // Return the existing lane or the first free lane for this alias.
+    #[inline]
+    fn lane(&self,key:u64) -> (usize,usize) {
+        let mut pos=(key.wrapping_mul(MIX)>>self.shift) as usize;
+        loop {
+            let g=&self.slots[pos];
+            for i in 0..4 {
+                if g.keys[i]==key || g.keys[i]==0 {return (pos,i);}
+            }
+            pos=(pos+1)&(self.slots.len()-1);
+        }
+    }
 
-        fn find(parent: &mut [u32], mut at: u32) -> u32 {
-            loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
-                }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
-            }
+    fn root(&mut self,mut key:u64) -> u64 {
+        let mut here=self.lane(key);
+        loop {
+            if self.slots[here.0].keys[here.1]==0 {return key;}
+            let parent=self.slots[here.0].values[here.1];
+            let next=self.lane(parent);
+            if self.slots[next.0].keys[next.1]==0 {return parent;}
+            let ancestor=self.slots[next.0].values[next.1];
+            self.slots[here.0].values[here.1]=ancestor;
+            key=ancestor;
+            here=self.lane(key);
         }
+    }
 
-        // Number the IDs as they appear; each pass below prefetches what the
-        // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
-                prefetch(&slots[home(c)]);
-                prefetch(&slots[home(d)]);
-            }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-            }
-            numbered.push(index);
+    fn build(pairs:&[(u64,u64)]) -> Self {
+        let count=pairs.len().div_ceil(2).next_power_of_two().max(2);
+        let mut result=Self {slots:vec![AliasGroup::default();count],shift:64-count.trailing_zeros(),empty:pairs.is_empty()};
+        huge(result.slots.as_ptr(),count);
+        let mut joins=Vec::new();
+        let order=|a,b| if keys::compare(a,b)==Order::Less {(b,a)} else {(a,b)};
+        // Every edge points downwards in exact byte order. Only a vertex
+        // with two different outgoing edges can require a later union.
+        for (i,&(a,b)) in pairs.iter().enumerate() {
+            if let Some(&(x,y))=pairs.get(i+8) {result.prefetch(x);result.prefetch(y);}
+            let (higher,lower)=order(a,b);
+            if higher==lower {continue;}
+            let (at,lane)=result.lane(higher);
+            let g=&mut result.slots[at];
+            if g.keys[lane]==0 {g.keys[lane]=higher;g.values[lane]=lower;}
+            else if g.values[lane]!=lower {joins.push((g.values[lane],lower));}
         }
-        // Join. The smaller number is the root, so no cycle can form.
-        let mut aliases = 0usize;
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-        for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
-                prefetch(&parent[c as usize]);
-                prefetch(&parent[d as usize]);
-            }
-            let a = find(&mut parent, a);
-            let b = find(&mut parent, b);
-            if a != b {
-                aliases += 1;
-                let root = a.min(b) as usize;
-                let child = a.max(b) as usize;
-                parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
-                }
+        for (a,b) in joins {
+            let a=result.root(a);
+            let b=result.root(b);
+            if a!=b {
+                let (higher,lower)=order(a,b);
+                let (at,lane)=result.lane(higher);
+                result.slots[at].keys[lane]=higher;
+                result.slots[at].values[lane]=lower;
             }
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
-        }
-        let count = aliases.div_ceil(2).next_power_of_two().max(2);
-        let shift = 64 - count.trailing_zeros();
-        let mut groups = vec![AliasGroup::default(); count];
-        huge(groups.as_ptr(), count);
-        for [key, id] in slots {
-            if key == 0 { continue; }
-            let person = names[id as usize];
-            if key == person { continue; }
-            let mut at = (key.wrapping_mul(MIX) >> shift) as usize;
-            loop {
-                let group = &mut groups[at];
-                if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
-                    group.values[lane] = person;
-                    break;
-                }
-                at = (at + 1) & (count - 1);
+        for at in 0..count {
+            for lane in 0..4 {
+                if result.slots[at].keys[lane]==0 {break;}
+                let parent=result.slots[at].values[lane];
+                let minimum=result.root(parent);
+                result.slots[at].values[lane]=minimum;
             }
         }
-        Self { slots: groups, shift, empty: aliases == 0 }
+        result
     }
 
     #[inline(always)]
