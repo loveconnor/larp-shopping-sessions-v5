@@ -636,29 +636,44 @@ fn person_part(person: u64, bits: u32) -> usize {
 const LONG_EVENT: u64 = 3 << 62;
 const EVENT_FINGERPRINT: u64 = (1 << 30) - 1;
 
-/// A hash selects the dedup bucket. Collisions are resolved by all 33 bytes.
+/// A lowercase hexadecimal event key is represented by its exact 16 bytes.
 #[inline(always)]
-fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+fn packed_event(bytes:&[u8;33]) -> Option<[u8;16]> {
+    if bytes[0]!=b'e' {return None;}
+    #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
     unsafe {
-        use std::arch::x86_64::_mm_crc32_u64;
-        let mut crc = u64::from(bytes[0]);
-        for word in bytes[1..].chunks_exact(8) {
-            crc = _mm_crc32_u64(crc, u64::from_le_bytes(word.try_into().unwrap()));
-        }
-        crc & EVENT_FINGERPRINT
+        use std::arch::x86_64::*;
+        let text=_mm256_loadu_si256(bytes.as_ptr().add(1).cast());
+        let digit=_mm256_sub_epi8(text,_mm256_set1_epi8(48));
+        let letter=_mm256_sub_epi8(text,_mm256_set1_epi8(97));
+        let invalid=_mm256_min_epu8(_mm256_subs_epu8(digit,_mm256_set1_epi8(9)),_mm256_subs_epu8(letter,_mm256_set1_epi8(5)));
+        if _mm256_testz_si256(invalid,invalid)==0 {return None;}
+        let nibbles=_mm256_min_epu8(digit,_mm256_add_epi8(letter,_mm256_set1_epi8(10)));
+        let pairs=_mm256_maddubs_epi16(nibbles,_mm256_set1_epi16(0x0110));
+        let dense=_mm_packus_epi16(_mm256_castsi256_si128(pairs),_mm256_extracti128_si256::<1>(pairs));
+        Some(std::mem::transmute::<__m128i,[u8;16]>(dense))
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    #[cfg(not(all(target_arch="x86_64",target_feature="avx2")))]
     {
-        let mixed = keys::long_name_mix(bytes) ^ u64::from(bytes[0]);
-        (mixed ^ (mixed >> 32)) & EVENT_FINGERPRINT
+        let nibble=|v:u8| match v { b'0'..=b'9'=>Some(v-b'0'),b'a'..=b'f'=>Some(v-b'a'+10),_=>None };
+        let mut out=[0;16];
+        for (v,pair) in out.iter_mut().zip(bytes[1..].chunks_exact(2)) {*v=(nibble(pair[0])?<<4)|nibble(pair[1])?;}
+        Some(out)
     }
+}
+
+#[inline(always)]
+fn event_fingerprint(bytes: &[u8; 16]) -> u64 {
+    let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let second = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    let mixed = first.wrapping_mul(MIX) ^ second.rotate_left(27);
+    (mixed ^ (mixed >> 32)) & EVENT_FINGERPRINT
 }
 
 struct EventSource {
     overflow_times: Vec<i64>,
     buckets: Buckets<Parsed>,
-    names: Vec<[u8; 33]>,
+    names: Vec<[u8; 16]>,
 }
 
 // Inline offsets cover nearly 25 days starting one day before the window.
@@ -704,11 +719,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let (id, partition_hash) = if n == 33 && shared.defer_long_events {
-            let bytes = &*p.cast::<[u8; 33]>();
-            let fingerprint = event_fingerprint(bytes);
+        let packed = if n == 33 && shared.defer_long_events {
+            packed_event(&*p.cast::<[u8; 33]>())
+        } else {
+            None
+        };
+        let (id, partition_hash) = if let Some(bytes) = packed {
+            let fingerprint = event_fingerprint(&bytes);
             let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
-            out.names.push(*bytes);
+            out.names.push(bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
             let id = keys::pack(p, n);
