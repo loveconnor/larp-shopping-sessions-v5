@@ -287,74 +287,52 @@ impl Links {
         let shift = 64 - capacity.trailing_zeros();
         let mut slots = vec![[0u64; 2]; capacity];
         huge(slots.as_ptr(), capacity);
-        let mut names: Vec<u64> = Vec::new();
         let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
-
-        fn find(parent: &mut [u32], mut at: u32) -> u32 {
+        // During construction the value is a parent slot. A root keeps the
+        // byte-wise smallest key of its component as its own original key.
+        fn root(slots: &mut [[u64; 2]], mut i: usize) -> usize {
             loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
-                }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
+                let up = slots[i][1] as usize;
+                if up == i { return i; }
+                let above = slots[up][1] as usize;
+                slots[i][1] = above as u64;
+                i = above;
             }
         }
-
-        // Number the IDs as they appear; each pass below prefetches what the
-        // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
+        for (at, &(a,b)) in pairs.iter().enumerate() {
+            if let Some(&(c,d)) = pairs.get(at + 8) {
                 prefetch(&slots[home(c)]);
                 prefetch(&slots[home(d)]);
             }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
+            let mut roots = [0usize; 2];
+            for (side,key) in [a,b].into_iter().enumerate() {
                 let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
+                while slots[slot][0] != 0 && slots[slot][0] != key {
                     slot = (slot + 1) & mask;
-                };
+                }
+                if slots[slot][0] == 0 {
+                    slots[slot] = [key, slot as u64];
+                    roots[side] = slot;
+                } else {
+                    roots[side] = root(&mut slots,slot);
+                }
             }
-            numbered.push(index);
-        }
-        // Join. The smaller number is the root, so no cycle can form.
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-        for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
-                prefetch(&parent[c as usize]);
-                prefetch(&parent[d as usize]);
-            }
-            let a = find(&mut parent, a);
-            let b = find(&mut parent, b);
+            let [a,b] = roots;
             if a != b {
-                let root = a.min(b) as usize;
-                let child = a.max(b) as usize;
-                parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
+                if keys::compare(slots[a][0],slots[b][0]) == Order::Less {
+                    slots[b][1] = a as u64;
+                } else {
+                    slots[a][1] = b as u64;
                 }
             }
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+        // First freeze every parent to its final root, then read only the key
+        // column while replacing the parent column with canonical names.
+        for i in 0..slots.len() {
+            if slots[i][0] != 0 { slots[i][1] = root(&mut slots,i) as u64; }
         }
-        for entry in &mut slots {
-            if entry[0] != 0 {
-                entry[1] = names[entry[1] as usize];
-            }
+        for i in 0..slots.len() {
+            if slots[i][0] != 0 { slots[i][1] = slots[slots[i][1] as usize][0]; }
         }
         Self {
             slots,
