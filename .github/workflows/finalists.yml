@@ -1,7 +1,7 @@
 name: Rehearse three final datasets with nine interleaved runs per commit on one host
 on:
   push:
-    branches: [bench/family19-profile-finals]
+    branches: [bench/family19-128-finals]
 permissions:
   contents: read
 jobs:
@@ -11,11 +11,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["913393,492713,560447", "819703,329791,107417", "206833,419033,210671", "210481,779189,409987", "207257,569303,684257", "795727,339391,282089"]
+        seed_list: ["816441,436231,457710", "200039,718604,736162", "291845,682864,810113", "940784,834114,174410", "309571,276467,892042", "487769,964396,757235"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 846a15a7bd3eda7a2a04581f25b48087093b42ea
+      CANDIDATE: 7e8f59da6626659f317f8ae7878a3b201dbd61f0
     steps:
       - uses: actions/checkout@v4
         with:
