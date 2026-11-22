@@ -33,7 +33,7 @@ struct Column {
     last_key: u64,
     /// `Category`: one bit per row, 1 where the value is present.
     present: Vec<u8>,
-    ints: Vec<i64>,
+
 }
 
 struct ChunkMeta {
@@ -166,6 +166,7 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
 
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
 /// miniblock packed at the width its largest delta above the block's minimum needs.
+#[cfg(test)]
 fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
     const BLOCK: usize = 128;
     const MINI: usize = 32;
@@ -233,7 +234,7 @@ impl Writer {
                     runs: Vec::new(),
                     last_key: 0,
                     present: Vec::new(),
-                    ints: Vec::new(),
+
                 })
                 .collect(),
             dictionary: plain,
@@ -287,7 +288,18 @@ impl Writer {
 
     #[inline(always)]
     pub fn int(&mut self, column: usize, value: i64) {
-        self.columns[column].ints.push(value);
+        if matches!(self.columns[column].kind,Kind::Int64) {self.int64(column,value);}
+        else {self.int32(column,value as i32);}
+    }
+
+    #[inline(always)]
+    pub fn int32(&mut self,column:usize,value:i32) {
+        self.columns[column].bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[inline(always)]
+    pub fn int64(&mut self,column:usize,value:i64) {
+        self.columns[column].bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     #[inline(always)]
@@ -377,8 +389,7 @@ impl Writer {
                     Self::page(&mut self.out, &body, rows, false, 8);
                 }
                 Kind::Date | Kind::Int32 | Kind::Int64 => {
-                    delta_binary_packed(&mut body, &column.ints);
-                    Self::page(&mut self.out, &body, rows, false, 5);
+                    Self::page(&mut self.out, &column.bytes, rows, false, 0);
                 }
             }
             chunks.push(ChunkMeta {
@@ -389,7 +400,7 @@ impl Writer {
             column.bytes.clear();
             column.runs.clear();
             column.present.clear();
-            column.ints.clear();
+
         }
         self.groups.push(GroupMeta {
             rows: rows as u64,
@@ -440,8 +451,8 @@ impl Writer {
                     Kind::Text => (6, &[0]),
                     Kind::Keyed => (6, &[0, 8]),
                     Kind::Category => (6, &[0, 8, 3]),
-                    Kind::Date | Kind::Int32 => (1, &[5]),
-                    Kind::Int64 => (2, &[5]),
+                    Kind::Date | Kind::Int32 => (1, &[0]),
+                    Kind::Int64 => (2, &[0]),
                 };
                 meta.begin(0);
                 meta.i64(2, chunk.offset as i64);

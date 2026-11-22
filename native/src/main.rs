@@ -1101,10 +1101,10 @@ impl Sessions<'_> {
         }
         let writer = self.writer.as_mut().unwrap();
         writer.keyed(0, person, |name| keys::unpack(person, name));
-        writer.int(1, shared.first_day + day as i64);
-        writer.int(2, sessions as i64);
-        writer.int(3, events as i64);
-        writer.int(4, revenue as i64);
+        writer.int32(1, (shared.first_day + i64::from(day)) as i32);
+        writer.int32(2,sessions as i32);
+        writer.int32(3,events as i32);
+        writer.int64(4,revenue as i64);
         let mut top: Option<usize> = None;
         for &category in &self.touched {
             let category = category as usize;
