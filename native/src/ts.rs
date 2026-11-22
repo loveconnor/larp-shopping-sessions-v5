@@ -36,6 +36,7 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 pub struct Dates {
     month: [u64; 100],
     midnight: [i64; 100],
+    offsets: [(u64, i64); 128],
 }
 
 impl Dates {
@@ -44,6 +45,7 @@ impl Dates {
             // No valid UTF-8 field can contain 0xff. NUL bytes are legal in CSV.
             month: [u64::MAX; 100],
             midnight: [0; 100],
+            offsets: [(0, 0); 128],
         }
     }
 }
@@ -263,22 +265,28 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
             let sign = *p.add(19);
             if sign == b'+' || sign == b'-' {
                 let seconds = civil_seconds(p, dates);
-                let c = load64(p.add(17)) ^ 0x3030_3A30_3000_3030; // SS?HH:MM, sign cleared below
-                let c = c & 0xFFFF_FFFF_FF00_FFFF;
-                if seconds == BAD || (c.wrapping_add(0x7676_7F76_7600_7676) | c) & HIGH != 0 {
-                    return BAD;
-                }
-                let hours = byte(c, 3) * 10 + byte(c, 4);
-                let minutes = byte(c, 6) * 10 + byte(c, 7);
-                if hours > 23 || minutes > 59 {
-                    return BAD;
-                }
-                let offset = hours * 3_600 + minutes * 60;
-                return (if sign == b'+' {
-                    seconds - offset
+                if seconds == BAD { return BAD; }
+                // All six bytes participate in equality. A plus or minus in
+                // the low byte keeps a valid cache lookup distinct from zero.
+                let text = load64(p.add(19)) & 0x0000_ffff_ffff_ffff;
+                let index = (text.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize;
+                let entry = &mut dates.offsets[index];
+                let offset = if entry.0 == text {
+                    entry.1
                 } else {
-                    seconds + offset
-                }) * 1000;
+                    let digits = (text >> 8) ^ 0x3030_3a30_30;
+                    if (digits.wrapping_add(0x7676_7f76_76) | digits) & 0x8080_8080_80 != 0 {
+                        return BAD;
+                    }
+                    let hours = byte(digits, 0) * 10 + byte(digits, 1);
+                    let minutes = byte(digits, 3) * 10 + byte(digits, 4);
+                    if hours > 23 || minutes > 59 { return BAD; }
+                    let east = hours * 3600 + minutes * 60;
+                    let offset = if sign == b'+' { east } else { -east };
+                    *entry = (text, offset);
+                    offset
+                };
+                return (seconds - offset) * 1000;
             }
         }
         digits_slow(p, len)
