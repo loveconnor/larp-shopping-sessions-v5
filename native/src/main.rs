@@ -109,6 +109,10 @@ impl<T: Copy> Buckets<T> {
             if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
                 at = self.grow(part);
             }
+            // Each worker owns its chunks. Bring the next destination line
+            // into its cache while other partitions are receiving records.
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
             at.write(value);
             *slot = at.add(1);
         }
