@@ -1,7 +1,7 @@
-name: Rehearse three final datasets with nine interleaved runs per commit on one host
+name: Compare the current release, two AMD-specific changes, and their combination
 on:
   push:
-    branches: [bench/family19-profile-finals]
+    branches: [bench/family19-sort-comparison]
 permissions:
   contents: read
 jobs:
@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed_list: ["913393,492713,560447", "819703,329791,107417", "206833,419033,210671", "210481,779189,409987", "207257,569303,684257", "795727,339391,282089"]
+        seed_list: ["354179,608391,816793", "965263,713993,316817", "435281,698671,865713", "739473,590623,971491", "547531,977107,694543", "763973,302143,812681"]
     env:
       SEED_LIST: ${{ matrix.seed_list }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
@@ -21,28 +21,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Check CPU and build the two submission images
+      - name: Identify compatible native hosts using the production selector
         run: |
-          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          for label in ranked candidate; do
-            sha=$CANDIDATE
-            if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = v4 ]; then sha=47bb8b73aa5f9ee3ac5a11fb1d5b429d0cff3c8a; fi
-            mkdir "$RUNNER_TEMP/$label-src"
-            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
-            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
-            cid=$(docker create "$label")
-            mkdir "$RUNNER_TEMP/$label"
-            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
-            docker rm "$cid"
-          done
-          lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
-          for engine in base v3 v4 n4 wide; do
-            cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/candidate/shopping-sessions.$engine"
-          done
+          lscpu | grep -E '^Model name:|^CPU family:|^Model:|^Vendor ID:'
           probe="$RUNNER_TEMP/selector-probe"
           mkdir "$probe"
-          cp "$RUNNER_TEMP/candidate/shopping-sessions" "$probe/selector"
+          git show "${CANDIDATE}:native/platform/select-engine.c" > "$probe/selector.c"
+          cc -Os -static "$probe/selector.c" -o "$probe/selector"
           for engine in base v3 v4 n4 wide p19; do
             cat > "$probe/selector.$engine" <<'EOF'
           #!/bin/sh
@@ -53,6 +38,29 @@ jobs:
           selected=$("$probe/selector")
           echo "Actual selector chose $selected"
           echo "SELECTED=$selected" >> "$GITHUB_ENV"
+      - name: Build the four release images and verify every fallback executable
+        if: env.SELECTED == 'p19'
+        run: |
+          lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
+          for label in ranked candidate sorter combined; do
+            sha=$CANDIDATE
+            if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = sorter ]; then sha=1426671a3250e5dcb5342c29ea6238942350685f; fi
+            if [ "$label" = combined ]; then sha=225f705d906a98cafac0117242ab8c80d7838659; fi
+            mkdir "$RUNNER_TEMP/$label-src"
+            git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            mkdir "$RUNNER_TEMP/$label"
+            docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
+            docker rm "$cid"
+          done
+          lscpu | grep -E '^CPU family:|^Model:|^Vendor ID:'
+          for engine in base v3 v4 n4 wide; do
+            for label in candidate sorter combined; do
+              cmp "$RUNNER_TEMP/ranked/shopping-sessions.$engine" "$RUNNER_TEMP/$label/shopping-sessions.$engine"
+            done
+          done
           docker tag ranked control
       - name: Generate fresh data
         if: env.SELECTED == 'p19'

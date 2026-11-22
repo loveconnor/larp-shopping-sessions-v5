@@ -11,7 +11,7 @@ import duckdb
 
 root = Path(os.environ["RUNNER_TEMP"])
 seeds = list(map(int, os.environ["SEED_LIST"].split(",")))
-labels = ("ranked", "candidate", "control")
+labels = ("ranked", "candidate", "sorter", "combined", "control")
 medians = {label: [] for label in labels}
 cpus = sorted(os.sched_getaffinity(0))[:8]
 cpuset = ",".join(map(str, cpus))
@@ -42,8 +42,8 @@ for seed in seeds:
                     "--events","60000000","--clicks","15000000","--threads",str(len(cpus)),
                     "--output",root/"data"],check=True)
     samples = {label: [] for label in labels}
-    # Each label appears first, second and third three times across nine rounds.
-    orders = [labels[i:]+labels[:i] for i in range(3)] * 3
+    # Every label takes each position twice in ten randomized rounds.
+    orders = [order[i:]+order[:i] for order in [labels, labels[::-1]] for i in range(len(labels))]
     random.Random(seed).shuffle(orders)
     for number, order in enumerate([labels]+orders):
         for label in order:
@@ -58,14 +58,14 @@ for seed in seeds:
             if number: samples[label].append(seconds)
             print("ROUND",seed,number,label,seconds,flush=True)
     for table in ["user_daily","campaign_daily"]:
-        for label in ["candidate","control"]:
+        for label in labels[1:]:
             a,b=[f"SELECT * FROM read_parquet('{root}/{k}-out/{table}/*.parquet')" for k in ["ranked",label]]
             for x,y in [(a,b),(b,a)]:
                 assert duckdb.sql(f"SELECT count(*) FROM ({x} EXCEPT ALL {y})").fetchone()[0]==0
     for label in labels:
         median=statistics.median(samples[label])
         medians[label].append(median)
-        print("MEDIAN",seed,label,median,flush=True)
+        print("MEDIAN",seed,label,median,"paired",round(statistics.median(x/y for x,y in zip(samples[label],samples["ranked"])),4),"wins",sum(x<y for x,y in zip(samples[label],samples["ranked"])),flush=True)
     shutil.rmtree(root/"data")
 for label in labels:
     mean=statistics.mean(medians[label])
