@@ -104,6 +104,13 @@ impl<T: Copy> Buckets<T> {
 
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) -> *mut T {
+        let at = self.reserve_slot(part);
+        unsafe { at.write(value); }
+        at
+    }
+
+    #[inline(always)]
+    fn reserve_slot(&mut self, part: usize) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -114,7 +121,6 @@ impl<T: Copy> Buckets<T> {
             // into its cache while other partitions are receiving records.
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
-            at.write(value);
             *slot = at.add(1);
             at
         }
@@ -187,17 +193,36 @@ impl<T: Copy> Buckets<T> {
 
 // ---------------------------------------------------------------- records
 
+// Four deduplication records share a cache line. Their users and prices
+// occupy the following line and stay cold until the winners are routed.
 #[derive(Clone, Copy)]
-#[repr(C, packed(4))]
-struct Parsed {
+#[repr(C, align(32))]
+struct ParsedSlot([u8; 32]);
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DedupFields {
     id: u64,
-    user: u64,
-    /// Offset from the ingest origin, or a tagged index into the worker’s overflow times.
     ingest: u32,
-    /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
-    /// 0, or for a purchase its category in the top 8 bits and price below.
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct UserFields {
+    user: u64,
     payload: u32,
+}
+
+impl ParsedSlot {
+    #[inline(always)]
+    fn fields(slot: *mut Self) -> (*mut DedupFields, *mut UserFields) {
+        const _: () = assert!(std::mem::size_of::<DedupFields>() == 16
+            && std::mem::size_of::<UserFields>() == 16 && CHUNK_BYTES % 128 == 0);
+        let tile = slot.cast::<u8>().map_addr(|address| address & !127);
+        let lane = (slot.addr() >> 5) & 3;
+        unsafe { (tile.cast::<DedupFields>().add(lane), tile.add(64).cast::<UserFields>().add(lane)) }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -657,7 +682,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 
 struct EventSource {
     overflow_times: Vec<i64>,
-    buckets: Buckets<Parsed>,
+    buckets: Buckets<ParsedSlot>,
     names: Vec<[u8; 33]>,
 }
 
@@ -694,9 +719,9 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     const LOOKUPS: usize = 16;
-    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<UserFields>(), 0u64); LOOKUPS];
     let mut queued = 0;
-    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
+    let drain = |items: &[(*const u8, *mut UserFields, u64)]| {
         for &(name,dest,mixed) in items {
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
@@ -755,14 +780,14 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
                 payload = (category << 24) | price;
             }
         }
-        let record = Parsed {
+        let slot = out.buckets.reserve_slot((partition_hash >> id_shift) as usize);
+        let (dedup, dest) = ParsedSlot::fields(slot);
+        dedup.write(DedupFields {
             id,
-            user,
             ingest: encode_ingest(ingest, window_start - DAY, &mut out.overflow_times),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
-            payload,
-        };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        });
+        dest.write(UserFields { user, payload });
         if deferred {
             lookups[queued] = (name,dest,mixed);
             queued += 1;
@@ -922,7 +947,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
-    let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
+    let mut chunks: Vec<(*mut ParsedSlot, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
@@ -947,7 +972,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
-                    let record = base.add(offset);
+                    let record = ParsedSlot::fields(base.add(offset)).0;
                     let id = (*record).id;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
@@ -963,6 +988,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             .get_unchecked((seen >> OFFSET_BITS) as usize)
                             .0
                             .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
+                        let other = ParsedSlot::fields(other).0;
                         let other_id = (*other).id;
                         let equal = if long {
                             // Equal fingerprints select candidates. Only the full bytes
@@ -998,14 +1024,15 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for &(base, count) in &chunks {
                 for offset in 0..count {
                     if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
+                        links.prefetch((*ParsedSlot::fields(base.add(offset + ahead)).1).user);
                     }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
+                    let (dedup, user) = ParsedSlot::fields(base.add(offset));
+                    let ts = (*dedup).ts;
+                    if ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    let person = links.person((*user).user);
+                    let value = ((ts as u64) << 32) | (*user).payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
