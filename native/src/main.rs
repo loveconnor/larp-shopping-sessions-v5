@@ -925,6 +925,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    let mut next_base = 1u64;
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -942,23 +943,33 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         }
         let capacity = (total * 5).div_ceil(2).next_power_of_two();
         let mask = capacity - 1;
-        table.clear();
-        table.resize(capacity, NONE);
+        // Each bucket gets a disjoint interval of locators. Older entries
+        // compare below its base, even if this bucket uses a smaller table.
+        let span = (chunks.len() as u64) << OFFSET_BITS;
+        if next_base + span > u64::from(u32::MAX) + 1 {
+            table.fill(0);
+            next_base = 1;
+        }
+        assert!(next_base + span <= u64::from(u32::MAX) + 1);
+        let bucket_base = next_base as u32;
+        next_base += span;
+        if table.len() < capacity { table.resize(capacity, 0); }
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
                     let record = base.add(offset);
                     let id = (*record).id;
-                    let entry = ((index << OFFSET_BITS) | offset) as u32;
+                    let entry = bucket_base + ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
                     let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
-                        if seen == NONE {
+                        if seen < bucket_base {
                             *table.get_unchecked_mut(slot) = entry;
                             break;
                         }
+                        let seen = seen - bucket_base;
                         let other = chunks
                             .get_unchecked((seen >> OFFSET_BITS) as usize)
                             .0
