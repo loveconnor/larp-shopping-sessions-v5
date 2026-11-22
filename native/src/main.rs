@@ -627,7 +627,7 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
 }
 
-const RADIX_BATCH: usize = 128;
+const RADIX_BATCH: usize = 512;
 const RADIX_GROUPS: usize = 32;
 
 struct StagedEvent {
