@@ -1042,12 +1042,12 @@ struct TimeBin {
     first: u32,
     last: u32,
     events: u32,
-    category_bits: [u64; 4],
+    category_bits: u32,
 }
 
 impl Default for TimeBin {
     fn default() -> Self {
-        Self { first: u32::MAX, last: 0, events: 0, category_bits: [0; 4] }
+        Self { first: u32::MAX, last: 0, events: 0, category_bits: 0 }
     }
 }
 
@@ -1187,7 +1187,7 @@ impl Sessions<'_> {
                 let category = (payload >> 24) as usize;
                 let price = u64::from(payload & 0xff_ffff);
                 scratch.revenue[index * scratch.categories + category] += price;
-                bin.category_bits[category / 64] |= 1 << (category % 64);
+                bin.category_bits |= 1 << (category % 32);
             }
         }
         let mut cursor = (0, 0);
@@ -1216,16 +1216,21 @@ impl Sessions<'_> {
                 }
                 day_events += bin.events;
                 last = bin.last;
-                for (word, &occupied_categories) in bin.category_bits.iter().enumerate() {
-                    let mut categories = occupied_categories;
-                    while categories != 0 {
-                        let category = word * 64 + categories.trailing_zeros() as usize;
-                        categories &= categories - 1;
-                        let amount = std::mem::take(&mut scratch.revenue[index * scratch.categories + category]);
-                        if self.sums[category] == 0 { self.touched.push(category as u8); }
-                        self.sums[category] += amount;
-                        day_revenue += amount;
-                        revenue += amount;
+                let mut bits = bin.category_bits;
+                let amounts = &mut scratch.revenue[index * scratch.categories..][..scratch.categories];
+                while bits != 0 {
+                    let lane = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    // Categories sharing five low bits still have independent
+                    // totals. Every marked lane has at least one purchase.
+                    for category in (lane..amounts.len()).step_by(32) {
+                        let amount = std::mem::take(&mut amounts[category]);
+                        if amount != 0 {
+                            if self.sums[category] == 0 { self.touched.push(category as u8); }
+                            self.sums[category] += amount;
+                            day_revenue += amount;
+                            revenue += amount;
+                        }
                     }
                 }
             }
