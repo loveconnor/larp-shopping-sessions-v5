@@ -1603,7 +1603,7 @@ fn main() -> io::Result<()> {
     let mut files = paths.iter().map(|path| Source::open(path, false)).collect::<io::Result<Vec<_>>>()?;
     let total: u64 = files.iter().map(|source| source.size).sum();
     let large = total >= 4u64 << 30;
-    let map_by_default = total >= 1 << 30;
+    let map_by_default = large;
     let block = tune("SS_BLOCK", if map_by_default { 1 << 21 } else { BLOCK }).max(4096);
     let map = tune("SS_MAP", u64::from(map_by_default || !cfg!(target_os = "linux"))) != 0;
     // Release mapped working sets in parallel so exit does not reclaim
@@ -1626,12 +1626,9 @@ fn main() -> io::Result<()> {
 
     let input_bytes = total.saturating_mul(copies);
     if copies == 1 { keys::prepare_users(input_bytes); }
-    // At intermediate sizes, fewer active destinations reduce scattered
-    // writes. Larger inputs need finer partitions for the dedup table.
-    let medium = (1 << 30..4u64 << 30).contains(&input_bytes);
-    let partition_bits = |bytes_per_part| input_bytes.div_ceil(bytes_per_part).max(threads as u64 * 8).ilog2();
-    let id_bits = partition_bits(if medium { 2 << 20 } else { 1 << 20 });
-    let person_bits = partition_bits(if medium { 4 << 20 } else { 1 << 20 });
+    let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
+    let id_bits = partition_bits;
+    let person_bits = partition_bits;
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
