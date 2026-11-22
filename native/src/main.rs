@@ -642,11 +642,12 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
     unsafe {
         use std::arch::x86_64::_mm_crc32_u64;
-        let mut crc = u64::from(bytes[0]);
-        for word in bytes[1..].chunks_exact(8) {
-            crc = _mm_crc32_u64(crc, u64::from_le_bytes(word.try_into().unwrap()));
-        }
-        crc & EVENT_FINGERPRINT
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let left = word(1) ^ word(9).rotate_left(13);
+        let right = word(17) ^ word(25).rotate_left(37);
+        let a = _mm_crc32_u64(u64::from(bytes[0]), left) as u32;
+        let b = _mm_crc32_u64(0, right) as u32;
+        u64::from(a.rotate_left(11) ^ b) & EVENT_FINGERPRINT
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
     {
@@ -1913,6 +1914,17 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod ingest_tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    #[test]
+    fn folded_event_tags_can_collide_across_distinct_full_names() {
+        let a = [b'a'; 33];
+        let mut b = a;
+        b[1] ^= 1;
+        b[15] ^= 8;
+        assert_ne!(a, b);
+        assert_eq!(event_fingerprint(&a), event_fingerprint(&b));
+    }
 
     #[test]
     fn compact_ingest_preserves_boundaries_and_overflow_values() {
