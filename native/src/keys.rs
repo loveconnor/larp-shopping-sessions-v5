@@ -107,7 +107,7 @@ pub fn prepare_users(bytes: u64) {
 pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
-    {
+    unsafe {
         use std::arch::x86_64::_mm_crc32_u64;
         // Two independent CRC streams cover every byte. This value only
         // selects a slot; the stored spelling resolves every collision.
