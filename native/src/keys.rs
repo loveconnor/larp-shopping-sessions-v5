@@ -91,7 +91,7 @@ static USER_SLOTS: std::sync::OnceLock<&'static [UserSlot]> = std::sync::OnceLoc
 
 pub fn prepare_users(bytes: u64) {
     USER_SLOTS.get_or_init(|| {
-        let size = bytes.div_ceil(4096).clamp(256, 1 << 22).next_power_of_two() as usize;
+        let size = bytes.div_ceil(6144).clamp(256, 1 << 22).next_power_of_two() as usize;
         // A byte allocation can use calloc even though the slots need cache-line
         // alignment. Untouched pages stay shared until a worker claims a slot.
         let bytes = size * size_of::<UserSlot>() + align_of::<UserSlot>() - 1;
@@ -133,7 +133,7 @@ unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
-    for _ in 0..12 {
+    for _ in 0..16 {
         let slot = &slots[at];
         let mut tag = slot.tag.load(Acquire);
         if tag == 0 {
