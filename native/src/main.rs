@@ -1073,6 +1073,7 @@ impl TimeBins {
 
 struct Sessions<'a> {
     shared: &'a Shared,
+    click_sources: &'a [ClickSource],
     writer: Option<pq::Writer>,
     thread: usize,
     totals: Vec<Totals>,
@@ -1156,11 +1157,16 @@ impl Sessions<'_> {
             }
             if high > low {
                 let latest = clicks[high - 1].ts;
+                let mut winner = clicks[high - 1];
                 let mut pick = high - 1;
                 while pick > low && clicks[pick - 1].ts == latest {
                     pick -= 1;
+                    let candidate = clicks[pick];
+                    if click_order(candidate.id, winner.id, self.click_sources, self.shared.defer_long_events).is_lt() {
+                        winner = candidate;
+                    }
                 }
-                credited = clicks[pick].campaign as usize;
+                credited = winner.campaign as usize;
             }
             for &campaign in &self.active {
                 self.totals[campaign as usize * days + day as usize][3] += 1;
@@ -1376,6 +1382,7 @@ fn session_worker(
     let campaigns = shared.campaign_names.len();
     let mut sessions = Sessions {
         shared,
+        click_sources: clicks,
         writer: None,
         thread,
         totals: vec![[0; 4]; campaigns * shared.days],
@@ -1555,7 +1562,7 @@ fn session_worker(
             let mine = &mut values[from..to];
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+                reached.sort_unstable_by_key(|click| click.ts);
             }
             if mine.len() < 512 {
                 #[cfg(all(target_arch="x86_64", target_feature="avx512f"))]
