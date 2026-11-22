@@ -1,7 +1,7 @@
 name: Compare AVX-512 paths without byte compression
 on:
   push:
-    branches: [bench/v3-time-lanes]
+    branches: [bench/vector-campaign-assists]
 permissions:
   contents: read
 jobs:
@@ -12,17 +12,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 319993, engine: v3}
-          - {events: 60000000, format: current, seed: 319993, engine: v3}
-          - {events: 20000000, format: current, seed: 854033, engine: v3}
-          - {events: 60000000, format: current, seed: 854033, engine: v3}
+          - {events: 20000000, format: current, seed: 658509, engine: n4}
+          - {events: 60000000, format: current, seed: 658509, engine: n4}
+          - {events: 20000000, format: current, seed: 371971, engine: n4}
+          - {events: 60000000, format: current, seed: 371971, engine: n4}
     env:
       ENGINE: ${{ matrix.engine }}
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 7dc89590be73fd32ef6b7ac1ca748f4f8d6259de
+      CANDIDATE: 8ae1b3962baf652b8a3eaa065d0dcc38142e14c2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +42,13 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
+      - name: Exercise native indexed counter writes on independent campaign permutations
+        run: |
+          if grep -qw avx512bw /proc/cpuinfo; then
+            cd "$RUNNER_TEMP/candidate-src"
+            RUSTFLAGS='-Ctarget-cpu=x86-64-v4' cargo test --release --manifest-path native/Cargo.toml gathered_assists_preserve_other_days_and_counters | tee "$RUNNER_TEMP/assist-test.log"
+            grep -q '1 passed' "$RUNNER_TEMP/assist-test.log"
+          fi
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
@@ -59,8 +66,8 @@ jobs:
           import duckdb
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          if os.environ["ENGINE"] == "v3" and "avx2" not in pathlib.Path("/proc/cpuinfo").read_text():
-              print("Host has no v3 engine. Skipping this comparison.", flush=True)
+          if os.environ["ENGINE"] == "n4" and "avx512bw" not in pathlib.Path("/proc/cpuinfo").read_text():
+              print("Host has no v4 engine. Skipping this comparison.", flush=True)
               raise SystemExit(0)
           cpus = sorted(os.sched_getaffinity(0))[:8]
           cpuset = ",".join(map(str, cpus))
@@ -114,7 +121,7 @@ jobs:
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          if [ "$ENGINE"  = v3 ] && ! grep -qw avx2 /proc/cpuinfo; then exit 0; fi
+          if [ "$ENGINE"  = n4 ] && ! grep -qw avx512bw /proc/cpuinfo; then exit 0; fi
           for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
