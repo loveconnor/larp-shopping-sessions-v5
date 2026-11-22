@@ -718,6 +718,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
+        let partition = (partition_hash >> id_shift) as usize;
+        // Resolving the remaining fields gives the destination time to arrive.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        std::arch::asm!("prefetchw [{dest}]", dest = in(reg) *out.buckets.next.get_unchecked(partition),
+            options(nostack, preserves_flags, readonly));
         let (p, n) = field(3);
         let ingest = ts::ingest(p, n, dates);
         if ingest == ts::BAD {
@@ -762,7 +767,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let dest = out.buckets.push(partition, record);
         if deferred {
             lookups[queued] = (name,dest,mixed);
             queued += 1;
