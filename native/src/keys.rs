@@ -137,10 +137,32 @@ unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
 
 #[inline(always)]
 pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
-    if n == 33 {
-        if let Some(slots) = USER_SLOTS.get() { return unsafe { fixed_user(p, slots) }; }
+    if let Some(slots) = USER_SLOTS.get() {
+        if n == 33 { return unsafe { fixed_user(p, slots) }; }
+        return unsafe { prefixed(p, n, b'u') };
     }
     unsafe { pack(p, n) }
+}
+
+fn user_bytes(key: u64, scratch: &mut [u8; 9]) -> &[u8] {
+    if key & INTERNED != 0 { return name(key); }
+    let tag = (key >> 56) as usize;
+    let len = if tag >= 32 { 9 } else { tag };
+    scratch[0] = b'u';
+    scratch[1..].copy_from_slice(&key.to_le_bytes());
+    &scratch[..len]
+}
+
+#[inline]
+pub fn compare_users(a: u64, b: u64) -> Ordering {
+    if USER_SLOTS.get().is_none() { return compare(a, b); }
+    user_bytes(a, &mut [0; 9]).cmp(user_bytes(b, &mut [0; 9]))
+}
+
+#[inline]
+pub fn unpack_user(key: u64, out: &mut Vec<u8>) {
+    if USER_SLOTS.get().is_none() { unpack(key, out); return; }
+    out.extend_from_slice(user_bytes(key, &mut [0; 9]));
 }
 
 fn name(key: u64) -> &'static [u8] {
