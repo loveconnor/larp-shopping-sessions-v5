@@ -1126,7 +1126,9 @@ impl Sessions<'_> {
     #[inline(always)]
     fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
         let (mut low, mut high) = cursor;
-        let days = self.shared.days;
+        let campaigns = self.reach.len();
+        let first = day as usize * campaigns;
+        let today = &mut self.totals[first..first + campaigns];
         let mut credited = 0usize;
         if !clicks.is_empty() {
             // A click's `ts` counts from 7 days before the events' zero, so
@@ -1163,10 +1165,10 @@ impl Sessions<'_> {
                 credited = clicks[pick].campaign as usize;
             }
             for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+                today[campaign as usize][3] += 1;
             }
         }
-        let totals = &mut self.totals[credited * days + day as usize];
+        let totals = &mut today[credited];
         totals[0] += 1;
         totals[1] += i64::from(purchased);
         totals[2] += revenue as i64;
@@ -1825,7 +1827,7 @@ fn main() -> io::Result<()> {
         for day in 0..shared.days {
             let mut sum: Totals = [0; 4];
             for result in &results {
-                let totals = &result.0[campaign * shared.days + day];
+                let totals = &result.0[day * shared.campaign_names.len() + campaign];
                 for (total, part) in sum.iter_mut().zip(totals) {
                     *total += part;
                 }
