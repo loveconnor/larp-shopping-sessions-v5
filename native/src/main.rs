@@ -718,8 +718,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let id = id ^ copy;
             (id, id.wrapping_mul(MIX))
         };
-        let (p, n) = field(3);
-        let ingest = ts::ingest(p, n, dates);
+        let (at, ingest) = ts::event_clocks(field(2), field(3), dates);
         if ingest == ts::BAD {
             return;
         }
@@ -728,8 +727,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
         let user = if user == 0 { 0 } else { user ^ copy };
-        let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
+
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {

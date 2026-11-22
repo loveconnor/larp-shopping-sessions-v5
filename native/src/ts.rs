@@ -239,6 +239,39 @@ pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Decode the two independent ISO clocks in parallel when both days are cached.
+#[inline(always)]
+pub unsafe fn event_clocks(event: (*const u8, usize), ingestion: (*const u8, usize), dates: &mut Dates) -> (i64, i64) {
+    unsafe {
+        #[cfg(all(target_arch="x86_64",target_feature="avx2"))]
+        if event.1 == 20 && ingestion.1 == 20 && *event.0.add(19) == b'Z' && *ingestion.0.add(19) == b'Z' {
+            use std::arch::x86_64::*;
+            let lanes = |a, b| _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(a), b);
+            let text = lanes(_mm_loadu_si128(event.0.add(4).cast()), _mm_loadu_si128(ingestion.0.add(4).cast()));
+            let template = _mm_setr_epi8(45,48,48,45,48,48,84,48,48,58,48,48,58,48,48,90);
+            let limits = _mm_setr_epi8(0,9,9,0,9,9,0,9,9,0,9,9,0,9,9,0);
+            let digits = _mm256_xor_si256(text, _mm256_broadcastsi128_si256(template));
+            let wrong = _mm256_subs_epu8(digits,_mm256_broadcastsi128_si256(limits));
+            let order = _mm_setr_epi8(4,5,7,8,10,11,13,14,-1,-1,-1,-1,-1,-1,-1,-1);
+            let pairs = _mm256_maddubs_epi16(_mm256_shuffle_epi8(digits,_mm256_broadcastsi128_si256(order)),_mm256_set1_epi16(0x010a));
+            let upper = _mm256_broadcastsi128_si256(_mm_setr_epi16(99,23,59,59,0,0,0,0));
+            let bad = _mm256_or_si256(wrong,_mm256_cmpgt_epi16(pairs, upper));
+            if _mm256_testz_si256(bad,bad) != 0 {
+                let d0 = _mm256_extract_epi16::<0>(pairs) as usize;
+                let d1 = _mm256_extract_epi16::<8>(pairs) as usize;
+                if dates.month[d0] == load64(event.0) && dates.month[d1] == load64(ingestion.0) {
+                    let terms = _mm256_madd_epi16(pairs,_mm256_broadcastsi128_si256(_mm_setr_epi16(0,3600,60,1,0,0,0,0)));
+                    let seconds = _mm256_add_epi32(terms,_mm256_srli_si256::<4>(terms));
+                    return ((dates.midnight[d0]+i64::from(_mm256_extract_epi32::<0>(seconds)))*1000,
+                            (dates.midnight[d1]+i64::from(_mm256_extract_epi32::<4>(seconds)))*1000);
+                }
+            }
+        }
+        let received = ingest(ingestion.0,ingestion.1,dates);
+        (parse(event.0,event.1,dates),received)
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
