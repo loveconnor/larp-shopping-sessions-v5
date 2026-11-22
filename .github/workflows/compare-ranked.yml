@@ -21,7 +21,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: c285015aa9fad18b8d530ce925c48df218154305
-      CANDIDATE: 1898b35935467fa0b013fec93af791c44e5daa78
+      CANDIDATE: a0f3345cb37c145636ba4d7d662e9d1616c31e8a
     steps:
       - uses: actions/checkout@v4
         with:
