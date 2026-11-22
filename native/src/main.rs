@@ -1080,6 +1080,9 @@ struct Sessions<'a> {
     reach: Vec<u32>,
     place: Vec<u32>,
     active: Vec<u32>,
+    assist_from: Vec<u32>,
+    assist_day: u32,
+    assist_sessions: u32,
     sums: [u64; 256],
     touched: Vec<u8>,
 }
@@ -1123,11 +1126,28 @@ impl Sessions<'_> {
         Ok(())
     }
 
+    fn close_assist_day(&mut self) {
+        if self.assist_sessions == 0 { return; }
+        for &campaign in &self.active {
+            let index = campaign as usize;
+            self.totals[index * self.shared.days + self.assist_day as usize][3] +=
+                i64::from(self.assist_sessions - self.assist_from[index]);
+            self.assist_from[index] = 0;
+        }
+        self.assist_sessions = 0;
+        self.assist_day = NONE;
+    }
+
     #[inline(always)]
     fn credit(&mut self, clicks: &[Touch], cursor: (usize, usize), start: u64, day: u32, revenue: u64, purchased: bool) -> (usize, usize) {
         let (mut low, mut high) = cursor;
         let days = self.shared.days;
         let mut credited = 0usize;
+        let batch_assists = clicks.len() >= 64;
+        if batch_assists && self.assist_day != day {
+            self.close_assist_day();
+            self.assist_day = day;
+        }
         if !clicks.is_empty() {
             // A click's `ts` counts from 7 days before the events' zero, so
             // the clicks in reach are those with start <= ts <= start + 7 days.
@@ -1137,6 +1157,7 @@ impl Sessions<'_> {
                 if self.reach[campaign] == 0 {
                     self.place[campaign] = self.active.len() as u32;
                     self.active.push(campaign as u32);
+                    if batch_assists { self.assist_from[campaign] = self.assist_sessions; }
                 }
                 self.reach[campaign] += 1;
                 high += 1;
@@ -1145,6 +1166,10 @@ impl Sessions<'_> {
                 let campaign = clicks[low].campaign as usize;
                 self.reach[campaign] -= 1;
                 if self.reach[campaign] == 0 {
+                    if batch_assists {
+                        self.totals[campaign * days + day as usize][3] +=
+                            i64::from(self.assist_sessions - self.assist_from[campaign]);
+                    }
                     let hole = self.place[campaign] as usize;
                     let moved = self.active.pop().unwrap();
                     if hole < self.active.len() {
@@ -1162,8 +1187,12 @@ impl Sessions<'_> {
                 }
                 credited = clicks[pick].campaign as usize;
             }
-            for &campaign in &self.active {
-                self.totals[campaign as usize * days + day as usize][3] += 1;
+            if batch_assists {
+                self.assist_sessions += 1;
+            } else {
+                for &campaign in &self.active {
+                    self.totals[campaign as usize * days + day as usize][3] += 1;
+                }
             }
         }
         let totals = &mut self.totals[credited * days + day as usize];
@@ -1232,6 +1261,7 @@ impl Sessions<'_> {
         }
         self.credit(clicks, cursor, u64::from(start), current_day, revenue, revenue != 0);
         self.row(person, current_day, day_sessions, day_events, day_revenue)?;
+        self.close_assist_day();
         for campaign in self.active.drain(..) { self.reach[campaign as usize] = 0; }
         Ok(())
     }
@@ -1285,6 +1315,7 @@ impl Sessions<'_> {
         if current != NONE {
             self.row(person, current, day_sessions, day_events, day_revenue)?;
         }
+        self.close_assist_day();
         for campaign in self.active.drain(..) {
             self.reach[campaign as usize] = 0;
         }
@@ -1382,6 +1413,9 @@ fn session_worker(
         reach: vec![0; campaigns],
         place: vec![0; campaigns],
         active: Vec::new(),
+        assist_from: vec![0; campaigns],
+        assist_day: NONE,
+        assist_sessions: 0,
         sums: [0; 256],
         touched: Vec::new(),
     };
