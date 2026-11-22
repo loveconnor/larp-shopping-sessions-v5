@@ -289,14 +289,6 @@ struct Links {
 
 impl Links {
     fn build(pairs: &[(u64, u64)]) -> Self {
-        let capacity = (pairs.len() * 3).next_power_of_two().max(16);
-        let mask = capacity - 1;
-        let shift = 64 - capacity.trailing_zeros();
-        let mut slots = vec![[0u64; 2]; capacity];
-        huge(slots.as_ptr(), capacity);
-        let mut names: Vec<u64> = Vec::new();
-        let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
-
         fn find(parent: &mut [u32], mut at: u32) -> u32 {
             loop {
                 let up = parent[at as usize];
@@ -309,34 +301,39 @@ impl Links {
             }
         }
 
-        // Number the IDs as they appear; each pass below prefetches what the
-        // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
-        for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
-                prefetch(&slots[home(c)]);
-                prefetch(&slots[home(d)]);
-            }
-            let mut index = [0u32; 2];
-            for (side, key) in [a, b].into_iter().enumerate() {
-                let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
-                    if entry[0] == key {
-                        break entry[1] as u32;
-                    }
-                    if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
-                    }
-                    slot = (slot + 1) & mask;
-                };
-            }
-            numbered.push(index);
+        // Number each endpoint inside a cache-sized hash partition. Retain
+        // the original edge position so transitive union sees exactly the
+        // same graph irrespective of file or partition order.
+        let groups = (pairs.len() / 2048).clamp(1, 256).next_power_of_two();
+        let partition = |key: u64| ((key.wrapping_mul(MIX) >> 40) as usize) & (groups - 1);
+        let mut endpoints: Vec<Vec<(u64, usize)>> = (0..groups)
+            .map(|_| Vec::with_capacity(2 * pairs.len() / groups + 16)).collect();
+        for (i, &(a, b)) in pairs.iter().enumerate() {
+            endpoints[partition(a)].push((a, i * 2));
+            endpoints[partition(b)].push((b, i * 2 + 1));
         }
-        // The hash index is only needed while numbering. Retain the original
-        // keys densely for the final alias table, then free the sparse index.
+        let mut names = Vec::new();
+        let mut numbered = vec![[0u32; 2]; pairs.len()];
+        let mut slots = Vec::new();
+        for group in endpoints {
+            slots.clear();
+            let capacity = (group.len() * 2).max(2).next_power_of_two();
+            slots.resize(capacity, [0u64; 2]);
+            for (key, position) in group {
+                let mut at = ((key.wrapping_mul(MIX) >> 18) as usize) & (capacity - 1);
+                let id = loop {
+                    if slots[at][0] == key { break slots[at][1] as u32; }
+                    if slots[at][0] == 0 {
+                        let id = names.len() as u32;
+                        slots[at] = [key, u64::from(id)];
+                        names.push(key);
+                        break id;
+                    }
+                    at = (at + 1) & (capacity - 1);
+                };
+                numbered[position / 2][position & 1] = id;
+            }
+        }
         drop(slots);
         let original = names.clone();
         // Join. The smaller number is the root, so no cycle can form.
