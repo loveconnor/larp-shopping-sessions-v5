@@ -60,33 +60,20 @@ impl Source {
     pub fn map_input(&mut self) {
         use std::os::fd::AsRawFd;
         if self.size != 0 && self.map.is_null() {
-            // Reserve our own virtual range and replace only its file prefix.
-            // The anonymous tail keeps SIMD overreads valid even at a page boundary.
+            // On Linux the last partial file page has a zero-filled tail.
+            // Request the full rounded mapping and reuse that padding when
+            // sufficient. Page-aligned endings use the existing copied tail.
+            let mut mapped_len = self.size as usize;
             #[cfg(target_os = "linux")]
-            unsafe {
-                unsafe extern "C" {
-                    fn getpagesize() -> i32;
-                    fn munmap(address: *mut std::ffi::c_void, length: usize) -> i32;
-                }
-                let page = getpagesize() as usize;
-                let rounded = (self.size as usize).div_ceil(page) * page;
-                let length = rounded + page;
-                let region = mmap(std::ptr::null_mut(),length,1,2 | 0x20,-1,0);
-                if region as usize != usize::MAX {
-                    let file_map = mmap(region,self.size as usize,1,2 | 0x10,self.file.as_raw_fd(),0);
-                    if file_map == region {
-                        self.map = region.cast();
-                        self.guarded_tail = true;
-                    } else {
-                        munmap(region,length);
-                    }
-                }
+            {
+                unsafe extern "C" { fn getpagesize() -> i32; }
+                let page = unsafe { getpagesize() } as usize;
+                mapped_len = mapped_len.div_ceil(page) * page;
             }
-            if self.map.is_null() {
-                let address = unsafe { mmap(std::ptr::null_mut(), self.size as usize, 1, 2, self.file.as_raw_fd(), 0) };
-                if address as usize != usize::MAX {
-                    self.map = address as *const u8;
-                }
+            let address = unsafe { mmap(std::ptr::null_mut(),mapped_len,1,2,self.file.as_raw_fd(),0) };
+            if address as usize != usize::MAX {
+                self.map = address.cast();
+                self.guarded_tail = mapped_len - self.size as usize >= 4 * PAD;
             }
         }
     }
@@ -778,7 +765,7 @@ mod tests {
                 std::fs::write(&path,&bytes).unwrap();
                 let mapped = Source::open(&path,true).unwrap();
                 let copied = Source::open(&path,false).unwrap();
-                assert!(mapped.guarded_tail);
+                assert!(!mapped.map.is_null());
                 let run = |source: &Source| {
                     let mut out = Vec::new();
                     let mut block = Block::new();
