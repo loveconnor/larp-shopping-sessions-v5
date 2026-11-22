@@ -1365,6 +1365,68 @@ fn sort_medium_times(values: &mut [u64], tmp: &mut [u64], depth: usize) {
     sort_medium_times(right,r,depth-1);
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+fn sort_medium_avx2(values: &mut [u64], scratch: &mut [u64], depth: usize) {
+    use std::arch::x86_64::*;
+    const ORDER: [[i32; 8]; 16] = {
+        let mut table = [[0; 8]; 16];
+        let mut mask = 0;
+        while mask < 16 {
+            let mut lane = 0;
+            let mut low = 0;
+            let mut high = (mask as u32).count_ones() as usize;
+            while lane < 4 {
+                let target = if mask & (1 << lane) != 0 {
+                    low += 1;
+                    low - 1
+                } else {
+                    high += 1;
+                    high - 1
+                };
+                table[mask][2 * target] = 2 * lane as i32;
+                table[mask][2 * target + 1] = 2 * lane as i32 + 1;
+                lane += 1;
+            }
+            mask += 1;
+        }
+        table
+    };
+    if values.len() <= 32 || depth == 0 { values.sort_unstable(); return; }
+    let n = values.len();
+    let (a, b, c) = (values[0], values[n / 2], values[n - 1]);
+    let pivot = a.min(b).max(a.max(b).min(c));
+    let (mut low, mut high, mut index) = (0, n, 0);
+    unsafe {
+        let sign = _mm256_set1_epi64x(i64::MIN);
+        let bound = _mm256_set1_epi64x((pivot as i64) ^ i64::MIN);
+        // With eight slots free, the two four-lane stores cannot overwrite
+        // previously committed values, regardless of the partition mask.
+        while n - index >= 8 {
+            let v = _mm256_loadu_si256(values.as_ptr().add(index).cast());
+            let smaller = _mm256_cmpgt_epi64(bound, _mm256_xor_si256(v, sign));
+            let mask = _mm256_movemask_pd(_mm256_castsi256_pd(smaller)) as usize;
+            let order = _mm256_loadu_si256(ORDER[mask].as_ptr().cast());
+            let packed = _mm256_permutevar8x32_epi32(v, order);
+            _mm256_storeu_si256(scratch.as_mut_ptr().add(low).cast(), packed);
+            _mm256_storeu_si256(scratch.as_mut_ptr().add(high - 4).cast(), packed);
+            let small = mask.count_ones() as usize;
+            low += small;
+            high -= 4 - small;
+            index += 4;
+        }
+    }
+    for &v in &values[index..] {
+        if v < pivot { scratch[low] = v; low += 1; }
+        else { high -= 1; scratch[high] = v; }
+    }
+    if low == 0 || low == n { values.sort_unstable(); return; }
+    values.copy_from_slice(&scratch[..n]);
+    let (a, b) = values.split_at_mut(low);
+    let (left, right) = scratch.split_at_mut(low);
+    sort_medium_avx2(a, left, depth - 1);
+    sort_medium_avx2(b, right, depth - 1);
+}
+
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
@@ -1396,7 +1458,7 @@ fn session_worker(
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let mut scratch: Vec<u64> = Vec::new();
     let mut bins = None;
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -1565,7 +1627,12 @@ fn session_worker(
                     if scratch.len()<mine.len() {scratch.resize(mine.len(),0);}
                     sort_medium_times(mine,&mut scratch[..mine.len()],12);
                 }
-                #[cfg(not(all(target_arch="x86_64", target_feature="avx512f")))]
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+                if mine.len() > 32 {
+                    if scratch.len() < mine.len() { scratch.resize(mine.len(), 0); }
+                    sort_medium_avx2(mine, &mut scratch[..mine.len()], 12);
+                } else { mine.sort_unstable(); }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
                 mine.sort_unstable();
                 sessions.person(person, mine, reached)?;
             } else {
