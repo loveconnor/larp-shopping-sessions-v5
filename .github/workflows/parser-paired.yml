@@ -1,7 +1,7 @@
 name: Benchmark parser against ranked entry
 on:
   push:
-    branches: [bench/parser-paired]
+    branches: [bench/in-place-partition-verification]
 permissions:
   contents: read
 jobs:
@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: current, seed: 519521}
-          - {events: 60000000, format: current, seed: 519521}
-          - {events: 20000000, format: current, seed: 877397}
-          - {events: 60000000, format: current, seed: 877397}
+          - {events: 20000000, format: current, seed: 453361}
+          - {events: 60000000, format: current, seed: 453361}
+          - {events: 20000000, format: current, seed: 821441}
+          - {events: 60000000, format: current, seed: 821441}
     env:
       SEED: ${{ matrix.seed }}
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: f5364f4a92df4eec0d5f5556deadd3c2dcb64f30
-      CANDIDATE: 0352e9fca678ac8f7b7893a0de54c12d1a4aac2a
+      CANDIDATE: ff2c2c513c6d11f74694c3545e095db219d1d0fd
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +42,11 @@ jobs:
             docker cp "$cid:/app/." "$RUNNER_TEMP/$label/"
             docker rm "$cid"
           done
+      - name: Compare native AVX-512 sorting to the standard library across 4168 guarded histories
+        run: |
+          if grep -qw avx512bw /proc/cpuinfo; then
+            docker run --rm -v "$RUNNER_TEMP/candidate-src/native:/src" -w /src -e 'RUSTFLAGS=-Ctarget-cpu=x86-64-v4' rust:1.90-slim-bookworm cargo test --locked --release medium_partition_matches_unsigned_sort
+          fi
       - name: Generate fresh data
         run: |
           cd "$RUNNER_TEMP"
