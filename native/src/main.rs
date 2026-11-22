@@ -54,7 +54,7 @@ const CHUNK_BYTES: usize = 8192;
 /// Chunks per slab.
 const SLAB: usize = 1 << 13;
 /// The dedup table packs a record's offset in its chunk into this many bits.
-const OFFSET_BITS: u32 = 10;
+const OFFSET_BITS: u32 = 11;
 
 /// Records appended to one of many partitions, in fixed chunks carved from
 /// big slabs: no copying on growth, and a chunk never moves. A chunk can also
@@ -188,12 +188,13 @@ impl<T: Copy> Buckets<T> {
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
 struct IdRef {
-    id: u64,
+    tag: u32,
     row: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Parsed {
+    id: u64,
     user: u64,
     /// Full UTC ingestion time, including copies ingested before the window.
     ingest: i64,
@@ -720,13 +721,13 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             }
         }
         let record = Parsed {
-            user,
+            id, user,
             ingest,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
         let row = out.append(record);
-        out.buckets.push((partition_hash >> id_shift) as usize, IdRef { id, row });
+        out.buckets.push((partition_hash >> id_shift) as usize, IdRef { tag: (partition_hash >> 16) as u32, row });
     });
 }
 
@@ -872,11 +873,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
                     let record = base.add(offset);
-                    let id = (*record).id;
+                    let tag = (*record).tag;
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
-                    let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut slot = tag as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
@@ -887,15 +886,15 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             .get_unchecked((seen >> OFFSET_BITS) as usize)
                             .0
                             .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
-                        let other_id = (*other).id;
-                        let equal = if long {
-                            // Equal fingerprints select candidates. Only the full bytes
-                            // decide whether these two records are duplicates.
-                            id >> 32 == other_id >> 32
-                                && sources[owners[index]].names[id as u32 as usize]
-                                    == sources[owners[(seen >> OFFSET_BITS) as usize]].names[other_id as u32 as usize]
-                        } else {
-                            id == other_id
+                        let equal = if tag != (*other).tag { false } else {
+                            let a = owners[index];
+                            let b = owners[(seen >> OFFSET_BITS) as usize];
+                            let id = sources[a].body((*record).row).id;
+                            let other_id = sources[b].body((*other).row).id;
+                            if shared.defer_long_events && id & LONG_EVENT == LONG_EVENT {
+                                id >> 32 == other_id >> 32 &&
+                                    sources[a].names[id as u32 as usize] == sources[b].names[other_id as u32 as usize]
+                            } else { id == other_id }
                         };
                         if equal {
                             let a = owners[index];
