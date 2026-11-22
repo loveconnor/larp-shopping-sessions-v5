@@ -378,7 +378,7 @@ impl Links {
             loop {
                 let group = &mut groups[at];
                 if let Some(lane) = group.keys.iter().position(|&k| k == 0) {
-                    group.keys[lane] = key;
+                    group.keys[lane] = key.wrapping_mul(MIX);
                     group.values[lane] = person.wrapping_mul(MIX);
                     break;
                 }
@@ -391,19 +391,18 @@ impl Links {
     #[inline(always)]
     fn prefetch(&self, key: u64) {
         if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
+            prefetch(unsafe { self.slots.get_unchecked((key >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
         // Carry the reversible hash through partitioning and grouping.
-        let mixed = key.wrapping_mul(MIX);
         if self.empty {
-            return mixed;
+            return key;
         }
         let mask = self.slots.len() - 1;
-        let mut slot = (mixed >> self.shift) as usize;
+        let mut slot = (key >> self.shift) as usize;
         loop {
             let group = unsafe { self.slots.get_unchecked(slot) };
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -418,7 +417,7 @@ impl Links {
             if let Some(lane) = group.keys.iter().position(|&k| k == key) {
                 return group.values[lane];
             }
-            if group.keys[3] == 0 { return mixed; }
+            if group.keys[3] == 0 { return key; }
             slot = (slot + 1) & mask;
         }
     }
@@ -702,7 +701,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let mut queued = 0;
     let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
         for &(name,dest,mixed) in items {
-            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+            unsafe { (*dest).user = keys::finish_long_user(name,mixed).wrapping_mul(MIX); }
         }
     };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
@@ -731,7 +730,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let deferred = n == 33 && shared.defer_long_events;
         let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
         let user = if deferred { 1 } else { keys::pack_user(name,n) };
-        let user = if user == 0 { 0 } else { user ^ copy };
+        let user = if user == 0 { 0 } else { (user ^ copy).wrapping_mul(MIX) };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -813,7 +812,7 @@ fn parse_clicks(
     let mut queued = Vec::with_capacity(16);
     let drain = |queued: &mut Vec<(*const u8,u64,usize)>, pending: &mut Vec<RawClick>| {
         for (name, hash, index) in queued.drain(..) {
-            pending[index].user = unsafe { keys::finish_long_user(name,hash) };
+            pending[index].user = unsafe { keys::finish_long_user(name,hash) }.wrapping_mul(MIX);
         }
     };
     block.raw_lines::<4>(|buf, start, seps| unsafe {
@@ -833,7 +832,7 @@ fn parse_clicks(
         if id == 0 || user == 0 {
             return;
         }
-        let (id, user) = (id ^ copy, user ^ copy);
+        let (id, user) = (id ^ copy, (user ^ copy).wrapping_mul(MIX));
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
