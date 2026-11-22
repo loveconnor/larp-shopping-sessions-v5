@@ -148,20 +148,20 @@ fn pack(out: &mut Vec<u8>, values: impl Iterator<Item = u64>, bits: u32) {
     if bits == 0 {
         return;
     }
-    let mut buffer: u128 = 0;
-    let mut held = 0u32;
+    let min_values=values.size_hint().0;
+    out.reserve(min_values.saturating_mul(bits as usize).div_ceil(8));
+    let mut buffer=0u128;
+    let mut held=0;
     for value in values {
-        buffer |= (value as u128) << held;
-        held += bits;
-        while held >= 8 {
-            out.push(buffer as u8);
-            buffer >>= 8;
-            held -= 8;
+        buffer|=u128::from(value)<<held;
+        held+=bits;
+        if held>=64 {
+            out.extend_from_slice(&(buffer as u64).to_le_bytes());
+            buffer>>=64;
+            held-=64;
         }
     }
-    if held > 0 {
-        out.push(buffer as u8);
-    }
+    out.extend_from_slice(&(buffer as u64).to_le_bytes()[..held.div_ceil(8) as usize]);
 }
 
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each
@@ -185,25 +185,18 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
         zigzag(out, least);
         let minis = count.div_ceil(MINI);
         let mut widths = [0u8; BLOCK / MINI];
-        for mini in 0..minis {
-            let end = ((mini + 1) * MINI).min(count);
-            let most = deltas[mini * MINI..end]
-                .iter()
-                .fold(0u64, |most, &delta| most.max(delta.wrapping_sub(least) as u64));
-            widths[mini] = width(most) as u8;
+        deltas[count..minis*MINI].fill(least);
+        for (mini,group) in deltas[..minis*MINI].chunks_exact_mut(MINI).enumerate() {
+            let mut combined=0;
+            for d in group {
+                *d=d.wrapping_sub(least);
+                combined|=*d as u64;
+            }
+            widths[mini]=width(combined) as u8;
         }
         out.extend_from_slice(&widths);
-        for mini in 0..minis {
-            // A short last miniblock is padded with zeros to its full 32 values.
-            let from = mini * MINI;
-            let packed = (from..from + MINI).map(|slot| {
-                if slot < count {
-                    deltas[slot].wrapping_sub(least) as u64
-                } else {
-                    0
-                }
-            });
-            pack(out, packed, widths[mini] as u32);
+        for (group,&bits) in deltas[..minis*MINI].chunks_exact(MINI).zip(&widths) {
+            pack(out,group.iter().map(|&v|v as u64),u32::from(bits));
         }
         at += count;
     }
