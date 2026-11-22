@@ -465,9 +465,11 @@ impl Block {
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
-            if N == 7 { return unsafe { self.event_rows(visit) }; }
+            if N == 7 { return unsafe { self.event_rows::<N, true>(visit) }; }
             return unsafe { self.raw_wide(visit) };
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if N == 7 { return unsafe { self.event_rows::<N, false>(visit) }; }
         self.raw_indexed::<N, false>(visit)
     }
 
@@ -475,16 +477,16 @@ impl Block {
     // validate paired field quotes, and hand its separators directly to the
     // consumer. The block loader provides readable padding past its tail.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512bw,avx512vbmi2")]
-    unsafe fn event_rows<const N: usize>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    #[inline(always)]
+    unsafe fn event_rows<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
         let buf = self.base;
         let data = std::slice::from_raw_parts(buf, self.end);
         let Some(first) = data[..self.own_end.min(self.end)].iter().position(|&ch| ch == b'\n') else { return };
         let mut line = first + 1;
         while line < data.len() {
             let p = buf.add(line);
-            let (sl,nl,ql) = wide_classes(p);
-            let (sh,nh,qh) = wide_classes(p.add(64));
+            let (sl,nl,ql) = if WIDE { wide_classes(p) } else { classes(p) };
+            let (sh,nh,qh) = if WIDE { wide_classes(p.add(64)) } else { classes(p.add(64)) };
             let nl = u128::from(nl) | (u128::from(nh) << 64);
             if nl == 0 {
                 if let Some(found) = Self::split_line::<N>(buf, line) { visit(buf, line as u32, &found); }
@@ -501,8 +503,13 @@ impl Block {
             if valid && sep.count_ones() == N as u32 {
                 let mut scratch = std::mem::MaybeUninit::<[u32; 32]>::uninit();
                 let out = scratch.as_mut_ptr().cast::<u32>();
-                let n = wide_positions(sep as u64, line as u32, out);
-                if n < N { wide_positions((sep >> 64) as u64, line as u32 + 64, out.add(n)); }
+                if WIDE {
+                    let n = wide_positions(sep as u64, line as u32, out);
+                    if n < N { wide_positions((sep >> 64) as u64, line as u32 + 64, out.add(n)); }
+                } else {
+                    let n = flatten::<5>(sep as u64, line as u32, out);
+                    if n < N { flatten::<4>((sep >> 64) as u64, line as u32 + 64, out.add(n)); }
+                }
                 visit(buf, line as u32, &*out.cast::<[u32; N]>());
             }
             line += stop + 1;
