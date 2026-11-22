@@ -189,20 +189,27 @@ fn delta_binary_packed(out: &mut Vec<u8>, values: &[i64]) {
     let mut at = 1;
     while at < values.len() {
         let count = (values.len() - at).min(BLOCK);
+        let minis = count.div_ceil(MINI);
         let mut least = i64::MAX;
-        for slot in 0..count {
-            deltas[slot] = values[at + slot].wrapping_sub(values[at + slot - 1]);
-            least = least.min(deltas[slot]);
+        let mut highs = [i64::MIN; BLOCK / MINI];
+        for (mini, high) in highs[..minis].iter_mut().enumerate() {
+            let from = mini * MINI;
+            let end = (from + MINI).min(count);
+            let mut low = i64::MAX;
+            for slot in from..end {
+                let delta = values[at + slot].wrapping_sub(values[at + slot - 1]);
+                deltas[slot] = delta;
+                low = low.min(delta);
+                *high = (*high).max(delta);
+            }
+            least = least.min(low);
         }
         zigzag(out, least);
-        let minis = count.div_ceil(MINI);
         let mut widths = [0u8; BLOCK / MINI];
         for mini in 0..minis {
-            let end = ((mini + 1) * MINI).min(count);
-            let most = deltas[mini * MINI..end]
-                .iter()
-                .fold(0u64, |most, &delta| most.max(delta.wrapping_sub(least) as u64));
-            widths[mini] = width(most) as u8;
+            // Subtracting the block minimum maps signed order to unsigned
+            // distance even when the signed subtraction would overflow.
+            widths[mini] = width(highs[mini].wrapping_sub(least) as u64) as u8;
         }
         out.extend_from_slice(&widths);
         for mini in 0..minis {
