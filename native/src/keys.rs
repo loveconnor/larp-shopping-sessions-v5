@@ -189,12 +189,14 @@ pub unsafe fn pack(p: *const u8, len: usize) -> u64 {
             return 0;
         }
         if len <= 9 {
-            // The first eight bytes, with those past the end cleared.
-            let x = _bzhi_u64(u64::from_le((p as *const u64).read_unaligned()), len as u32 * 8);
-            // 0x80 in every byte that is 1..=127: wanted in each byte of the ID.
-            let plain = (x & LOW).wrapping_add(LOW) & !x & HIGH;
+            let raw = u64::from_le((p as *const u64).read_unaligned());
+            // A zero or high-bit byte rejects the prefix. A borrow can also
+            // mark a later byte, but only after an earlier invalid byte.
+            let bad = (raw.wrapping_sub(0x0101_0101_0101_0101) | raw) & HIGH;
+            let bits = len as u32 * 8;
             let ninth = if len == 9 { *p.add(8) } else { 1 };
-            if plain == _bzhi_u64(HIGH, len as u32 * 8) && ninth.wrapping_sub(1) < 127 {
+            if _bzhi_u64(bad, bits) == 0 && ninth.wrapping_sub(1) < 127 {
+                let x = _bzhi_u64(raw, bits);
                 let ninth = if len == 9 { ninth as u64 } else { 0 };
                 return (_pext_u64(x.swap_bytes(), LOW) << 7) | ninth;
             }
