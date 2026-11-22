@@ -102,7 +102,7 @@ impl<T: Copy> Buckets<T> {
     }
 
     #[inline(always)]
-    fn push(&mut self, part: usize, value: T) {
+    fn push(&mut self, part: usize, value: T) -> *mut T {
         unsafe {
             let slot = self.next.as_mut_ptr().add(part);
             let mut at = *slot;
@@ -115,6 +115,7 @@ impl<T: Copy> Buckets<T> {
             std::arch::asm!("prefetchw [{p} + 64]", p = in(reg) at, options(nostack, preserves_flags, readonly));
             at.write(value);
             *slot = at.add(1);
+            at
         }
     }
 
@@ -643,6 +644,14 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
+    const LOOKUPS: usize = 16;
+    let mut lookups = [(std::ptr::null::<u8>(), std::ptr::null_mut::<Parsed>(), 0u64); LOOKUPS];
+    let mut queued = 0;
+    let drain = |items: &[(*const u8, *mut Parsed, u64)]| {
+        for &(name,dest,mixed) in items {
+            unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
+        }
+    };
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -665,8 +674,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
-        let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let (name,n) = field(1);
+        let deferred = n == 33 && shared.defer_long_events;
+        let mixed = if deferred { keys::prepare_long_user(name) } else { 0 };
+        let user = if deferred { 1 } else { keys::pack_user(name,n) };
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
@@ -702,8 +713,17 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        let dest = out.buckets.push((partition_hash >> id_shift) as usize, record);
+        if deferred {
+            lookups[queued] = (name,dest,mixed);
+            queued += 1;
+            if queued == LOOKUPS {
+                drain(&lookups);
+                queued = 0;
+            }
+        }
     });
+    drain(&lookups[..queued]);
 }
 
 struct ClickSource {

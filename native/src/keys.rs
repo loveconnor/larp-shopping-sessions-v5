@@ -99,12 +99,32 @@ pub fn prepare_users(bytes: u64) {
 }
 
 #[inline(always)]
+unsafe fn user_mix(p: *const u8) -> u64 {
+    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
+    (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
+        .wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+#[inline(always)]
+pub unsafe fn prepare_long_user(p: *const u8) -> u64 {
+    let mixed = unsafe { user_mix(p) };
+    let slots = USER_SLOTS.get().unwrap();
+    crate::prefetch(&slots[(mixed >> 24) as usize & (slots.len()-1)]);
+    mixed
+}
+#[inline(always)]
+pub unsafe fn finish_long_user(p: *const u8, mixed: u64) -> u64 {
+    unsafe { fixed_user_mixed(p,USER_SLOTS.get().unwrap(),mixed) }
+}
+
+#[inline(always)]
 unsafe fn fixed_user(p: *const u8, slots: &[UserSlot]) -> u64 {
+    unsafe { fixed_user_mixed(p,slots,user_mix(p)) }
+}
+#[inline(always)]
+unsafe fn fixed_user_mixed(p: *const u8, slots: &[UserSlot], mixed: u64) -> u64 {
     use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let bytes = unsafe { &*p.cast::<[u8;33]>() };
-    let word = |at: usize| unsafe { p.add(at).cast::<u64>().read_unaligned() };
-    let mixed = (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
-        .wrapping_mul(0x9e3779b97f4a7c15);
     let hash = (mixed ^ (mixed >> 31)) | 2;
     let mask = slots.len()-1;
     let mut at = (mixed >> 24) as usize & mask;
