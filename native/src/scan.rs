@@ -287,6 +287,34 @@ pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N]
     }
 }
 
+/// Resolve all field starts and lengths of a validated event row together.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn event_bounds(buf: *const u8, start: u32, seps: &[u32; 7]) -> ([u32; 8], [u32; 8]) {
+    use std::arch::x86_64::*;
+    if seps[6] >= i32::MAX as u32 {
+        let mut starts = [0; 8];
+        let mut lengths = [0; 8];
+        for i in 0..7 {
+            let (a, b) = unsafe { bounds(buf, start, seps, i) };
+            starts[i] = a;
+            lengths[i] = b-a;
+        }
+        return (starts, lengths);
+    }
+    unsafe {
+        let valid = _mm256_setr_epi32(-1,-1,-1,-1,-1,-1,-1,0);
+        let ends = _mm256_maskload_epi32(seps.as_ptr().cast(), valid);
+        let prior = _mm256_permutevar8x32_epi32(ends, _mm256_setr_epi32(0,0,1,2,3,4,5,6));
+        let starts = _mm256_blend_epi32::<1>(_mm256_add_epi32(prior, _mm256_set1_epi32(1)), _mm256_set1_epi32(start as i32));
+        let first = _mm256_i32gather_epi32::<1>(buf.cast(), starts);
+        let quoted = _mm256_cmpeq_epi32(_mm256_and_si256(first, _mm256_set1_epi32(255)), _mm256_set1_epi32(i32::from(b'"')));
+        let starts = _mm256_sub_epi32(starts, quoted);
+        let lengths = _mm256_sub_epi32(_mm256_add_epi32(ends, quoted), starts);
+        (std::mem::transmute(starts), std::mem::transmute(lengths))
+    }
+}
+
 /// Field `at` of a line from `raw_lines`, without its quotes: (first byte, length).
 #[inline(always)]
 pub unsafe fn field<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (*const u8, usize) {
