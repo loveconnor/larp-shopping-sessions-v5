@@ -185,6 +185,24 @@ fn pack_eight<const BITS: usize>(out: &mut Vec<u8>, values: &[i64], least: i64) 
         }
         return;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "bmi2"))]
+    if (9..=16).contains(&BITS) {
+        use std::arch::x86_64::*;
+        let select = 0x0001_0001_0001_0001 * ((1u64 << BITS) - 1);
+        out.reserve(values.len() / 8 * BITS);
+        unsafe {
+            let bias = _mm_set1_epi16(least as i16);
+            for group in values.chunks_exact(8) {
+                let deltas = _mm512_loadu_si512(group.as_ptr().cast());
+                let words = _mm_sub_epi16(_mm512_cvtepi64_epi16(deltas), bias);
+                let lo = _pext_u64(_mm_cvtsi128_si64(words) as u64, select);
+                let hi = _pext_u64(_mm_extract_epi64::<1>(words) as u64, select);
+                let packed = u128::from(lo) | (u128::from(hi) << (4 * BITS));
+                out.extend_from_slice(&packed.to_le_bytes()[..BITS]);
+            }
+        }
+        return;
+    }
     for group in values.chunks_exact(8) {
         let mut packed = 0u128;
         for (index, &delta) in group.iter().enumerate() {
@@ -588,7 +606,7 @@ mod tests {
         fn check<const B: usize>() {
             for least in [i64::MIN, -100_000, -257, -1, 0, 254, i64::MAX] {
                 let offsets: Vec<u64> = (0..64)
-                    .map(|i| (i * 47 + 19) & ((1 << B) - 1))
+                    .map(|i| (i * 756547 + 52991) & ((1 << B) - 1))
                     .collect();
                 let deltas: Vec<_> = offsets.iter().map(|&v| least.wrapping_add(v as i64)).collect();
                 let mut actual = vec![11];
@@ -600,6 +618,8 @@ mod tests {
         }
         check::<1>(); check::<2>(); check::<3>(); check::<4>();
         check::<5>(); check::<6>(); check::<7>(); check::<8>();
+        check::<9>(); check::<10>(); check::<11>(); check::<12>();
+        check::<13>(); check::<14>(); check::<15>(); check::<16>();
     }
 
     #[test]
