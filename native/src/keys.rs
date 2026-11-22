@@ -106,6 +106,16 @@ pub fn prepare_users(bytes: u64) {
 #[inline(always)]
 pub fn long_name_mix(bytes: &[u8; 33]) -> u64 {
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    {
+        use std::arch::x86_64::_mm_crc32_u64;
+        // Two independent CRC streams cover every byte. This value only
+        // selects a slot; the stored spelling resolves every collision.
+        let left = _mm_crc32_u64(_mm_crc32_u64(u64::from(bytes[0]), word(1)), word(9));
+        let right = _mm_crc32_u64(_mm_crc32_u64(0, word(17)), word(25));
+        return (left | (right << 32)).wrapping_mul(0x9e3779b97f4a7c15);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
     (word(1) ^ word(9).rotate_left(17) ^ word(17).rotate_left(33) ^ word(25).rotate_left(49))
         .wrapping_mul(0x9e3779b97f4a7c15)
 }
