@@ -1420,6 +1420,7 @@ fn session_worker(
         persons.clear();
         ends.clear();
         local.clear();
+        local.reserve(total);
         unsafe {
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
@@ -1436,28 +1437,29 @@ fn session_worker(
                             *table_ids.get_unchecked_mut(slot) = id;
                             persons.push(person);
                             ends.push(0);
+                            if persons.len() * 2 > capacity {
+                                capacity *= 2;
+                                mask = capacity - 1;
+                                table_keys.clear();
+                                table_keys.resize(capacity, 0);
+                                table_ids.clear();
+                                table_ids.resize(capacity, 0);
+                                for (id, &person) in persons.iter().enumerate() {
+                                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
+                                    while table_keys[slot] != 0 {
+                                        slot = (slot + 1) & mask;
+                                    }
+                                    table_keys[slot] = person;
+                                    table_ids[slot] = id as u32;
+                                }
+                            }
                             break id;
                         }
                         slot = (slot + 1) & mask;
                     };
                     *ends.get_unchecked_mut(id as usize) += 1;
                     local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
-                    }
+
                 }
             }
             // `ends` holds counts; make it each person's first slot, then fill,
@@ -1490,6 +1492,7 @@ fn session_worker(
         click_ends.clear();
         click_ends.resize(persons.len(), 0);
         click_local.clear();
+        click_local.reserve(click_chunks.iter().map(|chunk| chunk.1).sum());
         let mut kept = 0usize;
         unsafe {
             for &(base, count) in &click_chunks {
