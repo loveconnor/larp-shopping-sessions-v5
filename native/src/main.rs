@@ -730,9 +730,16 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
-        let (p, n) = field(4);
-        let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
-        let other = n == 4 && {
+        let kind_start = seps[3] + 1;
+        let width = seps[4] - kind_start;
+        // All valid event types are 4 or 8 bytes. Their quoted spellings are
+        // two bytes longer, so their widths give the address before we load them.
+        let quoted = ((width >> 1) & 1) as usize;
+        let raw = buf.add(kind_start as usize);
+        let p = raw.add(quoted);
+        let quote_ok = quoted == 0 || *raw == b'"';
+        let purchase = width & !2 == 8 && quote_ok && (p as *const u64).read_unaligned() == PURCHASE.to_le();
+        let other = width & !2 == 4 && quote_ok && {
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
