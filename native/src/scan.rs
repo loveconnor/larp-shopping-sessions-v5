@@ -472,21 +472,26 @@ impl Block {
     /// exactly which are wrong.
     #[inline(always)]
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+        let mut visit = visit;
+        self.tagged::<N,false>(|buf,start,seps,_| visit(buf,start,seps))
+    }
+    #[inline(always)]
+    pub fn tagged<const N: usize,const TAG: bool>(&self, visit: impl FnMut(*const u8,u32,&[u32;N],u8)) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
-            return unsafe { self.raw_wide(visit) };
+            return unsafe { self.raw_wide::<N,TAG>(visit) };
         }
-        self.raw_indexed::<N, false>(visit)
+        self.raw_indexed::<N, false,TAG>(visit)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512bw,avx512vbmi2")]
-    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
-        self.raw_indexed::<N, true>(visit)
+    unsafe fn raw_wide<const N: usize,const TAG: bool>(&self, visit: impl FnMut(*const u8, u32, &[u32; N],u8)) {
+        self.raw_indexed::<N, true,TAG>(visit)
     }
 
     #[inline(always)]
-    fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    fn raw_indexed<const N: usize, const WIDE: bool,const TAG: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N],u8)) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -502,6 +507,8 @@ impl Block {
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
             let mut bad: Vec<u32> = Vec::new();
+            let mut flags = Vec::<u8>::new();
+            let mut first_bit = 0usize;
             let mut bad_at = 0usize;
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
@@ -515,6 +522,14 @@ impl Block {
                     seps.set_len(kept);
                     seps.reserve(WINDOW * 64 + 128);
                 }
+                if TAG { flags.resize((kept + WINDOW * 64 + 192) / 8 + 16, 0); }
+                let fp = flags.as_mut_ptr();
+                let bits = |at:usize| -> u8 {
+                    if !TAG { return 0; }
+                    let index = first_bit + at;
+                    let p = fp.add(index / 8);
+                    (p.cast::<u16>().read_unaligned() >> (index % 8)) as u8
+                };
                 let mut count = kept;
                 let mut lines = 0usize;
                 let out = seps.as_mut_ptr();
@@ -567,6 +582,23 @@ impl Block {
                     let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
                     #[cfg(not(target_arch = "x86_64"))]
                     let positions = flatten::<10>(sep, at, out.add(count));
+                    if TAG {
+                        let before_quote = (quote << 1) | u64::from(before == b'"');
+                        #[cfg(all(target_arch="x86_64",target_feature="bmi2"))]
+                        let packed = std::arch::x86_64::_pext_u64(before_quote,sep);
+                        #[cfg(not(all(target_arch="x86_64",target_feature="bmi2")))]
+                        let packed = {
+                            let mut src=sep; let mut dst=0u64; let mut bit=1u64;
+                            while src!=0 {dst |= if src & src.wrapping_neg() & before_quote != 0 {bit} else {0};src &= src-1;bit=bit.wrapping_mul(2);}
+                            dst
+                        };
+                        let idx = first_bit + count;
+                        let dst = fp.add(idx/8);
+                        let shift = idx%8;
+                        let rest = *dst & ((1u8 << shift)-1);
+                        dst.cast::<u64>().write_unaligned((packed << shift) | u64::from(rest));
+                        if positions + shift > 64 { *dst.add(8) = (packed >> (64-shift)) as u8; }
+                    }
                     count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
@@ -585,7 +617,7 @@ impl Block {
                     }
                     let clean = *bad.get_unchecked(bad_at) > stop;
                     if *out.add(sep_at + N - 1) == stop && clean {
-                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]),bits(sep_at));
                         sep_at += N;
                         continue;
                     }
@@ -595,7 +627,13 @@ impl Block {
                     sep_at += 1;
                     if !clean {
                         if let Some(found) = Self::split_line::<N>(buf, start as usize) {
-                            visit(buf, start, &found);
+                            let mut q = 0;
+                            if TAG {
+                                for (i, &end) in found.iter().enumerate() {
+                                    q |= u8::from(end > start && *buf.add(end as usize-1)==b'"') << i;
+                                }
+                            }
+                            visit(buf, start, &found,q);
                         }
                     }
                 }
@@ -603,6 +641,11 @@ impl Block {
                 // Separators of the line still open move to the front.
                 kept = count - sep_at;
                 std::ptr::copy(out.add(sep_at), out, kept);
+                if TAG {
+                    let head = first_bit + sep_at;
+                    first_bit = head%8;
+                    std::ptr::copy(fp.add(head/8),fp,(first_bit+kept).div_ceil(8));
+                }
             }
         }
     }

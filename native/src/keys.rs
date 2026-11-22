@@ -172,6 +172,29 @@ fn name(key: u64) -> &'static [u8] {
     NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
 }
 
+/// Event IDs need equality only. Store the suffix of common short event
+/// names directly, reserving the high bit for the interner. Embedded NULs
+/// go through the interner so zero padding never aliases a shorter name.
+#[inline(always)]
+pub unsafe fn event_key(p: *const u8, len: usize) -> u64 {
+    unsafe {
+        if len == 0 {
+            return 0;
+        }
+        if (2..=9).contains(&len) && *p == b'e' {
+            let word = u64::from_le(p.add(1).cast::<u64>().read_unaligned());
+            let mask = u64::MAX >> ((9 - len) * 8);
+            let filled = word | !mask;
+            let high = 0x8080_8080_8080_8080;
+            let zero = filled.wrapping_sub(0x0101_0101_0101_0101) & !filled & high;
+            if zero == 0 && word & mask & high == 0 {
+                return word & mask;
+            }
+        }
+        intern(std::slice::from_raw_parts(p, len))
+    }
+}
+
 /// The key of the `len` bytes at `p`. At least 9 bytes must be readable at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 #[inline(always)]

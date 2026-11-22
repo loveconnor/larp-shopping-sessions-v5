@@ -652,8 +652,12 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             unsafe { (*dest).user = keys::finish_long_user(name,mixed); }
         }
     };
-    block.raw_lines::<7>(|buf, start, seps| unsafe {
-        let field = |at: usize| scan::field(buf, start, seps, at);
+    block.tagged::<7,true>(|buf, start, seps, quoted| unsafe {
+        let field = |at:usize| {
+            let from = if at==0 {start} else {seps[at-1]+1};
+            let quote = u32::from((quoted >> at)&1);
+            (buf.add((from+quote) as usize), (seps[at]-from-2*quote) as usize)
+        };
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
@@ -662,7 +666,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
         } else {
-            let id = keys::pack(p, n);
+            let id = keys::event_key(p, n);
             if id == 0 {
                 return;
             }
