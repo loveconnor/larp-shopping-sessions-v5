@@ -799,6 +799,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
     let mut table: Vec<u32> = Vec::new();
+    let mut seen_bits = Vec::<u64>::new();
+    let mut repeated = Vec::<u64>::new();
+    let mut occupied = Vec::<usize>::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -818,18 +821,56 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         let mask = capacity - 1;
         table.clear();
         table.resize(capacity, NONE);
+        let bitmap_size = (total * 16).next_power_of_two().max(64);
+        let bitmap_mask = bitmap_size - 1;
+        seen_bits.clear();
+        repeated.clear();
+        occupied.clear();
+        seen_bits.resize(bitmap_size / 64, 0);
+        repeated.resize(bitmap_size / 64, 0);
+        let hash = |id: u64| {
+            let key = if shared.defer_long_events && id & LONG_EVENT == LONG_EVENT {
+                (id >> 32) & EVENT_FINGERPRINT
+            } else { id };
+            (key.wrapping_mul(MIX) >> 24) as usize
+        };
         unsafe {
+            // A fingerprint seen exactly once proves that its event ID is
+            // unique. Every collision still goes through full ID comparison.
+            for &(base, count) in &chunks {
+                for offset in 0..count {
+                    let bit = hash((*base.add(offset)).id) & bitmap_mask;
+                    let mask = 1u64 << (bit & 63);
+                    let prev = seen_bits[bit >> 6];
+                    repeated[bit >> 6] |= prev & mask;
+                    seen_bits[bit >> 6] = prev | mask;
+                }
+            }
+            let mut emit = |record: Parsed| {
+                if record.ts != DEAD {
+                    let person = links.person(record.user);
+                    let value = ((record.ts as u64) << 32) | record.payload as u64;
+                    out.push(person_part(person, person_bits), Event { person, value });
+                }
+            };
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
                     let record = base.add(offset);
+                    if offset + ahead < count { links.prefetch((*base.add(offset + ahead)).user); }
                     let id = (*record).id;
+                    let h = hash(id);
+                    let bit = h & bitmap_mask;
+                    if repeated[bit >> 6] & (1u64 << (bit & 63)) == 0 {
+                        emit(*record);
+                        continue;
+                    }
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
-                    let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let mut slot = h & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
                         if seen == NONE {
+                            occupied.push(slot);
                             *table.get_unchecked_mut(slot) = entry;
                             break;
                         }
@@ -849,10 +890,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         };
                         if equal {
                             if (*record).ingest < (*other).ingest {
-                                (*other).ts = DEAD;
                                 *table.get_unchecked_mut(slot) = entry;
-                            } else {
-                                (*record).ts = DEAD;
                             }
                             break;
                         }
@@ -860,19 +898,10 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     }
                 }
             }
-            for &(base, count) in &chunks {
-                for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
-                    let record = *base.add(offset);
-                    if record.ts == DEAD {
-                        continue;
-                    }
-                    let person = links.person(record.user);
-                    let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
-                }
+            for &slot in &occupied {
+                let entry = table[slot];
+                let record = chunks[(entry >> OFFSET_BITS) as usize].0.add((entry & ((1 << OFFSET_BITS) - 1)) as usize);
+                emit(*record);
             }
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
